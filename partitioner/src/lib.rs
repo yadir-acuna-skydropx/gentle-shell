@@ -4,3 +4,4 @@ pub mod keys;
 pub mod layout;
 pub mod pane;
 pub mod tree;
+pub mod viewer;
