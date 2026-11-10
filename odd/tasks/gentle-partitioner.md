@@ -19,7 +19,7 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 
 ## Tasks
 
-- T1 [ ] S2, S3, S7, S11 — scaffold `partitioner/` crate; pure layout engine (chat-only + tool bar, partitioned sidebar/editor/diff/chat) with unit tests. Route: inline. Commit: —
+- T1 [x] S2, S3, S7, S11 — scaffold `partitioner/` crate; pure layout engine (chat-only + tool bar, partitioned sidebar/editor/diff/chat) with unit tests. Route: inline. Commit: `d6c095df7`
 - T2 [ ] S4 — file tree: directory scan, sizes, formats, git worktree status (porcelain parser); unit tests. Route: inline. Commit: —
 - T3 [ ] S2, S3, S6 — PTY pane: spawn `gentle-shell` in portable-pty, vt100 emulation, reader thread + dirty flag, resize, key-to-bytes encoding; unit tests. Route: inline. Commit: —
 - T4 [ ] S5 — center viewer: selected file content (left) + agent changes from `git diff` (right), read-only; diff classifier tests. Route: inline. Commit: —
