@@ -2,6 +2,8 @@
 //! gentle-shell, unchanged, inside its own PTY pane.
 pub mod app;
 pub mod editor;
+pub mod highlight;
+pub mod icons;
 pub mod keys;
 pub mod layout;
 pub mod pane;

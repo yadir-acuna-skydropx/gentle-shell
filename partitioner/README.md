@@ -22,6 +22,13 @@ repainted — only the changed cells of that fragment are written out.
   `git diff` (right, read-only), and the **chat** at the bottom. On small
   terminals the layout
   degrades back to chat mode so the chat stays usable (S11).
+- **Icons (S4).** The sidebar and the Files overlay show a **Nerd Font** glyph
+  per entry: open/closed folders and a per-language file icon in the language's
+  brand colour (e.g. the Python glyph in blue for `.py`, Rust orange for `.rs`).
+  See “Icons” below for the font requirement and the ASCII fallback.
+- **Syntax highlighting (S5).** The editor pane highlights code per language,
+  colours brackets by nesting depth (**rainbow brackets**) and emphasises the
+  **bracket matching** the one at the cursor. See “Syntax highlighting” below.
 - **Prediction (S9).** A deterministic n-gram engine (no model weights, no
   network) runs in-process. In the editor it shows a dim **ghost suggestion**
   after the cursor at the end of a line; `Tab` or `Right` accept it. The same
@@ -65,6 +72,59 @@ on its own thread, sharing the engine via `Arc<RwLock<..>>`. The child receives
 
 JSON for these two shapes is parsed and serialized by hand (quotes, backslashes,
 control characters and `\uXXXX` are handled).
+
+## Icons
+
+The sidebar tree and the Files overlay draw a **Nerd Font** glyph before every
+entry (`icons.rs`): a closed-folder glyph, an open-folder glyph when the folder
+is expanded, and a file glyph chosen by extension or by well-known name
+(`Dockerfile`, `Makefile`, `Cargo.toml` → Rust, `package.json` → npm,
+`.gitignore` → git, …), coloured with the language's usual brand colour. Each
+glyph is a single Private Use Area codepoint from the
+[nerd-fonts cheat sheet](https://www.nerdfonts.com/cheat-sheet) (`nf-fa-folder` /
+`nf-fa-folder_open`, `nf-seti-*`, `nf-dev-*`, `nf-custom-*`) that `unicode-width`
+(the crate ratatui uses to measure cells) reports as exactly **one column**.
+
+- **Font requirement.** Install a Nerd Font and select it in your terminal
+  (the ODD choice L19 is **JetBrainsMono Nerd Font** in `~/.local/share/fonts`).
+  Without a Nerd Font the glyphs render as tofu boxes.
+- **ASCII fallback.** Set `GENTLE_PARTITIONER_ICONS=ascii` for terminals without
+  the font: folders show `▸` / `▾` and files show no marker, exactly as before.
+  Any other value (or unset) uses the Nerd Font set (the default).
+
+## Syntax highlighting
+
+The editor pane (`highlight.rs`) runs a small **hand-written per-language
+tokenizer** — deliberately not `syntect` (which pulls the `onig` C regex engine
+or a large fancy-regex payload, growing the binary and startup cost) nor
+`tree-sitter-highlight` (a grammar crate and C build per language). The lexer is
+dependency-free, keeps the release binary small, starts instantly, and is fast
+enough to highlight far more than a screenful per frame (benched at well under
+50 ms for 1000 lines in release). Highlighting is computed **only for the
+visible lines**, with a per-line cache that carries the end-of-line state and is
+invalidated from the edited line down (S11).
+
+- **Languages:** Python, Rust, JS/TS (+JSX/TSX), JSON, TOML, YAML, shell, SQL,
+  Markdown, C, C++, Go, Java, HTML and CSS.
+- **Token classes & colours:** keyword (magenta), string (green), number (cyan),
+  comment (dark gray), function call (blue), type / capitalised name (yellow)
+  and punctuation (gray) — readable on a dark background.
+- **Rainbow brackets:** `()`, `[]`, `{}` are coloured by nesting depth on a
+  four-colour cycle; brackets inside strings and comments are ignored, and an
+  unbalanced closing bracket is shown in **red**.
+- **Matching bracket:** when the cursor is on or right after a bracket, it and
+  its pair are **bold + underlined**, even across lines (searched within a
+  bounded ±2000-line window so it never stalls).
+- **Limitations (documented):** multi-line Python triple-quoted strings, JS/TS
+  template backticks and `/* */` block comments are tracked across lines; a
+  normal single/double-quoted string left open at end of line is treated as
+  ending there; Rust lifetimes like `'a` may read as a string; the
+  matching-bracket search pairs by nesting only and does not skip brackets
+  inside strings or comments.
+
+The editor's existing behaviour is preserved alongside highlighting: tab
+expansion, horizontal scroll, the cursor, the dim ghost suggestion, line
+numbers, and the dirty / read-only markers.
 
 ## Build & run
 
@@ -119,6 +179,8 @@ else is forwarded to the chat.
   `Ctrl+Home`/`Ctrl+End`. `Ctrl+S` saves, `Ctrl+R` reloads from disk
   (discarding edits). A `●` before the path marks unsaved edits. `Esc` returns
   to the chat.
+  - Code is **syntax-highlighted** per language, with rainbow brackets and the
+    matching bracket emphasised at the cursor (see “Syntax highlighting”).
   - With prediction on, a dim **ghost suggestion** appears after the cursor at
     the end of a line; `Tab` or `Right` accept it. Without a ghost, `Tab` and
     `Right` behave exactly as above. Saving learns the buffer (mode `code`).
@@ -159,6 +221,10 @@ else is forwarded to the chat.
 - **`editor.rs`** — the left half of the center viewer: a small editable buffer
   that preserves the file’s bytes (tabs, CRLF/LF, trailing newline) and saves
   atomically with an on-disk-change guard.
+- **`icons.rs`** — the Nerd Font (and ASCII fallback) glyph + colour for each
+  tree entry (S4).
+- **`highlight.rs`** — the per-language lexical highlighter, rainbow brackets
+  and matching-bracket search for the editor pane (S5).
 - **`predict.rs`** — the deterministic n-gram prediction engine, the hand-written
   JSON helpers, and the repo/history seeding (S9).
 - **`predict_server.rs`** — the loopback HTTP server exposing the engine to the
@@ -174,7 +240,12 @@ else is forwarded to the chat.
 - **T8a (S9)** — prediction engine, local server and editor ghost text: **done**.
 - **T8b (S9)** — gentle-shell prompt editor ghost suggestion from
   `GENTLE_PREDICT_URL` (dim inline, `Tab`/`Right` accept, learn submitted
-  prompts): next.
+  prompts): **done**.
+- **T9 (S4)** — clicking an expanded folder collapses it again (click toggles
+  like `Enter`): **done**.
+- **T10 (S4)** — Nerd Font icons in the sidebar and overlays: **done**.
+- **T11 (S5)** — editor syntax highlighting, rainbow brackets and matching
+  bracket: **done**.
 
 ## Fast development loop
 

@@ -13,6 +13,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::editor::{Editor, SaveOutcome};
+use crate::highlight::{self, Highlighter};
+use crate::icons::{self, IconMode};
 use crate::layout::{self, Layout, Mode};
 use crate::pane::{self, PtyPane};
 use crate::predict::{Engine, PredictMode};
@@ -84,6 +86,11 @@ pub struct App {
     pub predict: Option<Arc<RwLock<Engine>>>,
     /// Dim ghost suffix shown after the editor cursor, when any.
     pub ghost: Option<String>,
+    /// Icon set for the sidebar tree and Files overlay (T10).
+    pub icons: IconMode,
+    /// Cached syntax highlighter for the open editor buffer (T11); `None`
+    /// until a file is opened.
+    pub highlighter: Option<Highlighter>,
 }
 
 impl App {
@@ -111,6 +118,8 @@ impl App {
             overlay_area: None,
             predict: None,
             ghost: None,
+            icons: IconMode::from_env(),
+            highlighter: None,
         };
         app.rescan();
         app
@@ -205,11 +214,19 @@ impl App {
         self.pending_discard = None;
         self.pending_quit = false;
         self.editor = Some(Editor::open(&self.root, rel));
+        self.highlighter = Some(Highlighter::new(lang_for_path(rel)));
         self.viewer = Some(Viewer::open(&self.root, rel));
         self.mode = Mode::Workspace;
         self.focus = Focus::Editor;
         self.overlay = None;
         self.refresh_ghost();
+    }
+
+    /// Drops cached highlight lines from `line` down after an edit.
+    fn invalidate_hl(&mut self, line: usize) {
+        if let Some(h) = &mut self.highlighter {
+            h.invalidate_from(line);
+        }
     }
 
     /// Whether the main loop should ask the git worker to refresh (after a save).
@@ -262,6 +279,8 @@ impl App {
             let p = v.path.clone();
             *v = Viewer::open(&self.root, &p);
         }
+        // The whole buffer was replaced: drop the entire highlight cache.
+        self.invalidate_hl(0);
         self.pending_discard = None;
         self.status_msg = Some("reloaded from disk".into());
     }
@@ -456,21 +475,34 @@ impl App {
         // their usual meaning (literal tab / move right).
         if self.ghost.is_some() && !ctrl && matches!(key.code, KeyCode::Tab | KeyCode::Right) {
             let suffix = self.ghost.take().unwrap();
+            let mut from = None;
             if let Some(e) = &mut self.editor {
+                from = Some(e.cursor_line);
                 e.insert_str(&suffix);
+            }
+            if let Some(line) = from {
+                self.invalidate_hl(line);
             }
             self.refresh_ghost();
             return Action::None;
         }
         let mut readonly_reason = None;
+        let mut edited_from = None;
         if let Some(e) = &mut self.editor {
             if e.is_read_only() {
                 if is_edit_key(&key) {
                     readonly_reason = e.read_only_reason().map(str::to_string);
                 }
             } else {
+                let before = e.cursor_line;
                 e.handle_key(key);
+                if is_edit_key(&key) {
+                    edited_from = Some(before.min(e.cursor_line));
+                }
             }
+        }
+        if let Some(line) = edited_from {
+            self.invalidate_hl(line);
         }
         if let Some(reason) = readonly_reason {
             self.status_msg = Some(reason);
@@ -642,7 +674,8 @@ impl App {
         let idx = rel + self.tree_offset;
         if idx < self.entries.len() {
             self.selected = idx;
-            self.expand_or_open_selected();
+            // A click toggles folders, so a second click closes an open one.
+            self.toggle_or_open_selected();
         }
     }
 
@@ -721,21 +754,90 @@ fn tree_lines(app: &App, height: usize, width: usize) -> Vec<Line<'static>> {
         .skip(app.tree_offset)
         .take(height)
         .map(|(i, e)| {
-            let icon = if e.is_dir { if app.expanded.contains(&e.path) { "▾ " } else { "▸ " } } else { "  " };
+            let expanded = e.is_dir && app.expanded.contains(&e.path);
+            let (glyph, gcolor) = icons::icon_for(e, expanded, app.icons);
+            // The icon cell is always two columns: glyph + space, or two spaces
+            // when there is no glyph (the ASCII fallback for files).
+            let icon_cell = if glyph.is_empty() { "  ".to_string() } else { format!("{glyph} ") };
             let mark = e.status.map_or(' ', |s| s.marker());
-            let left = format!("{mark} {}{icon}{}", "  ".repeat(e.depth), e.name);
+            let prefix = format!("{mark} {}", "  ".repeat(e.depth));
             let right = if e.is_dir { String::new() } else { tree::human_size(e.size) };
-            let pad = width.saturating_sub(left.chars().count() + right.len()).max(1);
-            let mut style = status_style(e.status);
+            // Each glyph is one column, so char count equals column width here.
+            let left_len = prefix.chars().count() + icon_cell.chars().count() + e.name.chars().count();
+            let pad = width.saturating_sub(left_len + right.len()).max(1);
+            let mut base = status_style(e.status);
             if e.is_dir {
-                style = style.add_modifier(Modifier::BOLD);
+                base = base.add_modifier(Modifier::BOLD);
             }
             if i == app.selected {
-                style = style.add_modifier(Modifier::REVERSED);
+                base = base.add_modifier(Modifier::REVERSED);
             }
-            Line::styled(format!("{left}{}{right}", " ".repeat(pad)), style)
+            // Colour the glyph with its brand colour (Nerd set only); the ASCII
+            // fallback keeps the base style so it renders exactly as before.
+            let icon_style = if app.icons == IconMode::Nerd && !glyph.is_empty() { base.fg(gcolor) } else { base };
+            Line::from(vec![
+                Span::styled(prefix, base),
+                Span::styled(icon_cell, icon_style),
+                Span::styled(format!("{}{}{}", e.name, " ".repeat(pad), right), base),
+            ])
         })
         .collect()
+}
+
+/// Language for the open file, from its extension.
+fn lang_for_path(rel: &Path) -> highlight::Lang {
+    let ext = rel.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    highlight::lang_for_ext(&ext)
+}
+
+/// The bracket (if any) at or just before `col` on `line`, paired with its
+/// match. Returns `[cursor_bracket, matching_bracket]` positions.
+fn bracket_pair(lines: &[String], line: usize, col: usize) -> Option<[(usize, usize); 2]> {
+    let mut cols = vec![col];
+    if col > 0 {
+        cols.push(col - 1);
+    }
+    for c in cols {
+        if let Some(m) = highlight::match_bracket(lines, line, c) {
+            return Some([(line, c), m]);
+        }
+    }
+    None
+}
+
+/// Builds the visible, highlighted spans of one code line: it slices the
+/// tokenised line to the `[scroll_col, scroll_col + text_w)` window and bolds +
+/// underlines any column in `emph` (the matching-bracket pair).
+fn code_spans(segs: &[highlight::Seg], scroll_col: usize, text_w: usize, emph: &[usize]) -> Vec<Span<'static>> {
+    let visible_end = scroll_col + text_w;
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut cur = String::new();
+    let mut cur_style: Option<Style> = None;
+    fn flush(spans: &mut Vec<Span<'static>>, cur: &mut String, style: Option<Style>) {
+        if !cur.is_empty() {
+            spans.push(Span::styled(std::mem::take(cur), style.unwrap_or_default()));
+        }
+    }
+    let mut col = 0usize;
+    for seg in segs {
+        let base = highlight::class_style(seg.class);
+        for ch in seg.text.chars() {
+            if col >= scroll_col && col < visible_end {
+                let mut st = base;
+                if emph.contains(&col) {
+                    st = st.add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+                }
+                if cur_style != Some(st) {
+                    flush(&mut spans, &mut cur, cur_style);
+                    cur_style = Some(st);
+                }
+                cur.push(ch);
+            }
+            col += 1;
+        }
+    }
+    flush(&mut spans, &mut cur, cur_style);
+    spans
 }
 
 fn entry_details(e: &Entry) -> String {
@@ -796,8 +898,10 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
     }
 
     if let (Some(ed), Some(df)) = (l.editor, l.diff) {
-        // Left pane: the editable buffer.
+        // Left pane: the editable buffer. Take the highlighter out so it can be
+        // borrowed mutably alongside the editor; it is restored below.
         let ghost = if focus == Focus::Editor { app.ghost.clone() } else { None };
+        let mut highlighter = app.highlighter.take();
         match &mut app.editor {
             Some(e) => {
                 let mark = if e.dirty { "\u{25cf} " } else { "" };
@@ -812,19 +916,35 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
                 e.ensure_visible(text_h, text_w);
                 let (scroll_row, scroll_col) = (e.scroll_row, e.scroll_col);
                 let cursor_line = e.cursor_line;
-                let lines: Vec<Line> = e
-                    .lines
-                    .iter()
-                    .enumerate()
-                    .skip(scroll_row)
-                    .take(text_h)
-                    .map(|(i, t)| {
-                        let expanded = crate::editor::expand_tabs(t);
-                        let shown: String = expanded.chars().skip(scroll_col).take(text_w.max(1)).collect();
-                        let mut spans = vec![
-                            Span::styled(format!("{:>num_w$} ", i + 1), Style::default().fg(Color::DarkGray)),
-                            Span::raw(shown),
-                        ];
+                let cursor_vcol = e.cursor_visual_col();
+                // Highlight runs on the tab-expanded lines, matching what the
+                // cursor column and the rendered slice use.
+                let expanded_lines: Vec<String> = e.lines.iter().map(|t| crate::editor::expand_tabs(t)).collect();
+                if let Some(h) = &mut highlighter {
+                    h.ensure(&expanded_lines, scroll_row + text_h);
+                }
+                // The bracket under/after the cursor and its match (if any).
+                let matched = if focus == Focus::Editor {
+                    bracket_pair(&expanded_lines, cursor_line, cursor_vcol)
+                } else {
+                    None
+                };
+                let text_w = text_w.max(1);
+                let last = (scroll_row + text_h).min(expanded_lines.len());
+                let lines: Vec<Line> = (scroll_row..last)
+                    .map(|i| {
+                        let mut spans =
+                            vec![Span::styled(format!("{:>num_w$} ", i + 1), Style::default().fg(Color::DarkGray))];
+                        let emph: Vec<usize> =
+                            matched.iter().flatten().filter(|(l, _)| *l == i).map(|(_, c)| *c).collect();
+                        match &highlighter {
+                            Some(h) => spans.extend(code_spans(h.segs(i), scroll_col, text_w, &emph)),
+                            None => {
+                                let shown: String =
+                                    expanded_lines[i].chars().skip(scroll_col).take(text_w).collect();
+                                spans.push(Span::raw(shown));
+                            }
+                        }
                         // Dim ghost suggestion rendered after the cursor (S9).
                         if i == cursor_line {
                             if let Some(g) = &ghost {
@@ -848,6 +968,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
                 frame.render_widget(hint.block(pane_block(" Editor ".into(), focus == Focus::Editor)), ed);
             }
         }
+        app.highlighter = highlighter;
         // Right pane: the agent's changes (read-only).
         match &app.viewer {
             Some(v) => {
@@ -1357,4 +1478,62 @@ mod tests {
         assert_eq!(app.handle_key(ch('x')), Action::Forward(b"x".to_vec()));
         fs::remove_dir_all(root).unwrap();
     }
+    #[test]
+    fn sidebar_renders_the_nerd_glyph_for_a_py_file() {
+        let root = std::env::temp_dir().join(format!("gentle-partitioner-app-pyicon-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("app.py"), "print(1)\n").unwrap();
+        let mut app = App::new(root.clone());
+        app.icons = IconMode::Nerd;
+        app.mode = Mode::Workspace;
+        let t = render(&mut app, 120, 40);
+        let py = icons::icon_for(&app.entries[0], false, IconMode::Nerd).0;
+        assert_eq!(app.entries[0].name, "app.py");
+        assert!(screen_text(&t).contains(py), "sidebar should render the python glyph {py:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn editor_highlights_code_without_losing_any_text() {
+        let root = fixture("hl-render");
+        let mut app = App::new(root.clone());
+        app.open_file(Path::new("src/main.rs"));
+        let t = render(&mut app, 120, 40);
+        // The buffer text survives highlighting: keyword, name and brackets all show.
+        let text = screen_text(&t);
+        assert!(text.contains("fn main() {}"), "highlighted code keeps its text: {text:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn bracket_pair_matches_on_or_right_after_the_cursor() {
+        let lines = vec!["fn main() {".to_string(), "    x".to_string(), "}".to_string()];
+        // Cursor just after the open brace at (0,10): pairs with (2,0).
+        assert_eq!(bracket_pair(&lines, 0, 11), Some([(0, 10), (2, 0)]));
+        // Cursor directly on the close brace at (2,0): pairs back to (0,10).
+        assert_eq!(bracket_pair(&lines, 2, 0), Some([(2, 0), (0, 10)]));
+        // Not near a bracket: nothing to highlight.
+        assert_eq!(bracket_pair(&lines, 1, 2), None);
+    }
+
+    #[test]
+    fn clicking_an_expanded_folder_in_the_sidebar_collapses_it() {
+        let root = fixture("toggle-click");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Sidebar;
+        render(&mut app, 120, 40);
+        let side = app.layout.unwrap().sidebar.unwrap();
+        assert_eq!(app.entries[0].name, "src");
+        app.handle_mouse(click(side.x + 3, side.y + 1));
+        assert!(app.expanded.contains(Path::new("src")), "first click expands");
+        assert_eq!(app.entries[1].path, PathBuf::from("src/main.rs"));
+        render(&mut app, 120, 40);
+        app.handle_mouse(click(side.x + 3, side.y + 1));
+        assert!(!app.expanded.contains(Path::new("src")), "second click collapses");
+        assert!(app.entries.iter().all(|e| e.path != PathBuf::from("src/main.rs")));
+        fs::remove_dir_all(root).unwrap();
+    }
+
 }
