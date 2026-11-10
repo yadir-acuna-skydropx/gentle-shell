@@ -427,7 +427,9 @@ impl Editor {
             return SaveOutcome::DiskChanged;
         }
         let bytes = self.to_bytes();
-        if let Err(e) = atomic_write(&self.abs, &bytes, self.mode) {
+        // Write through symlinks: renaming over the link itself would detach it from its target.
+        let target = std::fs::canonicalize(&self.abs).unwrap_or_else(|_| self.abs.clone());
+        if let Err(e) = atomic_write(&target, &bytes, self.mode) {
             return SaveOutcome::Error(e);
         }
         self.load_hash = content_hash(&bytes);
@@ -615,6 +617,23 @@ mod tests {
         assert!(!ed.handle_key(ch('x')));
         assert_eq!(ed.save(), SaveOutcome::ReadOnly);
         assert_eq!(fs::read(d.join("l1.txt")).unwrap(), original);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saving_through_a_symlink_writes_the_target_and_keeps_the_link() {
+        let d = tmp("symlink");
+        fs::create_dir_all(d.join("real")).unwrap();
+        fs::write(d.join("real/target.txt"), "original\n").unwrap();
+        std::os::unix::fs::symlink("real/target.txt", d.join("link.txt")).unwrap();
+        let mut ed = Editor::open(&d, Path::new("link.txt"));
+        assert!(ed.handle_key(ch('Z')));
+        assert_eq!(ed.save(), SaveOutcome::Saved);
+        assert!(fs::symlink_metadata(d.join("link.txt")).unwrap().file_type().is_symlink());
+        assert_eq!(fs::read_to_string(d.join("real/target.txt")).unwrap(), "Zoriginal\n");
+        let leftovers: Vec<_> = fs::read_dir(d.join("real")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(leftovers, [std::ffi::OsString::from("target.txt")]);
         fs::remove_dir_all(d).unwrap();
     }
 }
