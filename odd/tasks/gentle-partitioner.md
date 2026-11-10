@@ -20,10 +20,10 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 ## Tasks
 
 - T1 [x] S2, S3, S7, S11 — scaffold `partitioner/` crate; pure layout engine (chat-only + tool bar, partitioned sidebar/editor/diff/chat) with unit tests. Route: inline. Commit: `d6c095df7`
-- T2 [ ] S4 — file tree: directory scan, sizes, formats, git worktree status (porcelain parser); unit tests. Route: inline. Commit: —
-- T3 [ ] S2, S3, S6 — PTY pane: spawn `gentle-shell` in portable-pty, vt100 emulation, reader thread + dirty flag, resize, key-to-bytes encoding; unit tests. Route: inline. Commit: —
-- T4 [ ] S5 — center viewer: selected file content (left) + agent changes from `git diff` (right), read-only; diff classifier tests. Route: inline. Commit: —
-- T5 [ ] S2, S3, S7, S11 — app loop: threads, focus, prefix keys, mouse click on tree, tool overlay, mode toggle, redraw-on-dirty; `README.md`. Route: inline. Commit: —
+- T2 [x] S4 — file tree: directory scan, sizes, formats, git worktree status (porcelain parser); unit tests. Route: inline. Commit: `22445ba41`
+- T3 [x] S2, S3, S6 — PTY pane: spawn `gentle-shell` in portable-pty, vt100 emulation, reader thread + dirty flag, resize, key-to-bytes encoding; unit tests. Route: inline. Commit: `7660dcdc6`
+- T4 [x] S5 — center viewer: selected file content (left) + agent changes from `git diff` (right), read-only; diff classifier tests. Route: inline. Commit: `fd0db959a`
+- T5 [x] S2, S3, S7, S11 — app loop: threads, focus, prefix keys, mouse click on tree, tool overlay, mode toggle, redraw-on-dirty; `README.md`. Route: inline. Commit: `2a97f01dd`
 - T6 [ ] S5 — manual editing in the left editor pane with save. Route: later phase. Commit: —
 - T7 [ ] S8 — translator engine (pivot through English) as a middleware around Pi. Route: later phase. Commit: —
 - T8 [ ] S9 — prediction engine: decide concrete use first. Route: deferred. Commit: —
@@ -35,3 +35,4 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 - L3 (research evidence): prior art — herdr (Rust, Apache-2.0, already integrated by `extensions/gentle-herdr-agent.ts`), peemux (Rust, MIT, stack ratatui/crossterm/portable-pty), HOM, paneflow, renga, tttt, `cockpit` crate; translation pivot: langpivot, TokenTranslation, multi_lang_pivot.
 - L4 (user, verbatim): "excelnte, eso es lo que busno yo nobusco invtar queiro es moldea lo que ya exite a una vs propia, perfecto, arma el odd cones ta arqueitectura, y empzia a trbjar en el desarollo, para ir viendo mejoras, q podamos aplcair"
 - L5 (user decisions): install rustup stable in the user account; crate inside gentle-shell in its own folder; own code on ratatui + portable-pty (no fork); first slice = partitioner MVP.
+- L6 (evidence, phase 1): 41 lib tests green; release build ok; `--help` exit 0; missing command exit 1 with error; PTY smoke `-- sh -c "echo hi; sleep 1"` exit 0. clippy not installed. Engram unavailable (runtime contract mismatch), mirror not written.
