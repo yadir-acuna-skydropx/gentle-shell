@@ -82,6 +82,20 @@ impl PtyPane {
         f(self.parser.lock().unwrap().screen())
     }
 
+    /// Scrolls the chat scrollback; positive `delta` reveals older output.
+    /// vt100 clamps the target to the available scrollback.
+    pub fn scroll_chat(&mut self, delta: isize) {
+        let mut parser = self.parser.lock().unwrap();
+        let current = parser.screen().scrollback() as isize;
+        let target = (current + delta).max(0) as usize;
+        parser.screen_mut().set_scrollback(target);
+    }
+
+    /// Jumps back to the live bottom of the scrollback (used on fresh input).
+    pub fn reset_scroll(&mut self) {
+        self.parser.lock().unwrap().screen_mut().set_scrollback(0);
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.kill();
     }
@@ -196,6 +210,23 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(hits.load(Ordering::SeqCst) >= 2, "notify on output and on exit");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scroll_chat_moves_scrollback_and_reset_returns_to_bottom() {
+        let mut cmd = CommandBuilder::new("sh");
+        cmd.args(["-c", "for i in $(seq 1 100); do echo line$i; done; sleep 0.3"]);
+        let mut pane = PtyPane::spawn(cmd, 5, 20, || {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pane.with_screen(|s| s.contents().contains("line100")) {
+            assert!(Instant::now() < deadline, "no output");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        pane.scroll_chat(10);
+        assert!(pane.with_screen(|s| s.scrollback()) > 0, "scrollback moved up");
+        pane.reset_scroll();
+        assert_eq!(pane.with_screen(|s| s.scrollback()), 0, "reset returns to the live bottom");
     }
 
     #[cfg(unix)]
