@@ -130,3 +130,31 @@ fn oversized_body_is_400() {
     let r = send_raw(&server, &raw);
     assert_eq!(r.status, 400);
 }
+
+#[test]
+fn huge_content_length_is_rejected_before_allocation() {
+    let (server, _) = start();
+    let raw = build_request("POST", "/predict", Some(&server.token), "", 2_000_000_000);
+    assert_eq!(send_raw(&server, &raw).status, 400);
+}
+
+#[test]
+fn concurrent_connections_are_capped_and_recover_when_released() {
+    let (server, _) = start();
+    // Idle clients occupy every slot without sending a request.
+    let idle: Vec<TcpStream> = (0..gentle_partitioner::predict_server::MAX_CONNECTIONS)
+        .map(|_| TcpStream::connect(server.addr).unwrap())
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    let body = r#"{"text":"hola","mode":"chat"}"#;
+    assert_eq!(request(&server, "POST", "/predict", Some(&server.token), body).status, 503);
+    drop(idle);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if request(&server, "POST", "/predict", Some(&server.token), body).status == 200 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "slots never released");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}

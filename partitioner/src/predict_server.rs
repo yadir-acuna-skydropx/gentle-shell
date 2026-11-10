@@ -28,6 +28,18 @@ pub struct PredictServer {
     pub token: String,
 }
 
+/// Maximum simultaneous connections; further clients get 503 until a slot frees.
+pub const MAX_CONNECTIONS: usize = 16;
+
+/// Compares secrets without an early exit on the first differing byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = a.len() ^ b.len();
+    for i in 0..a.len().max(b.len()) {
+        diff |= (a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0)) as usize;
+    }
+    diff == 0
+}
+
 impl PredictServer {
     /// Binds 127.0.0.1:0, spawns the accept thread and returns the address and
     /// token. Never blocks the caller.
@@ -36,16 +48,38 @@ impl PredictServer {
         let addr = listener.local_addr()?;
         let token = random_token();
         let thread_token = token.clone();
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         std::thread::Builder::new().name("predict-server".into()).spawn(move || {
+            use std::sync::atomic::Ordering;
             for stream in listener.incoming() {
-                let Ok(stream) = stream else { continue };
+                let Ok(mut stream) = stream else { continue };
+                // Bound worker threads: a local client holding many sockets gets 503.
+                if active.fetch_add(1, Ordering::AcqRel) >= MAX_CONNECTIONS {
+                    active.fetch_sub(1, Ordering::AcqRel);
+                    let short = Some(std::time::Duration::from_millis(200));
+                    let _ = stream.set_read_timeout(short);
+                    let _ = stream.set_write_timeout(short);
+                    // Drain the pending request (bounded) so closing does not reset the reply.
+                    let mut sink = [0u8; 8192];
+                    let _ = std::io::Read::read(&mut stream, &mut sink);
+                    let _ = std::io::Write::write_all(
+                        &mut stream,
+                        b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                    continue;
+                }
                 let engine = engine.clone();
                 let token = thread_token.clone();
+                let slot = active.clone();
                 // Each connection on its own worker so a slow client never
                 // blocks the accept loop.
-                let _ = std::thread::Builder::new().name("predict-conn".into()).spawn(move || {
+                let spawned = std::thread::Builder::new().name("predict-conn".into()).spawn(move || {
                     let _ = handle_conn(stream, &engine, &token);
+                    slot.fetch_sub(1, Ordering::AcqRel);
                 });
+                if spawned.is_err() {
+                    active.fetch_sub(1, Ordering::AcqRel);
+                }
             }
         })?;
         Ok(PredictServer { addr, token })
@@ -147,7 +181,8 @@ fn read_request(stream: &TcpStream) -> Result<Request, ReadErr> {
 
 fn route(req: &Request, engine: &Arc<RwLock<Engine>>, token: &str) -> (u16, String) {
     // Auth first: no valid bearer token, no service.
-    if req.auth.as_deref() != Some(format!("Bearer {token}").as_str()) {
+    let expected = format!("Bearer {token}");
+    if !req.auth.as_deref().is_some_and(|got| constant_time_eq(got.as_bytes(), expected.as_bytes())) {
         return (401, err("unauthorized"));
     }
     match req.path.as_str() {
@@ -217,4 +252,18 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std::io::R
     }
     stream.write_all(resp.as_bytes())?;
     stream.flush()
+}
+
+#[cfg(test)]
+mod ct_tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn constant_time_eq_matches_only_identical_bytes() {
+        assert!(constant_time_eq(b"Bearer abc", b"Bearer abc"));
+        assert!(!constant_time_eq(b"Bearer abc", b"Bearer abd"));
+        assert!(!constant_time_eq(b"Bearer abc", b"Bearer ab"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
 }
