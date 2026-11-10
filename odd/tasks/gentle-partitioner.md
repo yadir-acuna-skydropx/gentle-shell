@@ -24,7 +24,7 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 - T3 [x] S2, S3, S6 — PTY pane: spawn `gentle-shell` in portable-pty, vt100 emulation, reader thread + dirty flag, resize, key-to-bytes encoding; unit tests. Route: inline. Commit: `7660dcdc6`
 - T4 [x] S5 — center viewer: selected file content (left) + agent changes from `git diff` (right), read-only; diff classifier tests. Route: inline. Commit: `fd0db959a`
 - T5 [x] S2, S3, S7, S11 — app loop: threads, focus, prefix keys, mouse click on tree, tool overlay, mode toggle, redraw-on-dirty; `README.md`. Route: inline. Commit: `2a97f01dd`
-- T6 [ ] S5 — manual editing in the left editor pane with save; diff refreshes after save. Route: worker (context backstop). Commit: —
+- T6 [x] S5 — manual editing in the left editor pane with save; diff refreshes after save. Route: worker (context backstop). Commit: `a63ffe4d4`
 - T7 [ ] S8 — translator engine (pivot through English) as a middleware around Pi. Route: later phase. Commit: —
 - T8 [ ] S9 — prediction engine: decide concrete use first. Route: deferred. Commit: —
 
