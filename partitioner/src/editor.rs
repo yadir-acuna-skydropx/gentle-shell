@@ -298,6 +298,21 @@ impl Editor {
         }
     }
 
+    /// Inserts a literal string at the cursor (used to accept a ghost
+    /// suggestion). Newlines split the line; read-only buffers are untouched.
+    pub fn insert_str(&mut self, s: &str) {
+        if self.readonly.is_some() {
+            return;
+        }
+        for c in s.chars() {
+            if c == '\n' {
+                self.split_line();
+            } else {
+                self.insert_char(c);
+            }
+        }
+    }
+
     fn insert_char(&mut self, c: char) {
         let line = &mut self.lines[self.cursor_line];
         let bi = byte_idx(line, self.cursor_col);

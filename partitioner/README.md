@@ -22,6 +22,49 @@ repainted — only the changed cells of that fragment are written out.
   `git diff` (right, read-only), and the **chat** at the bottom. On small
   terminals the layout
   degrades back to chat mode so the chat stays usable (S11).
+- **Prediction (S9).** A deterministic n-gram engine (no model weights, no
+  network) runs in-process. In the editor it shows a dim **ghost suggestion**
+  after the cursor at the end of a line; `Tab` or `Right` accept it. The same
+  engine is served on a loopback HTTP endpoint (random port, bearer token) so
+  the `gentle-shell` child can use it for its own prompt editor. Disable it all
+  with `--no-predict`.
+
+## Prediction engine & server
+
+The engine (`predict.rs`) keeps unigram/bigram/trigram continuation counts with
+trigram → bigram → unigram backoff, plus a frequency-ordered prefix index that
+completes the partial current word. It is tokenized on Unicode words (letters,
+digits and `_`, so Spanish accents and `ñ` work) plus single punctuation tokens.
+`predict(text_before_cursor, mode)` returns **only the suffix** to insert:
+
+- Inside a word (≥ 2 chars typed): the most frequent known longer word with that
+  prefix, with the typed prefix's case preserved.
+- At a boundary: up to three next words via backoff, stopping at a line end.
+- Never on empty/whitespace input or when the best candidate count is below 2;
+  suggestions are capped at 60 characters.
+
+There are two independent models, `code` and `chat`. Memory is bounded by
+pruning count-1 entries once the vocabulary passes ~200k n-gram entries. At
+startup, on background threads: `code` is seeded from the repo's tracked text
+files (`git ls-files`, skipping binaries and files > 256 KiB, capped at 20 MiB);
+`chat` is seeded from gentle-shell's shared prompt history when present
+(`~/.pi/agent/history/{history-global.jsonl, projects/<hash>/*.jsonl}`, read-only).
+
+The server (`predict_server.rs`) is a std `TcpListener` bound to `127.0.0.1:0`
+on its own thread, sharing the engine via `Arc<RwLock<..>>`. The child receives
+`GENTLE_PREDICT_URL=http://127.0.0.1:<port>` and `GENTLE_PREDICT_TOKEN=<token>`
+(32 random hex chars from `/dev/urandom`).
+
+| Request | Response |
+| --- | --- |
+| `POST /predict {"text":"...","mode":"chat"\|"code"}` | `200 {"suggestion":"..."}` (empty when none) |
+| `POST /learn {"text":"...","mode"?}` | `204` |
+| missing / wrong `Authorization: Bearer <token>` | `401` |
+| unknown path | `404` · wrong method `405` |
+| body > 64 KiB or bad JSON | `400` |
+
+JSON for these two shapes is parsed and serialized by hand (quotes, backslashes,
+control characters and `\uXXXX` are handled).
 
 ## Build & run
 
@@ -42,12 +85,14 @@ cargo run --release -- sh -c 'echo hi; sleep 1'
 Other flags:
 
 ```sh
-gentle-partitioner --help      # usage
-gentle-partitioner --version   # version
+gentle-partitioner --help        # usage
+gentle-partitioner --version     # version
+gentle-partitioner --no-predict  # disable the prediction engine and server
 ```
 
 The child process inherits the current working directory, with
-`TERM=xterm-256color` and `GENTLE_PARTITIONER=1` set. If the command cannot be
+`TERM=xterm-256color` and `GENTLE_PARTITIONER=1` set (plus
+`GENTLE_PREDICT_URL`/`GENTLE_PREDICT_TOKEN` unless `--no-predict`). If the command cannot be
 found on `PATH`, the partitioner prints a clear error naming it and exits with
 status `1` without disturbing the terminal.
 
@@ -74,6 +119,9 @@ else is forwarded to the chat.
   `Ctrl+Home`/`Ctrl+End`. `Ctrl+S` saves, `Ctrl+R` reloads from disk
   (discarding edits). A `●` before the path marks unsaved edits. `Esc` returns
   to the chat.
+  - With prediction on, a dim **ghost suggestion** appears after the cursor at
+    the end of a line; `Tab` or `Right` accept it. Without a ghost, `Tab` and
+    `Right` behave exactly as above. Saving learns the buffer (mode `code`).
   - Saving writes atomically (temp file + rename, preserving permissions) and
     refuses if the file changed on disk since it was loaded — `Ctrl+R` reloads.
   - Opening another file or quitting with unsaved edits warns first; repeat the
@@ -111,6 +159,10 @@ else is forwarded to the chat.
 - **`editor.rs`** — the left half of the center viewer: a small editable buffer
   that preserves the file’s bytes (tabs, CRLF/LF, trailing newline) and saves
   atomically with an on-disk-change guard.
+- **`predict.rs`** — the deterministic n-gram prediction engine, the hand-written
+  JSON helpers, and the repo/history seeding (S9).
+- **`predict_server.rs`** — the loopback HTTP server exposing the engine to the
+  `gentle-shell` child with a bearer token (S9).
 - **`keys.rs`** — encodes crossterm key events as the bytes a terminal sends to
   a PTY child.
 
@@ -119,8 +171,10 @@ else is forwarded to the chat.
 - **T7 (S8)** — translator engine: a pivot-through-English middleware around Pi,
   so the user always reads their native language while everything flows through
   English.
-- **T8 (S9)** — prediction engine: deferred until a concrete use is decided
-  (the LLM already predicts the next token).
+- **T8a (S9)** — prediction engine, local server and editor ghost text: **done**.
+- **T8b (S9)** — gentle-shell prompt editor ghost suggestion from
+  `GENTLE_PREDICT_URL` (dim inline, `Tab`/`Right` accept, learn submitted
+  prompts): next.
 
 ## Fast development loop
 

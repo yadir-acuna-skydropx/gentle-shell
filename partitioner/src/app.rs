@@ -3,6 +3,7 @@
 //! the event loop in `main.rs` only wires threads, PTY and terminal.
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::{Position, Rect};
@@ -14,6 +15,7 @@ use ratatui::Frame;
 use crate::editor::{Editor, SaveOutcome};
 use crate::layout::{self, Layout, Mode};
 use crate::pane::{self, PtyPane};
+use crate::predict::{Engine, PredictMode};
 use crate::tree::{self, Entry, GitStatus};
 use crate::viewer::{self, DiffKind, Viewer};
 
@@ -78,6 +80,10 @@ pub struct App {
     pub tree_offset: usize,
     pub layout: Option<Layout>,
     pub overlay_area: Option<Rect>,
+    /// Shared n-gram engine (S9); `None` disables ghost suggestions and learning.
+    pub predict: Option<Arc<RwLock<Engine>>>,
+    /// Dim ghost suffix shown after the editor cursor, when any.
+    pub ghost: Option<String>,
 }
 
 impl App {
@@ -103,9 +109,42 @@ impl App {
             tree_offset: 0,
             layout: None,
             overlay_area: None,
+            predict: None,
+            ghost: None,
         };
         app.rescan();
         app
+    }
+
+    /// Wires the shared prediction engine (S9) for in-process ghost text.
+    pub fn set_predict(&mut self, engine: Arc<RwLock<Engine>>) {
+        self.predict = Some(engine);
+    }
+
+    /// Recomputes the editor ghost: only when the editor is focused, editable,
+    /// no overlay is open and the cursor sits at the END of a non-blank line.
+    fn refresh_ghost(&mut self) {
+        self.ghost = None;
+        let Some(engine) = self.predict.clone() else { return };
+        if self.effective_focus() != Focus::Editor || self.overlay.is_some() {
+            return;
+        }
+        let before = match &self.editor {
+            Some(e) if !e.is_read_only() => {
+                let line = &e.lines[e.cursor_line];
+                if e.cursor_col != line.chars().count() {
+                    return; // cursor is not at the end of the line
+                }
+                line.clone()
+            }
+            _ => return,
+        };
+        if before.trim().is_empty() {
+            return;
+        }
+        if let Ok(eng) = engine.read() {
+            self.ghost = eng.predict(&before, PredictMode::Code);
+        }
     }
 
     /// Rebuilds the tree from disk with the current git statuses.
@@ -170,6 +209,7 @@ impl App {
         self.mode = Mode::Workspace;
         self.focus = Focus::Editor;
         self.overlay = None;
+        self.refresh_ghost();
     }
 
     /// Whether the main loop should ask the git worker to refresh (after a save).
@@ -190,6 +230,13 @@ impl App {
                 self.pending_quit = false;
                 self.pending_discard = None;
                 self.needs_git_refresh = true;
+                // Learn the saved buffer into the code model (S9).
+                if let (Some(engine), Some(e)) = (self.predict.clone(), &self.editor) {
+                    let text = e.lines.join("\n");
+                    if let Ok(mut eng) = engine.write() {
+                        eng.learn(&text, PredictMode::Code);
+                    }
+                }
                 if let Some(v) = &mut self.viewer {
                     let p = v.path.clone();
                     v.diff = viewer::git_diff(&self.root, &p);
@@ -389,18 +436,31 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
+                self.ghost = None;
                 self.focus = Focus::Chat;
                 return Action::None;
             }
             KeyCode::Char('s') if ctrl => {
                 self.save_editor();
+                self.refresh_ghost();
                 return Action::None;
             }
             KeyCode::Char('r') if ctrl => {
                 self.reload_editor();
+                self.ghost = None;
                 return Action::None;
             }
             _ => {}
+        }
+        // A shown ghost is accepted by Tab or Right; otherwise those keys keep
+        // their usual meaning (literal tab / move right).
+        if self.ghost.is_some() && !ctrl && matches!(key.code, KeyCode::Tab | KeyCode::Right) {
+            let suffix = self.ghost.take().unwrap();
+            if let Some(e) = &mut self.editor {
+                e.insert_str(&suffix);
+            }
+            self.refresh_ghost();
+            return Action::None;
         }
         let mut readonly_reason = None;
         if let Some(e) = &mut self.editor {
@@ -415,6 +475,7 @@ impl App {
         if let Some(reason) = readonly_reason {
             self.status_msg = Some(reason);
         }
+        self.refresh_ghost();
         Action::None
     }
 
@@ -528,6 +589,7 @@ impl App {
                     let gutter = e.gutter_width();
                     e.click(ed.x + 1, ed.y + 1, gutter, col, row);
                 }
+                self.refresh_ghost();
                 return Action::None;
             }
         }
@@ -735,6 +797,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
 
     if let (Some(ed), Some(df)) = (l.editor, l.diff) {
         // Left pane: the editable buffer.
+        let ghost = if focus == Focus::Editor { app.ghost.clone() } else { None };
         match &mut app.editor {
             Some(e) => {
                 let mark = if e.dirty { "\u{25cf} " } else { "" };
@@ -748,6 +811,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
                 e.page = text_h.max(1);
                 e.ensure_visible(text_h, text_w);
                 let (scroll_row, scroll_col) = (e.scroll_row, e.scroll_col);
+                let cursor_line = e.cursor_line;
                 let lines: Vec<Line> = e
                     .lines
                     .iter()
@@ -757,10 +821,17 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
                     .map(|(i, t)| {
                         let expanded = crate::editor::expand_tabs(t);
                         let shown: String = expanded.chars().skip(scroll_col).take(text_w.max(1)).collect();
-                        Line::from(vec![
+                        let mut spans = vec![
                             Span::styled(format!("{:>num_w$} ", i + 1), Style::default().fg(Color::DarkGray)),
                             Span::raw(shown),
-                        ])
+                        ];
+                        // Dim ghost suggestion rendered after the cursor (S9).
+                        if i == cursor_line {
+                            if let Some(g) = &ghost {
+                                spans.push(Span::styled(g.clone(), Style::default().fg(Color::DarkGray)));
+                            }
+                        }
+                        Line::from(spans)
                     })
                     .collect();
                 frame.render_widget(Paragraph::new(lines).block(block), ed);
@@ -1198,6 +1269,80 @@ mod tests {
         assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"oneX\n");
         let diff = &app.viewer.as_ref().unwrap().diff;
         assert!(diff.iter().any(|d| d.kind == DiffKind::Added && d.text == "+oneX"), "diff refreshed: {diff:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn engine_with(text: &str) -> Arc<RwLock<Engine>> {
+        let engine = Arc::new(RwLock::new(Engine::new()));
+        engine.write().unwrap().learn(text, PredictMode::Code);
+        engine
+    }
+
+    /// Opens README, drops onto a fresh empty line and types `typed`, leaving
+    /// the cursor at the end of the line so a ghost can appear.
+    fn editor_typing(app: &mut App, typed: &str) {
+        app.open_file(Path::new("README.md"));
+        render(app, 120, 40);
+        app.handle_key(key(KeyCode::End));
+        app.handle_key(key(KeyCode::Enter));
+        for c in typed.chars() {
+            app.handle_key(ch(c));
+        }
+    }
+
+    #[test]
+    fn ghost_is_shown_and_tab_accepts_it() {
+        let root = fixture("ghost-tab");
+        let mut app = App::new(root.clone());
+        app.set_predict(engine_with("configuración configuración"));
+        editor_typing(&mut app, "configura");
+        assert_eq!(app.ghost.as_deref(), Some("ción"));
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.editor.as_ref().unwrap().lines[1], "configuración");
+        // Completed word: nothing longer to offer, so the ghost is gone.
+        assert_eq!(app.ghost, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn right_accepts_the_ghost() {
+        let root = fixture("ghost-right");
+        let mut app = App::new(root.clone());
+        app.set_predict(engine_with("configuración configuración"));
+        editor_typing(&mut app, "configura");
+        assert_eq!(app.ghost.as_deref(), Some("ción"));
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.editor.as_ref().unwrap().lines[1], "configuración");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn another_key_clears_the_ghost() {
+        let root = fixture("ghost-clear");
+        let mut app = App::new(root.clone());
+        app.set_predict(engine_with("configuración configuración"));
+        editor_typing(&mut app, "configura");
+        assert!(app.ghost.is_some());
+        // Moving the cursor off the line end clears the suggestion.
+        app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.ghost, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn tab_and_right_are_unchanged_without_a_ghost() {
+        let root = fixture("no-ghost");
+        let mut app = App::new(root.clone());
+        // No engine wired: the ghost is always None, so Tab/Right keep their
+        // usual meaning exactly as before (literal tab, move right).
+        app.open_file(Path::new("README.md"));
+        render(&mut app, 120, 40);
+        assert_eq!(app.handle_key(key(KeyCode::Tab)), Action::None);
+        assert_eq!(app.editor.as_ref().unwrap().lines[0], "\t# hi");
+        let before = app.editor.as_ref().unwrap().cursor_col;
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.editor.as_ref().unwrap().cursor_col, before + 1);
+        assert_eq!(app.ghost, None);
         fs::remove_dir_all(root).unwrap();
     }
 

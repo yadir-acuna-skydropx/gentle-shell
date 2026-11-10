@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -26,6 +26,8 @@ use ratatui::Terminal;
 
 use gentle_partitioner::app::{draw, Action, App, Focus};
 use gentle_partitioner::pane::PtyPane;
+use gentle_partitioner::predict::{self, Engine};
+use gentle_partitioner::predict_server::PredictServer;
 use gentle_partitioner::tree::{self, GitStatus};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -42,9 +44,11 @@ USAGE:
 OPTIONS:
     -h, --help       Print help
     -V, --version    Print version
+        --no-predict Disable the local n-gram prediction engine and server
 
 Without a command it runs `gentle-shell` inside a partitioned terminal.
 Everything after `--` is launched instead of the default command.
+With prediction on, the child sees GENTLE_PREDICT_URL and GENTLE_PREDICT_TOKEN.
 ";
 
 type Backend = CrosstermBackend<io::Stdout>;
@@ -70,10 +74,11 @@ fn main() {
 }
 
 fn run() -> Result<i32> {
-    let command = match parse_args(std::env::args().skip(1).collect())? {
-        ParseOutcome::Run(cmd) => cmd,
+    let opts = match parse_args(std::env::args().skip(1).collect())? {
+        ParseOutcome::Run(opts) => opts,
         ParseOutcome::Exit(code) => return Ok(code),
     };
+    let command = opts.command;
 
     // Resolve before touching the terminal so a missing command yields a clean,
     // readable error instead of a corrupted screen.
@@ -84,20 +89,26 @@ fn run() -> Result<i32> {
 
     install_panic_hook();
     let mut terminal = setup_terminal().context("entering raw mode / alternate screen")?;
-    let result = event_loop(&mut terminal, &command);
+    let result = event_loop(&mut terminal, &command, opts.predict);
     // Always restore the terminal, even when the loop failed.
     let _ = restore_terminal();
     result.map(|_| 0)
 }
 
+struct RunOpts {
+    command: Vec<String>,
+    predict: bool,
+}
+
 enum ParseOutcome {
-    Run(Vec<String>),
+    Run(RunOpts),
     Exit(i32),
 }
 
 fn parse_args(args: Vec<String>) -> Result<ParseOutcome> {
     let mut iter = args.into_iter();
     let mut command: Vec<String> = Vec::new();
+    let mut predict = true;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -107,6 +118,9 @@ fn parse_args(args: Vec<String>) -> Result<ParseOutcome> {
             "-V" | "--version" => {
                 println!("gentle-partitioner {VERSION}");
                 return Ok(ParseOutcome::Exit(0));
+            }
+            "--no-predict" => {
+                predict = false;
             }
             "--" => {
                 command.extend(iter.by_ref());
@@ -122,7 +136,37 @@ fn parse_args(args: Vec<String>) -> Result<ParseOutcome> {
     if command.is_empty() {
         command.push(DEFAULT_COMMAND.to_string());
     }
-    Ok(ParseOutcome::Run(command))
+    Ok(ParseOutcome::Run(RunOpts { command, predict }))
+}
+
+/// Shared handles for the prediction engine and its local server.
+struct PredictHandles {
+    engine: Arc<RwLock<Engine>>,
+    url: String,
+    token: String,
+    /// Kept alive for the process lifetime (the listener thread serves on).
+    _server: PredictServer,
+}
+
+/// Starts the engine and its server, then seeds both models off the UI thread
+/// (repo text for code, shared prompt history for chat).
+fn setup_predict(root: &Path) -> Result<PredictHandles> {
+    let engine = Arc::new(RwLock::new(Engine::new()));
+    let server = PredictServer::start(engine.clone()).context("starting the predict server")?;
+    let url = server.url();
+    let token = server.token.clone();
+    {
+        let engine = engine.clone();
+        let root = root.to_path_buf();
+        std::thread::spawn(move || predict::seed_code_repo(&engine, &root));
+    }
+    {
+        let engine = engine.clone();
+        std::thread::spawn(move || {
+            let _ = predict::seed_chat_history(&engine);
+        });
+    }
+    Ok(PredictHandles { engine, url, token, _server: server })
 }
 
 /// Finds `program` on PATH (or validates an explicit path). Returns the
@@ -161,9 +205,23 @@ fn install_panic_hook() {
     }));
 }
 
-fn event_loop(terminal: &mut Terminal<Backend>, command: &[String]) -> Result<()> {
+fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enabled: bool) -> Result<()> {
     let root = std::env::current_dir().context("reading the current directory")?;
     let mut app = App::new(root.clone());
+
+    // Start prediction before the child so its env can carry the URL/token.
+    let predict = if predict_enabled {
+        match setup_predict(&root) {
+            Ok(h) => Some(h),
+            // Prediction is best-effort: a failure must not stop the shell.
+            Err(_) => None,
+        }
+    } else {
+        None
+    };
+    if let Some(h) = &predict {
+        app.set_predict(h.engine.clone());
+    }
 
     let (tx, rx) = mpsc::channel::<Event>();
     spawn_input_thread(tx.clone());
@@ -172,7 +230,7 @@ fn event_loop(terminal: &mut Terminal<Backend>, command: &[String]) -> Result<()
     // Coalesce PTY wake-ups: the reader thread flips the flag and only sends a
     // PtyOutput when none is pending, so the UI never floods on fast output.
     let pty_pending = Arc::new(AtomicBool::new(false));
-    let mut pty = spawn_pty(terminal, &mut app, command, &root, tx.clone(), pty_pending.clone())?;
+    let mut pty = spawn_pty(terminal, &mut app, command, &root, tx.clone(), pty_pending.clone(), predict.as_ref())?;
 
     // Prime the first git refresh and paint the initial frame.
     let _ = git_tx.send(());
@@ -284,6 +342,7 @@ fn spawn_pty(
     root: &Path,
     tx: Sender<Event>,
     pending: Arc<AtomicBool>,
+    predict: Option<&PredictHandles>,
 ) -> Result<PtyPane> {
     let size = terminal.size()?;
     let inner = app.chat_inner(Rect::new(0, 0, size.width, size.height));
@@ -295,6 +354,11 @@ fn spawn_pty(
     cmd.cwd(root);
     cmd.env("TERM", "xterm-256color");
     cmd.env("GENTLE_PARTITIONER", "1");
+    // The gentle-shell child uses these to reach the in-process engine (S9).
+    if let Some(h) = predict {
+        cmd.env("GENTLE_PREDICT_URL", &h.url);
+        cmd.env("GENTLE_PREDICT_TOKEN", &h.token);
+    }
 
     let notify = move || {
         // Send only when no PtyOutput is already queued.
