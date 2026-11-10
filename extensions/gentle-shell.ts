@@ -2,6 +2,7 @@ import { sharedCooldown, syncUsageCooldown } from "../lib/model-fallback-policy.
 import { CustomEditor, keyHint, type ExtensionAPI, type ExtensionContext, type KeybindingsManager } from "@earendil-works/pi-coding-agent";
 import { isHomeOrBroadUserDirectory } from "../lib/bounded-writer-admission.ts";
 import { Editor, Image, Key, decodeKittyPrintable, getCapabilities, isKeyRelease, matchesKey, parseKey, truncateToWidth, visibleWidth, type Component, type EditorTheme, type TUI, type TuiMouseEvent } from "@earendil-works/pi-tui";
+import { fromEnv as promptPredictorFromEnv, type PredictResponse, type PromptPredictor } from "../lib/prompt-prediction.ts";
 import { readClipboardImage, type ClipboardImage } from "../lib/clipboard-image.ts";
 import { readPastedImagePaths } from "../lib/pasted-image-paths.ts";
 import { describeAttachment, ImageAttachments } from "../lib/image-attachments.ts";
@@ -530,9 +531,20 @@ interface PromptEditorDeps {
 	onTopRowClick?: (index: number) => void;
 	/** Open the same sheet as /gentle:panel. */
 	onPanelClick?: () => void;
+	/**
+	 * Build this editor's inline-suggestion predictor (S9), or return null/undefined
+	 * when gentle-shell runs outside gentle-partitioner (no GENTLE_PREDICT_URL). Only
+	 * a non-null predictor activates the ghost-suggestion code path; without one the
+	 * editor renders and handles input exactly as before.
+	 */
+	createPredictor?: () => PromptPredictor | null | undefined;
 }
 
 const PROMPT_FRAME_ROLE = "border";
+// Pi 1.2 wraps the drawn cursor cell in paired APC markers; the inline ghost is
+// injected right after the closing one. Matches the literal used across lib/
+// (shell-prompt.ts, selection-engine.ts) since pi-tui does not re-export it.
+const PROMPT_FAKE_CURSOR_END = "\x1b_pi:/fc\x07";
 // Matches Pi's own idle double-Esc window (empty editor -> /tree or /fork);
 // this is the same muscle memory applied to clearing a non-empty draft.
 const IDLE_ESC_CLEAR_WINDOW_MS = 500;
@@ -619,6 +631,12 @@ export class GentlePromptEditor extends CustomEditor {
 	// Counts submitted drafts, so a clipboard read that resolves after its
 	// draft was sent never lands in (and rides along with) the next message.
 	private submittedDrafts = 0;
+	// Inline suggestion engine (S9); undefined outside gentle-partitioner, which
+	// keeps every prediction code path dormant and the editor byte-for-byte as before.
+	private readonly predictor: PromptPredictor | undefined;
+	// The suffix offered after the cursor, paired with the exact draft it was
+	// computed for; rendered dim and never written into the stored text until accepted.
+	private ghost: { text: string; suffix: string } | undefined;
 
 	constructor(tui: TUI, theme: EditorTheme, keybindings: KeybindingsManager, deps: PromptEditorDeps) {
 		super(tui, theme, keybindings);
@@ -626,6 +644,20 @@ export class GentlePromptEditor extends CustomEditor {
 		this.deps = deps;
 		this.pointerTui = tui;
 		this.keybindingsManager = keybindings;
+		this.predictor = deps.createPredictor?.() ?? undefined;
+		// Teach the engine every submitted prompt (S9). Pi assigns onSubmit after
+		// construction, so intercept through an accessor; without a predictor the
+		// property stays an ordinary field and submit is untouched.
+		if (this.predictor) {
+			const predictor = this.predictor;
+			let piSubmit: ((text: string) => void) | undefined;
+			Object.defineProperty(this, "onSubmit", {
+				configurable: true,
+				enumerable: true,
+				get: () => piSubmit ? (text: string) => { predictor.learn(text); piSubmit!(text); } : piSubmit,
+				set: (handler: ((text: string) => void) | undefined) => { piSubmit = handler; },
+			});
+		}
 		const attachments = deps.attachments;
 		if (!attachments || !deps.readClipboardImage) return;
 		// SAFETY: Pi's Editor routes cursor movement, wrapping and deletion through
@@ -859,6 +891,11 @@ export class GentlePromptEditor extends CustomEditor {
 	 * and never reach this branch.
 	 */
 	override handleInput(data: string): void {
+		// Inline suggestion (S9): Tab/Right accept a shown ghost; any other key clears
+		// it. Only active when a predictor exists, so the native chain is untouched
+		// outside gentle-partitioner.
+		if (this.predictor && this.consumeGhostKey(data)) return;
+		const textBeforeInput = this.predictor ? this.getText() : undefined;
 		// Selection and Vim handlers can consume input before the native chain;
 		// any intervening key invalidates an idle Esc confirmation.
 		if (this.pendingIdleClearDeadline !== undefined && !this.keybindingsManager.matches(data, "app.interrupt")) {
@@ -870,6 +907,80 @@ export class GentlePromptEditor extends CustomEditor {
 		// registered extension shortcut still owns its chord (gentle-shell#1565).
 		if (this.vimPolicy === "on") this.handleInputNative(data);
 		else this.selectionEngine.handleInput(data, (d) => this.handleInputNative(d), (d) => this.onExtensionShortcut?.(d) === true);
+		if (this.predictor) this.updatePredictionAfterInput(textBeforeInput!);
+	}
+
+	/** True while a ghost is both stored and valid for the current draft/cursor. */
+	private ghostVisible(): boolean {
+		return this.ghost !== undefined && this.ghost.text === this.getText() && this.cursorAtEndOfLastLine();
+	}
+
+	private cursorAtEndOfLastLine(): boolean {
+		const lines = this.getLines();
+		const cursor = this.getCursor();
+		return cursor.line === lines.length - 1 && cursor.col === (lines[cursor.line]?.length ?? 0);
+	}
+
+	/**
+	 * Decide a key against the ghost. Returns true only when it accepts the ghost
+	 * (and should not reach the native chain). Tab or Right accept when a ghost is
+	 * shown and Pi's autocomplete is closed; otherwise the key is forwarded exactly
+	 * as before, and any non-accept key clears the ghost first.
+	 */
+	private consumeGhostKey(data: string): boolean {
+		const accept = matchesKey(data, "tab") || matchesKey(data, "right");
+		if (accept) {
+			if (this.ghostVisible() && !this.isShowingAutocomplete()) {
+				const suffix = this.ghost!.suffix;
+				this.ghost = undefined;
+				this.insertTextAtCursor(suffix);
+				this.deps.requestRender();
+				return true;
+			}
+			return false;
+		}
+		if (this.ghost !== undefined) { this.ghost = undefined; this.deps.requestRender(); }
+		return false;
+	}
+
+	/** After the native chain runs, drop a stale ghost and request a fresh suggestion. */
+	private updatePredictionAfterInput(before: string): void {
+		const text = this.getText();
+		if (text === before) {
+			// The cursor may have moved off the end; a ghost only applies there.
+			if (this.ghost !== undefined && !this.ghostVisible()) { this.ghost = undefined; this.deps.requestRender(); }
+			return;
+		}
+		// The draft changed: any stored ghost was for the previous text.
+		this.ghost = undefined;
+		if (text !== "" && this.cursorAtEndOfLastLine()) {
+			this.predictor!.request(text, (suffix) => this.onSuggestion(text, suffix));
+		}
+	}
+
+	private onSuggestion(requestText: string, suffix: string): void {
+		if (!suffix || this.getText() !== requestText || !this.cursorAtEndOfLastLine()) return;
+		this.ghost = { text: requestText, suffix };
+		this.deps.requestRender();
+	}
+
+	/**
+	 * Overlay the dim ghost onto the last rendered editor row, after Pi's cursor
+	 * cell, replacing trailing padding so the row stays exactly `inner` wide. The
+	 * stored text never changes; only the painted row does.
+	 */
+	private injectGhost(lines: string[], inner: number): void {
+		if (!this.ghostVisible() || lines.length < 3) return;
+		const idx = lines.length - 2;
+		const row = lines[idx]!;
+		const endMarker = row.lastIndexOf(PROMPT_FAKE_CURSOR_END);
+		const head = endMarker >= 0 ? row.slice(0, endMarker + PROMPT_FAKE_CURSOR_END.length) : row.replace(/ +$/u, "");
+		const padWidth = inner - visibleWidth(head);
+		if (padWidth <= 0) return;
+		const ghostText = truncateToWidth(this.ghost!.suffix, padWidth, "");
+		const ghostWidth = visibleWidth(ghostText);
+		if (ghostWidth === 0) return;
+		lines[idx] = head + this.deps.fg("dim", ghostText) + " ".repeat(Math.max(0, padWidth - ghostWidth));
 	}
 
 	private handleInputNative(data: string): void {
@@ -1395,6 +1506,7 @@ export class GentlePromptEditor extends CustomEditor {
 		this.floatMouseLayout = layout.background || layout.panel ? layout : undefined;
 		const inner = layout.nativeWidth;
 		const lines = super.render(inner);
+		if (this.predictor) this.injectGhost(lines, inner);
 		if (this.getText() === "" && lines.length === 3) lines[1] = withPromptHint(lines[1], PROMPT_HINT, this.deps.fg);
 		const state = this.promptState === PROMPT_STATE.WORKING && this.deps.pending() ? PROMPT_STATE.QUEUED : this.promptState;
 		// Neon keeps the shell's border role; float follows Pi's live public
@@ -1478,6 +1590,7 @@ export class GentlePromptEditor extends CustomEditor {
 
 	dispose(): void {
 		this.disposed = true;
+		this.predictor?.dispose();
 		this.clearEditorHover();
 		this.stopWatchdog();
 	}
@@ -1557,7 +1670,7 @@ type PromptFactory = NonNullable<ReturnType<ExtensionContext["ui"]["getEditorCom
 function installPrompt(
 	ctx: ExtensionContext,
 	onCreated: (prompt: GentlePromptEditor) => void,
-	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; attachments?: ImageAttachments; readClipboardImage?: () => Promise<ClipboardImage | null>; panelChrome?: (tui: TUI) => boolean; panelButton?: (tui: TUI) => boolean; topRows?: (tui: TUI, width: number, hovered?: number) => string[]; onTopRowClick?: (tui: TUI, index: number) => void; onPanelClick?: () => void },
+	promptDeps: { now: () => number; doubleEscCancelEnabled: () => boolean; dispatchQueuedText: (text: string) => void; vimRuntimeVersion?: () => string | undefined; attachments?: ImageAttachments; readClipboardImage?: () => Promise<ClipboardImage | null>; panelChrome?: (tui: TUI) => boolean; panelButton?: (tui: TUI) => boolean; topRows?: (tui: TUI, width: number, hovered?: number) => string[]; onTopRowClick?: (tui: TUI, index: number) => void; onPanelClick?: () => void; createPredictor?: () => PromptPredictor | null | undefined },
 ): boolean {
 	const previous = ctx.ui.getEditorComponent() as PromptFactory | undefined;
 	if (previous && !previous[PROMPT_OWNER]) return false;
@@ -1581,6 +1694,7 @@ function installPrompt(
 			topRows: promptDeps.topRows ? (width, hovered) => promptDeps.topRows!(tui, width, hovered) : undefined,
 			onTopRowClick: promptDeps.onTopRowClick ? (index) => promptDeps.onTopRowClick!(tui, index) : undefined,
 			onPanelClick: promptDeps.onPanelClick,
+			createPredictor: promptDeps.createPredictor,
 		});
 		// Pi's own docs require an explicit requestRender() after a state change
 		// (docs/tui.md: "Call tui.requestRender() after state changes"); no host
@@ -2936,7 +3050,11 @@ export default function gentleShell(pi: ExtensionAPI, env: NodeJS.ProcessEnv = p
 				topRows: (tui, width, hovered) => panelTopRows(tui, width, ctx.ui.theme, hovered),
 				// The mobile work row is the first top row; a tap on it opens the leading section's view.
 				onTopRowClick: (tui, index) => { if (chromeMode(tui) === "narrow" && index === 0) openWorkRow(tui, ctx); },
-				onPanelClick: () => { void openPanelSheet(ctx); } },
+				onPanelClick: () => { void openPanelSheet(ctx); },
+				// S9: each editor gets its own predictor, built from the partitioner env
+				// (GENTLE_PREDICT_URL/_TOKEN). Outside gentle-partitioner this returns null
+				// and the ghost-suggestion code path never runs.
+				createPredictor: () => promptPredictorFromEnv(env, { fetch: (url, init) => deps.fetch(url, init as RequestInit) as Promise<PredictResponse> }) },
 		);
 		imageAttachments.clear();
 		ctx.ui.setWidget(IMAGE_ATTACHMENTS_WIDGET_KEY, ownsPrompt

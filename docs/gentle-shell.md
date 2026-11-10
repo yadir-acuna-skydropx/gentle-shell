@@ -151,6 +151,30 @@ While a draft holds chips, a strip above the prompt lists each one:
   { "app.clipboard.pasteImage": ["ctrl+v", "alt+v"] }
   ```
 
+### Inline suggestions
+
+When gentle-shell runs **inside gentle-partitioner**, the prompt shows a dim inline
+suggestion — a ghost continuation of what you are typing — drawn after the cursor
+without changing your draft:
+
+```text
+explain the error in█ npm test
+```
+
+- **Where it comes from:** gentle-partitioner runs a local next-word prediction
+  engine (n-grams, S9) and serves it on `127.0.0.1` with a bearer token, passing
+  `GENTLE_PREDICT_URL` and `GENTLE_PREDICT_TOKEN` to the gentle-shell child. The
+  suggestion appears only while typing at the end of the line.
+- **Accept it:** press **Tab** or **Right** to insert the suggestion at the cursor.
+  Any other key dismisses it; a new suggestion follows as you keep typing. While
+  Pi's autocomplete dropdown is open, Tab and Right go to the dropdown and the
+  ghost is left untouched.
+- **Learning:** each submitted prompt is fed back to the engine so later
+  suggestions match how you write.
+- **Outside gentle-partitioner:** without `GENTLE_PREDICT_URL` the prompt behaves
+  exactly as before — no suggestion, no extra network calls, identical rendering
+  and input handling.
+
 ### Changes
 
 Changes shows the **current Git state** — working tree against HEAD, untracked files included — of the session's repository and of every worktree or repository its subagents used that still exists. Nothing is scanned at startup; the list fills at the first turn end or when the panel opens, then refreshes at each turn end and while the panel is open. Fullscreen, the sidebar, and mouse interaction are unchanged.
