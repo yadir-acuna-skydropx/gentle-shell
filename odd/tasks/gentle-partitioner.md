@@ -26,7 +26,7 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 - T5 [x] S2, S3, S7, S11 — app loop: threads, focus, prefix keys, mouse click on tree, tool overlay, mode toggle, redraw-on-dirty; `README.md`. Route: inline. Commit: `2a97f01dd`
 - T6 [x] S5 — manual editing in the left editor pane with save; diff refreshes after save. Route: worker (context backstop). Commit: `a63ffe4d4`
 - T7 [x] S8 — translator engine: separate Pi extension in `translator/` (not under `extensions/`, so gentle-shell is unchanged): `input` transform prompt → English, English-only system note via `appendSystemPromptOnce`, reply translated to the user's language for display only (model context stays English), code blocks/inline code/tool output never translated, fail-open when LibreTranslate is offline; `/translate on|off|<lang>` + status. Engine: LibreTranslate in Docker on 127.0.0.1:5000 (en,es). Route: worker (context backstop). Commit: `334b01a60`
-- T8a [ ] S9, S2, S11 — n-gram engine (`partitioner/src/predict.rs`), local HTTP server with token, learn from repo text and saves, dim ghost suggestion in the partitioner editor (Tab/Right accept), env passed to the child. Route: worker. Commit: —
+- T8a [x] S9, S2, S11 — n-gram engine (`partitioner/src/predict.rs`), local HTTP server with token, learn from repo text and saves, dim ghost suggestion in the partitioner editor (Tab/Right accept), env passed to the child. Route: worker. Commit: `3ab819db0`
 - T8b [ ] S9 — gentle-shell prompt editor: dim inline ghost suggestion from GENTLE_PREDICT_URL (debounced, abortable), Tab/Right accept only when a ghost is shown, learn submitted prompts; no change when the env is absent. Route: worker. Risk: item 3 (shared prompt editor). Commit: —
 
 ## Log
@@ -45,3 +45,4 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 - L12 (user, verbatim, after trying T7): "bien veo todo en orden asi que ahora avanza con el siguente punto"
 - L13 (user decisions, T8): use = "En los dos" (chat and editor, one shared engine); engine = "Investigar primero".
 - L14 (user decisions after T8 research): chat = "Texto gris inline (modifica Gentle Shell)"; engine = "Solo n-gramas". This amends S1 for S9: the gentle-shell prompt editor may be modified for the ghost suggestion.
+- L15 (evidence, T8a): 68 lib + 2 cli + 9 server tests green; predict 1.6 µs after seeding 5 MB (release, ignored test); child gets GENTLE_PREDICT_URL (smoke: http://127.0.0.1:35517); curl 401 without token, 204 learn, 200 predict. History roots fixed to ~/.gentle-shell/agent/history and ~/.pi/agent/history (index.ts:1326); none exist yet on this machine. Ghost is computed synchronously instead of debounced because predict is under 1 ms.
