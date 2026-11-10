@@ -24,7 +24,7 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 - T3 [x] S2, S3, S6 — PTY pane: spawn `gentle-shell` in portable-pty, vt100 emulation, reader thread + dirty flag, resize, key-to-bytes encoding; unit tests. Route: inline. Commit: `7660dcdc6`
 - T4 [x] S5 — center viewer: selected file content (left) + agent changes from `git diff` (right), read-only; diff classifier tests. Route: inline. Commit: `fd0db959a`
 - T5 [x] S2, S3, S7, S11 — app loop: threads, focus, prefix keys, mouse click on tree, tool overlay, mode toggle, redraw-on-dirty; `README.md`. Route: inline. Commit: `2a97f01dd`
-- T6 [ ] S5 — manual editing in the left editor pane with save. Route: later phase. Commit: —
+- T6 [ ] S5 — manual editing in the left editor pane with save; diff refreshes after save. Route: worker (context backstop). Commit: —
 - T7 [ ] S8 — translator engine (pivot through English) as a middleware around Pi. Route: later phase. Commit: —
 - T8 [ ] S9 — prediction engine: decide concrete use first. Route: deferred. Commit: —
 
@@ -36,3 +36,5 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 - L4 (user, verbatim): "excelnte, eso es lo que busno yo nobusco invtar queiro es moldea lo que ya exite a una vs propia, perfecto, arma el odd cones ta arqueitectura, y empzia a trbjar en el desarollo, para ir viendo mejoras, q podamos aplcair"
 - L5 (user decisions): install rustup stable in the user account; crate inside gentle-shell in its own folder; own code on ratatui + portable-pty (no fork); first slice = partitioner MVP.
 - L6 (evidence, phase 1): 41 lib tests green; release build ok; `--help` exit 0; missing command exit 1 with error; PTY smoke `-- sh -c "echo hi; sleep 1"` exit 0. clippy not installed. Engram unavailable (runtime contract mismatch), mirror not written.
+- L7 (user, verbatim, after manual test of phase 1): "bien lo veo muy fluiod, ahora, sige con el los putnos pendietes, pero un detalle neciso que haga una investiagacion alguin creo un repostior q optmizar el rust pata no terne q estar re compiladno tod puedes invear"
+- L8 (research, Rust fast rebuilds): lld is the default linker on x86_64 Linux since 1.90; applied dev profile (deps opt-level 3, line-tables-only, split-debuginfo unpacked): incremental rebuild after editing app.rs 0.61s. Recommended optional: bacon (AGPL tool, not linked), mold/wild only if link is slow, sccache for clean/branch rebuilds. Not adopted: cranelift (nightly only), subsecond/hot-lib-reloader (restructuring, PTY caveats), cargo-chef (Docker), cargo-hakari (multi-crate).

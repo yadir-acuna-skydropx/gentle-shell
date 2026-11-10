@@ -106,3 +106,13 @@ else is forwarded to the chat.
   English.
 - **T8 (S9)** — prediction engine: deferred until a concrete use is decided
   (the LLM already predicts the next token).
+
+## Fast development loop
+
+`Cargo.toml` optimizes dependencies once (`[profile.dev.package."*"] opt-level = 3`)
+and keeps this crate unoptimized, so an edit rebuilds in under a second while the
+UI stays fluid. Linux x86_64 links with `lld` by default since Rust 1.90.
+
+- Iterate with `cargo run` (dev profile); use `cargo run --release` for the final binary.
+- Optional: `cargo install bacon` and run `bacon test` for rebuild-on-save.
+- Only if linking becomes slow: install `mold` and add `-C link-arg=-fuse-ld=mold` in `.cargo/config.toml`.
