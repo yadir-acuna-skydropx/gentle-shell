@@ -18,8 +18,9 @@ repainted — only the changed cells of that fragment are written out.
   tree, worktree changes, help, or a quit action.
 - **Workspace mode.** A partitioned layout with a **sidebar** (folders, files,
   formats, sizes, git worktree status), a **center viewer** split into the file
-  content (left) and the agent’s changes from `git diff` (right, read-only in
-  this phase), and the **chat** at the bottom. On small terminals the layout
+  content in an **editable** buffer (left) and the agent’s changes from
+  `git diff` (right, read-only), and the **chat** at the bottom. On small
+  terminals the layout
   degrades back to chat mode so the chat stays usable (S11).
 
 ## Build & run
@@ -67,10 +68,22 @@ else is forwarded to the chat.
 
 - **Sidebar:** `↑↓` (or `k`/`j`) move · `Enter`/`→` open · `←` collapse / go to
   parent · `Esc` back to chat.
-- **Editor / changes:** `↑↓` `PgUp` `PgDn` scroll · `Esc` back to chat.
+- **Editor (left pane):** type to insert text (UTF-8 and tabs); `Enter` splits a
+  line, `Backspace`/`Delete` join lines at the edges, `Tab` inserts a literal
+  tab. Move with the arrows, `Home`/`End`, `PageUp`/`PageDown`,
+  `Ctrl+Home`/`Ctrl+End`. `Ctrl+S` saves, `Ctrl+R` reloads from disk
+  (discarding edits). A `●` before the path marks unsaved edits. `Esc` returns
+  to the chat.
+  - Saving writes atomically (temp file + rename, preserving permissions) and
+    refuses if the file changed on disk since it was loaded — `Ctrl+R` reloads.
+  - Opening another file or quitting with unsaved edits warns first; repeat the
+    action to discard.
+  - Binary, unreadable and oversized files stay read-only.
+- **Agent changes (right pane):** `↑↓` `PgUp` `PgDn` scroll · `Esc` back to chat.
 - **Overlays:** `↑↓` move · `Enter` open · `Esc` close.
-- **Mouse:** click selects panes, files and tools; the wheel scrolls the chat,
-  the viewer, or the sidebar depending on where it is over.
+- **Mouse:** click selects panes and places the editor cursor, opens files and
+  tools; the wheel scrolls the chat, the editor, the diff, or the sidebar
+  depending on where it is over.
 
 ## Architecture
 
@@ -93,14 +106,16 @@ else is forwarded to the chat.
   changed (S3).
 - **`tree.rs`** — the sidebar model: directory scan, sizes, formats and a
   `git status --porcelain` parser.
-- **`viewer.rs`** — the center viewer: file content plus a classified `git diff`
-  against `HEAD`.
+- **`viewer.rs`** — the right half of the center viewer: a classified `git diff`
+  against `HEAD`, plus the read-only file reader used for previews.
+- **`editor.rs`** — the left half of the center viewer: a small editable buffer
+  that preserves the file’s bytes (tabs, CRLF/LF, trailing newline) and saves
+  atomically with an on-disk-change guard.
 - **`keys.rs`** — encodes crossterm key events as the bytes a terminal sends to
   a PTY child.
 
 ## Roadmap
 
-- **T6 (S5)** — manual editing in the left editor pane, with save.
 - **T7 (S8)** — translator engine: a pivot-through-English middleware around Pi,
   so the user always reads their native language while everything flows through
   English.

@@ -194,6 +194,11 @@ fn event_loop(terminal: &mut Terminal<Backend>, command: &[String]) -> Result<()
                     Action::ScrollChat(delta) => pty.scroll_chat(delta),
                     Action::Quit => break,
                 }
+                // A save asks for a fresh git status off the UI thread.
+                if app.take_git_refresh() {
+                    last_git_refresh = Instant::now();
+                    let _ = git_tx.send(());
+                }
             }
             Event::Input(CtEvent::Mouse(mouse)) => match app.handle_mouse(mouse) {
                 Action::None => {}

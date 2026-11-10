@@ -11,10 +11,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use crate::editor::{Editor, SaveOutcome};
 use crate::layout::{self, Layout, Mode};
 use crate::pane::{self, PtyPane};
 use crate::tree::{self, Entry, GitStatus};
-use crate::viewer::{DiffKind, Viewer};
+use crate::viewer::{self, DiffKind, Viewer};
 
 /// Prefix chord for partitioner commands; everything else goes to the focused pane.
 pub const PREFIX_LABEL: &str = "Ctrl+]";
@@ -59,6 +60,17 @@ pub struct App {
     pub selected: usize,
     pub change_selected: usize,
     pub viewer: Option<Viewer>,
+    /// Editable buffer for the left pane; `None` until a file is opened.
+    pub editor: Option<Editor>,
+    /// Transient message shown in the status line until the next key.
+    pub status_msg: Option<String>,
+    /// Target of a blocked open while the editor is dirty; a second open of the
+    /// same target discards the edits.
+    pub pending_discard: Option<PathBuf>,
+    /// Set after a dirty-guarded quit warning; a second prefix-q quits.
+    pub pending_quit: bool,
+    /// Set when a save needs the main loop to refresh git status.
+    pub needs_git_refresh: bool,
     pub prefix: bool,
     /// Child DECCKM state, updated by the loop before each key.
     pub app_cursor: bool,
@@ -81,6 +93,11 @@ impl App {
             selected: 0,
             change_selected: 0,
             viewer: None,
+            editor: None,
+            status_msg: None,
+            pending_discard: None,
+            pending_quit: false,
+            needs_git_refresh: false,
             prefix: false,
             app_cursor: false,
             tree_offset: 0,
@@ -139,10 +156,67 @@ impl App {
     }
 
     pub fn open_file(&mut self, rel: &Path) {
+        // A dirty buffer is not discarded on the first open of a new target:
+        // warn and only switch when the same target is opened again.
+        if self.editor.as_ref().is_some_and(|e| e.dirty) && self.pending_discard.as_deref() != Some(rel) {
+            self.pending_discard = Some(rel.to_path_buf());
+            self.status_msg = Some("unsaved changes — Ctrl+S save, open again to discard".into());
+            return;
+        }
+        self.pending_discard = None;
+        self.pending_quit = false;
+        self.editor = Some(Editor::open(&self.root, rel));
         self.viewer = Some(Viewer::open(&self.root, rel));
         self.mode = Mode::Workspace;
         self.focus = Focus::Editor;
         self.overlay = None;
+    }
+
+    /// Whether the main loop should ask the git worker to refresh (after a save).
+    pub fn take_git_refresh(&mut self) -> bool {
+        std::mem::take(&mut self.needs_git_refresh)
+    }
+
+    /// Saves the editor (Ctrl+S): atomic write, clear dirty, refresh the diff
+    /// pane and request a git status refresh.
+    fn save_editor(&mut self) {
+        let outcome = match &mut self.editor {
+            Some(e) => e.save(),
+            None => return,
+        };
+        match outcome {
+            SaveOutcome::Saved => {
+                self.status_msg = Some("saved".into());
+                self.pending_quit = false;
+                self.pending_discard = None;
+                self.needs_git_refresh = true;
+                if let Some(v) = &mut self.viewer {
+                    let p = v.path.clone();
+                    v.diff = viewer::git_diff(&self.root, &p);
+                    v.diff_scroll = v.diff_scroll.min(v.diff.len().saturating_sub(1));
+                }
+            }
+            SaveOutcome::DiskChanged => {
+                self.status_msg = Some("file changed on disk — Ctrl+R reloads (discards your edits)".into());
+            }
+            SaveOutcome::ReadOnly => {
+                self.status_msg = self.editor.as_ref().and_then(|e| e.read_only_reason()).map(str::to_string);
+            }
+            SaveOutcome::Error(msg) => self.status_msg = Some(format!("save failed: {msg}")),
+        }
+    }
+
+    /// Reloads the editor from disk (Ctrl+R), discarding edits.
+    fn reload_editor(&mut self) {
+        if let Some(e) = &mut self.editor {
+            e.reload();
+        }
+        if let Some(v) = &mut self.viewer {
+            let p = v.path.clone();
+            *v = Viewer::open(&self.root, &p);
+        }
+        self.pending_discard = None;
+        self.status_msg = Some("reloaded from disk".into());
     }
 
     /// Translates a key event into either a partitioner command or bytes for
@@ -153,6 +227,8 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Action::None;
         }
+        // The transient status message lives only until the next key.
+        self.status_msg = None;
 
         // A pending prefix consumes exactly one key, then clears.
         if self.prefix {
@@ -172,7 +248,8 @@ impl App {
         match self.effective_focus() {
             Focus::Chat => Action::Forward(crate::keys::encode(key, self.app_cursor)),
             Focus::Sidebar => self.sidebar_key(key),
-            Focus::Editor | Focus::Diff => self.viewer_key(key),
+            Focus::Editor => self.editor_key(key),
+            Focus::Diff => self.diff_key(key),
         }
     }
 
@@ -196,7 +273,16 @@ impl App {
                 self.toggle_overlay(Overlay::Help);
                 Action::None
             }
-            KeyCode::Char('q') => Action::Quit,
+            KeyCode::Char('q') => {
+                // A dirty buffer warns once before quitting; a second q quits.
+                if self.editor.as_ref().is_some_and(|e| e.dirty) && !self.pending_quit {
+                    self.pending_quit = true;
+                    self.status_msg = Some("unsaved changes — Ctrl+S save, press q again to quit".into());
+                    Action::None
+                } else {
+                    Action::Quit
+                }
+            }
             KeyCode::Char(']') => Action::Forward(vec![0x1d]),
             KeyCode::Tab => {
                 self.cycle_focus();
@@ -296,7 +382,44 @@ impl App {
         Action::None
     }
 
-    fn viewer_key(&mut self, key: KeyEvent) -> Action {
+    /// Editor focus: editing keys go to the buffer; Ctrl+S saves, Ctrl+R
+    /// reloads, Esc returns to the chat. Read-only buffers explain why typing
+    /// does nothing.
+    fn editor_key(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.focus = Focus::Chat;
+                return Action::None;
+            }
+            KeyCode::Char('s') if ctrl => {
+                self.save_editor();
+                return Action::None;
+            }
+            KeyCode::Char('r') if ctrl => {
+                self.reload_editor();
+                return Action::None;
+            }
+            _ => {}
+        }
+        let mut readonly_reason = None;
+        if let Some(e) = &mut self.editor {
+            if e.is_read_only() {
+                if is_edit_key(&key) {
+                    readonly_reason = e.read_only_reason().map(str::to_string);
+                }
+            } else {
+                e.handle_key(key);
+            }
+        }
+        if let Some(reason) = readonly_reason {
+            self.status_msg = Some(reason);
+        }
+        Action::None
+    }
+
+    /// Diff focus: read-only scroll of the agent-changes pane.
+    fn diff_key(&mut self, key: KeyEvent) -> Action {
         let delta = match key.code {
             KeyCode::Up => -1,
             KeyCode::Down => 1,
@@ -309,7 +432,8 @@ impl App {
             _ => return Action::None,
         };
         if let Some(v) = &mut self.viewer {
-            v.scroll(delta);
+            let len = v.diff.len();
+            v.diff_scroll = (v.diff_scroll as isize + delta).clamp(0, len.saturating_sub(1) as isize) as usize;
         }
         Action::None
     }
@@ -400,6 +524,10 @@ impl App {
         if let Some(ed) = l.editor {
             if rect_contains(ed, col, row) {
                 self.focus = Focus::Editor;
+                if let Some(e) = &mut self.editor {
+                    let gutter = e.gutter_width();
+                    e.click(ed.x + 1, ed.y + 1, gutter, col, row);
+                }
                 return Action::None;
             }
         }
@@ -464,10 +592,19 @@ impl App {
                 return Action::None;
             }
         }
-        for pane in [l.editor, l.diff].into_iter().flatten() {
-            if rect_contains(pane, col, row) {
+        if let Some(ed) = l.editor {
+            if rect_contains(ed, col, row) {
+                if let Some(e) = &mut self.editor {
+                    e.scroll_lines(dir * 3);
+                }
+                return Action::None;
+            }
+        }
+        if let Some(df) = l.diff {
+            if rect_contains(df, col, row) {
                 if let Some(v) = &mut self.viewer {
-                    v.scroll(dir * 3);
+                    let len = v.diff.len();
+                    v.diff_scroll = (v.diff_scroll as isize + dir * 3).clamp(0, len.saturating_sub(1) as isize) as usize;
                 }
                 return Action::None;
             }
@@ -490,6 +627,15 @@ fn clamp_index(index: usize, delta: isize, len: usize) -> usize {
 
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     r.contains(Position::new(col, row))
+}
+
+/// Keys that mutate the buffer (used to explain a read-only buffer).
+fn is_edit_key(key: &KeyEvent) -> bool {
+    !key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(
+            key.code,
+            KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete | KeyCode::Tab
+        )
 }
 
 fn status_style(s: Option<GitStatus>) -> Style {
@@ -588,20 +734,52 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
     }
 
     if let (Some(ed), Some(df)) = (l.editor, l.diff) {
-        match &app.viewer {
-            Some(v) => {
-                let title = format!(" {} ", v.path.display());
+        // Left pane: the editable buffer.
+        match &mut app.editor {
+            Some(e) => {
+                let mark = if e.dirty { "\u{25cf} " } else { "" };
+                let title = format!(" {}{} ", mark, e.path.display());
                 let block = pane_block(title, focus == Focus::Editor);
-                let num_w = v.content.len().to_string().len();
-                let lines: Vec<Line> = v
-                    .content
+                let inner = block.inner(ed);
+                let gutter = e.gutter_width();
+                let num_w = gutter.saturating_sub(1);
+                let text_h = inner.height as usize;
+                let text_w = (inner.width as usize).saturating_sub(gutter);
+                e.page = text_h.max(1);
+                e.ensure_visible(text_h, text_w);
+                let (scroll_row, scroll_col) = (e.scroll_row, e.scroll_col);
+                let lines: Vec<Line> = e
+                    .lines
                     .iter()
                     .enumerate()
-                    .skip(v.content_scroll)
-                    .take(ed.height as usize)
-                    .map(|(i, t)| Line::from(vec![Span::styled(format!("{:>num_w$} ", i + 1), Style::default().fg(Color::DarkGray)), Span::raw(t.clone())]))
+                    .skip(scroll_row)
+                    .take(text_h)
+                    .map(|(i, t)| {
+                        let expanded = crate::editor::expand_tabs(t);
+                        let shown: String = expanded.chars().skip(scroll_col).take(text_w.max(1)).collect();
+                        Line::from(vec![
+                            Span::styled(format!("{:>num_w$} ", i + 1), Style::default().fg(Color::DarkGray)),
+                            Span::raw(shown),
+                        ])
+                    })
                     .collect();
                 frame.render_widget(Paragraph::new(lines).block(block), ed);
+                if focus == Focus::Editor && app.overlay.is_none() {
+                    let cx = inner.x + gutter as u16 + e.cursor_visual_col().saturating_sub(scroll_col) as u16;
+                    let cy = inner.y + e.cursor_line.saturating_sub(scroll_row) as u16;
+                    if cx < inner.x + inner.width && cy < inner.y + inner.height {
+                        frame.set_cursor_position(Position::new(cx, cy));
+                    }
+                }
+            }
+            None => {
+                let hint = Paragraph::new("Select a file in the sidebar (Enter or click).").style(Style::default().fg(Color::DarkGray));
+                frame.render_widget(hint.block(pane_block(" Editor ".into(), focus == Focus::Editor)), ed);
+            }
+        }
+        // Right pane: the agent's changes (read-only).
+        match &app.viewer {
+            Some(v) => {
                 let lines: Vec<Line> = v
                     .diff
                     .iter()
@@ -621,8 +799,6 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
                 frame.render_widget(Paragraph::new(lines).block(pane_block(" Agent changes ".into(), focus == Focus::Diff)), df);
             }
             None => {
-                let hint = Paragraph::new("Select a file in the sidebar (Enter or click).").style(Style::default().fg(Color::DarkGray));
-                frame.render_widget(hint.block(pane_block(" Editor ".into(), focus == Focus::Editor)), ed);
                 frame.render_widget(Paragraph::new("").block(pane_block(" Agent changes ".into(), focus == Focus::Diff)), df);
             }
         }
@@ -685,6 +861,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
 
     let status = if app.prefix {
         Line::styled(format!(" {PREFIX_LABEL} … w workspace · t files · c changes · Tab/1-4 focus · ? help · q quit · ] send {PREFIX_LABEL}"), Style::default().fg(Color::Black).bg(Color::Cyan))
+    } else if let Some(msg) = &app.status_msg {
+        Line::styled(format!(" {msg}"), Style::default().fg(Color::Black).bg(Color::Yellow))
     } else {
         let mode = match l.mode {
             Mode::Chat => "chat",
@@ -709,8 +887,11 @@ pub fn help_lines() -> Vec<Line<'static>> {
         format!("  ]      send a literal {PREFIX_LABEL} to the chat"),
         String::new(),
         "Sidebar: ↑↓ move · Enter/→ open · ← collapse · Esc back to chat".into(),
-        "Editor / changes: ↑↓ PgUp PgDn scroll · Esc back to chat".into(),
-        "Mouse: click selects panes, files and tools; wheel scrolls.".into(),
+        "Editor: type to edit · Enter/Backspace/Delete · Tab · arrows · Home/End".into(),
+        "        PageUp/PageDown · Ctrl+Home/End · Ctrl+S save · Ctrl+R reload".into(),
+        "        ● marks unsaved edits · Esc back to chat".into(),
+        "Agent changes: ↑↓ PgUp PgDn scroll · Esc back to chat".into(),
+        "Mouse: click selects panes and places the cursor; wheel scrolls.".into(),
     ]
     .into_iter()
     .map(Line::raw)
@@ -939,6 +1120,84 @@ mod tests {
         assert!(text.contains("Agent changes"));
         assert!(text.contains("Chat · gentle-shell"));
         assert!(!text.contains("TOOLS"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        use std::process::Command;
+        let ok = Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn dirty_guard_blocks_opening_another_file_until_the_second_attempt() {
+        let root = fixture("dirty-open");
+        let mut app = App::new(root.clone());
+        app.open_file(Path::new("README.md"));
+        render(&mut app, 120, 40);
+        assert_eq!(app.handle_key(ch('x')), Action::None);
+        assert!(app.editor.as_ref().unwrap().dirty);
+        // first open of a new target is refused and warns
+        app.open_file(Path::new("src/main.rs"));
+        assert_eq!(app.editor.as_ref().unwrap().path, PathBuf::from("README.md"));
+        assert_eq!(app.status_msg.as_deref(), Some("unsaved changes \u{2014} Ctrl+S save, open again to discard"));
+        // opening the same target again discards the edits and switches
+        app.open_file(Path::new("src/main.rs"));
+        assert_eq!(app.editor.as_ref().unwrap().path, PathBuf::from("src/main.rs"));
+        assert!(!app.editor.as_ref().unwrap().dirty);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dirty_guard_warns_before_quitting_then_quits_on_the_second_q() {
+        let root = fixture("dirty-quit");
+        let mut app = App::new(root.clone());
+        app.open_file(Path::new("README.md"));
+        render(&mut app, 120, 40);
+        app.handle_key(ch('x'));
+        assert!(app.editor.as_ref().unwrap().dirty);
+        app.handle_key(prefix());
+        assert_eq!(app.handle_key(ch('q')), Action::None);
+        assert!(app.pending_quit);
+        app.handle_key(prefix());
+        assert_eq!(app.handle_key(ch('q')), Action::Quit);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn saving_writes_the_file_and_refreshes_the_diff() {
+        let root = std::env::temp_dir().join(format!("gentle-partitioner-app-save-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        git(&root, &["init", "-q"]);
+        fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(&root, &["add", "."]);
+        git(&root, &["commit", "-qm", "init"]);
+        let mut app = App::new(root.clone());
+        app.open_file(Path::new("a.txt"));
+        render(&mut app, 120, 40);
+        // clean file: no diff against HEAD yet
+        assert!(app.viewer.as_ref().unwrap().diff.iter().all(|d| d.kind != DiffKind::Added));
+        app.handle_key(key(KeyCode::End));
+        app.handle_key(ch('X'));
+        assert!(app.editor.as_ref().unwrap().dirty);
+        app.handle_key(ctrl('s'));
+        assert!(!app.editor.as_ref().unwrap().dirty, "dirty flag cleared after save");
+        assert!(app.take_git_refresh(), "a git refresh was requested");
+        assert_eq!(fs::read(root.join("a.txt")).unwrap(), b"oneX\n");
+        let diff = &app.viewer.as_ref().unwrap().diff;
+        assert!(diff.iter().any(|d| d.kind == DiffKind::Added && d.text == "+oneX"), "diff refreshed: {diff:?}");
         fs::remove_dir_all(root).unwrap();
     }
 
