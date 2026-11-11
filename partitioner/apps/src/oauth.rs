@@ -155,7 +155,7 @@ pub enum CallbackError {
     /// The IdP returned `error=<code>` (e.g. `access_denied`).
     Denied(String),
     /// `state` did not match: a 400 was sent and the login aborted.
-    StateMismatch,
+    StateMismatch(String),
     /// No valid callback arrived before the deadline.
     TimedOut,
     /// A low-level I/O failure on the listener.
@@ -166,7 +166,7 @@ impl std::fmt::Display for CallbackError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CallbackError::Denied(e) => write!(f, "Slack returned error: {e}"),
-            CallbackError::StateMismatch => write!(f, "state mismatch (possible CSRF); login aborted"),
+            CallbackError::StateMismatch(seen) => write!(f, "state mismatch (possible CSRF; {seen}); login aborted"),
             CallbackError::TimedOut => write!(f, "login timed out before the browser redirect arrived"),
             CallbackError::Io(e) => write!(f, "callback server error: {e}"),
         }
@@ -193,7 +193,7 @@ pub fn await_callback(
             Ok((stream, _)) => match handle_callback(stream, expected_state) {
                 CallbackStep::Code(code) => return Ok(code),
                 CallbackStep::Denied(e) => return Err(CallbackError::Denied(e)),
-                CallbackStep::StateMismatch => return Err(CallbackError::StateMismatch),
+                CallbackStep::StateMismatch(seen) => return Err(CallbackError::StateMismatch(seen)),
                 CallbackStep::KeepWaiting => continue,
             },
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -207,7 +207,7 @@ pub fn await_callback(
 enum CallbackStep {
     Code(String),
     Denied(String),
-    StateMismatch,
+    StateMismatch(String),
     KeepWaiting,
 }
 
@@ -243,7 +243,12 @@ fn handle_callback(mut stream: TcpStream, expected_state: &str) -> CallbackStep 
     let state = get("state").unwrap_or_default();
     if !constant_time_eq(state.as_bytes(), expected_state.as_bytes()) {
         respond(&mut stream, "400 Bad Request", "text/html", PAGE_ERR);
-        return CallbackStep::StateMismatch;
+        // Describe what arrived without echoing any value.
+        let seen = match get("state") {
+            None => "redirect had no state".to_string(),
+            Some(v) => format!("received {} chars, expected {}", v.chars().count(), expected_state.len()),
+        };
+        return CallbackStep::StateMismatch(seen);
     }
     match get("code") {
         Some(code) if !code.is_empty() => {
@@ -491,6 +496,19 @@ mod tests {
     }
 
     #[test]
+    fn callback_without_state_reports_it_without_values() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let h = std::thread::spawn(move || await_callback(&listener, "expected", deadline));
+        let (status, _) = http_get(addr, "/callback?code=SECRETCODE");
+        assert!(status.contains("400"), "{status}");
+        let msg = h.join().unwrap().unwrap_err().to_string();
+        assert_eq!(msg, "state mismatch (possible CSRF; redirect had no state); login aborted");
+        assert!(!msg.contains("SECRETCODE"));
+    }
+
+    #[test]
     fn callback_with_wrong_state_returns_400_and_aborts() {
         let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
@@ -498,7 +516,11 @@ mod tests {
         let h = std::thread::spawn(move || await_callback(&listener, "expected", deadline));
         let (status, _) = http_get(addr, "/callback?code=X&state=wrong");
         assert!(status.contains("400"), "{status}");
-        assert_eq!(h.join().unwrap(), Err(CallbackError::StateMismatch));
+        let err = h.join().unwrap().unwrap_err();
+        assert!(matches!(err, CallbackError::StateMismatch(_)));
+        let msg = err.to_string();
+        assert!(msg.starts_with("state mismatch (possible CSRF; "), "{msg}");
+        assert!(!msg.contains("WRONG") && !msg.contains("wrong"), "never echo the received value: {msg}");
     }
 
     #[test]
