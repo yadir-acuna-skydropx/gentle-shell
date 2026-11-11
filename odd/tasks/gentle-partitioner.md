@@ -19,6 +19,7 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 
 - **S12 Apps panel and engine.** "un cuadad pequeno en la parte inferio izquieda nos conecmto a slack". "esto lo debe hacer un motor indepenite y debe estar escrio en ruts la coexion". "el recuador inferio izaiuerdo sear para coenfctar dindees apps, y sera un tipo de menu alter deplgable empzamos con salk pero muy prabmele se vna agrgar mas motres y mas apps". User decisions (L23): "Proceso aparte (recomendado)".
 - **S13 Slack mentions and reply.** "solo va amsotrar los mensjaes en lo que nos eticket, y un recudaro para contestar". User decisions (L23): "Creo la app y te paso el token"; "Keyring del sistema (recomendado)"; "Responder en el hilo del mensaje".
+- **S14 Minimize and focus panes.** "neicos una fucain que permita minimar algun reucdaor para ver mas codiog etc, o si solo qiero ver los cmaibo".
 ## Tasks
 
 - T1 [x] S2, S3, S7, S11 — scaffold `partitioner/` crate; pure layout engine (chat-only + tool bar, partitioned sidebar/editor/diff/chat) with unit tests. Route: inline. Commit: `d6c095df7`
@@ -35,6 +36,7 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 - T11 [x] S5 — editor syntax highlighting per language, rainbow brackets by nesting level, and highlight of the bracket matching the one at the cursor. Route: worker. Commit: `878aef981`
 - T12 [x] S12 — apps engine: separate Rust binary `gentle-apps` (own crate) spawned by the partitioner, JSON-lines protocol over stdio, connector trait for future apps; bottom-left collapsible apps panel under the sidebar with the app menu. Route: worker. Commit: `118ecce7c`
 - T13 [x] S12, S13 — Slack connector: browser OAuth login with PKCE (L25, L27), user token in the system keyring, `gentle-apps slack login`, mentions of the user only, reply in the thread as the user, Slack app manifest + docs. Route: worker. Risk: item 2 (credentials). Commit: `7afb947c8`
+- T14 [ ] S14 — pane zoom (maximize the focused pane, toggle) and minimize (collapse a pane to its title bar, others grow), keys prefix z / prefix m, clickable title buttons, a "changes only" view = zoom on the diff pane. Route: worker. Commit: —
 
 ## Log
 
@@ -69,3 +71,4 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 - L29 (evidence, T12-T13 verify): independent verify PASS for S12, S13 and (a)-(h): fake-server end-to-end login through the real binary with no token or code leak, loopback-only callback, constant-time state, RFC 7636 vector, no client_secret, XSS-safe page, huge header and slowloris handled, apps.toml 0600 created with mode, no openssl/libdbus, licenses MIT-compatible. Advisories: read_line buffers a full line before the MAX_LINE check (trusted child); a local process can abort a login during the 5-minute window (CSRF guard). Both binaries installed to ~/.cargo/bin.
 - L30 (live login attempt 1): failed. Slack page: "redirect_uri did not match any configured URIs. Passed URI: http://localhost:47917/callback" for app "Demo App": the app was created with the Slack default manifest instead of ours, so no redirect URL, scopes or PKCE. The CLI then reported a state mismatch (a callback without state, likely from the "Volver a Demo App" button). Added a value-free diagnostic to the mismatch error (`3bda57e8d`).
 - L31 (live login attempt 2): client id 190664192064.12569524356566 is valid (Slack showed the request-approval screen for gentle-apps; an earlier "Invalid client_id" came from the previous id after the app was recreated). The workspace Skydropx requires admin approval: the user submitted "Request to Workspace Install". Login is blocked until an admin approves; App Configuration Tokens (xoxe) cannot read messages and were not used.
+- L32 (user, verbatim, while waiting for Slack approval): "bien mientas consegumos la aprovacion neicos una fucain que permita minimar algun reucdaor para ver mas codiog etc, o si solo qiero ver los cmaibo"
