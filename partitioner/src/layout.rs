@@ -33,6 +33,56 @@ pub enum Mode {
     Workspace,
 }
 
+/// The four workspace panes that can be zoomed or minimized (S14). The sidebar
+/// (file tree + apps panel) is treated as a single unit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pane {
+    Sidebar,
+    Editor,
+    Diff,
+    Chat,
+}
+
+impl Pane {
+    /// The four panes in a stable order (focus / status listing / minimize bars).
+    pub const ALL: [Pane; 4] = [Pane::Sidebar, Pane::Editor, Pane::Diff, Pane::Chat];
+    /// Index into [`Layout::minimized`].
+    pub fn index(self) -> usize {
+        match self {
+            Pane::Sidebar => 0,
+            Pane::Editor => 1,
+            Pane::Diff => 2,
+            Pane::Chat => 3,
+        }
+    }
+    /// Short lowercase name for the status line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Pane::Sidebar => "sidebar",
+            Pane::Editor => "editor",
+            Pane::Diff => "diff",
+            Pane::Chat => "chat",
+        }
+    }
+}
+
+/// Zoom / minimize request applied on top of the base workspace layout (S14).
+/// Zoom wins over minimize: a zoomed pane fills the whole body and the others
+/// are hidden. Minimized panes collapse to a title bar and the rest grow.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Panes {
+    pub zoom: Option<Pane>,
+    pub min_sidebar: bool,
+    pub min_editor: bool,
+    pub min_diff: bool,
+    pub min_chat: bool,
+}
+
+/// Height of a horizontal pane (editor/diff/chat) collapsed to its title bar.
+pub const MIN_BAR_HEIGHT: u16 = 1;
+/// Width of the sidebar collapsed to its vertical icon strip.
+pub const MIN_STRIP_WIDTH: u16 = 3;
+
 /// Minimum terminal size for the partitioned workspace; below it the
 /// layout degrades to chat mode so the chat stays usable (S11).
 pub const MIN_WORKSPACE_WIDTH: u16 = 80;
@@ -56,12 +106,35 @@ pub struct Layout {
     pub diff: Option<Rect>,
     pub chat: Rect,
     pub status: Rect,
+    /// Whether the chat region is present on screen (false only when another
+    /// pane is zoomed and hides the chat). When minimized the chat still has a
+    /// title-bar region, so this stays true.
+    pub show_chat: bool,
+    /// The zoomed pane, if any (S14).
+    pub zoom: Option<Pane>,
+    /// Per-pane minimized flags, indexed by [`Pane::index`].
+    pub minimized: [bool; 4],
 }
 
+impl Layout {
+    pub fn is_minimized(&self, pane: Pane) -> bool {
+        self.minimized[pane.index()]
+    }
+}
+
+/// Base layout with no zoom or minimize (kept for the existing call sites and
+/// tests; delegates to [`compute_panes`]).
 pub fn compute(area: Rect, requested: Mode) -> Layout {
+    compute_panes(area, requested, Panes::default())
+}
+
+/// Workspace layout with zoom / minimize applied (S14). Chat mode is unaffected
+/// by `panes` (S7): the tool bar + chat layout is returned unchanged.
+pub fn compute_panes(area: Rect, requested: Mode, panes: Panes) -> Layout {
     let status_h = area.height.min(1);
     let body_h = area.height - status_h;
     let status = Rect::new(area.x, area.y + body_h, area.width, status_h);
+    let body = Rect::new(area.x, area.y, area.width, body_h);
 
     let fits = area.width >= MIN_WORKSPACE_WIDTH && area.height >= MIN_WORKSPACE_HEIGHT;
     if requested == Mode::Chat || !fits {
@@ -74,23 +147,134 @@ pub fn compute(area: Rect, requested: Mode) -> Layout {
             diff: None,
             chat: Rect::new(area.x + bar_w, area.y, area.width - bar_w, body_h),
             status,
+            show_chat: true,
+            zoom: None,
+            minimized: [false; 4],
         };
     }
 
-    let side_w = (area.width / 4).clamp(SIDEBAR_MIN, SIDEBAR_MAX);
-    let right_x = area.x + side_w;
-    let right_w = area.width - side_w;
-    // Upper viewer takes ~60% of the body, never squeezing the chat below its minimum.
-    let upper_h = (body_h * 3 / 5).min(body_h.saturating_sub(CHAT_MIN_HEIGHT));
-    let editor_w = right_w / 2;
+    let minimized = [panes.min_sidebar, panes.min_editor, panes.min_diff, panes.min_chat];
+
+    // Zoom wins: the focused pane fills the whole body; the others are hidden.
+    if let Some(z) = panes.zoom {
+        let mut l = Layout {
+            mode: Mode::Workspace,
+            toolbar: None,
+            sidebar: None,
+            editor: None,
+            diff: None,
+            chat: Rect::new(body.x, body.y, 0, 0),
+            status,
+            show_chat: false,
+            zoom: Some(z),
+            minimized: [false; 4],
+        };
+        match z {
+            Pane::Sidebar => l.sidebar = Some(body),
+            Pane::Editor => l.editor = Some(body),
+            Pane::Diff => l.diff = Some(body),
+            Pane::Chat => {
+                l.chat = body;
+                l.show_chat = true;
+            }
+        }
+        return l;
+    }
+
+    // Minimized horizontal panes (editor/diff/chat) dock as full-width title
+    // bars stacked at the bottom of the body; the rest of the body (the top
+    // region) holds the sidebar plus the non-minimized panes, which grow.
+    let bar_count = [panes.min_editor, panes.min_diff, panes.min_chat].iter().filter(|b| **b).count() as u16;
+    let bars_h = bar_count.min(body_h);
+    let top_h = body_h - bars_h;
+    let top = Rect::new(body.x, body.y, body.width, top_h);
+
+    let has_e = !panes.min_editor;
+    let has_d = !panes.min_diff;
+    let has_c = !panes.min_chat;
+    let any_right = has_e || has_d || has_c;
+
+    // Sidebar column. When it is the only non-minimized pane it fills the whole
+    // top region; otherwise a 3-column strip when minimized, else its usual width.
+    let side_w = if !any_right {
+        top.width
+    } else if panes.min_sidebar {
+        MIN_STRIP_WIDTH.min(top.width)
+    } else {
+        (area.width / 4).clamp(SIDEBAR_MIN, SIDEBAR_MAX).min(top.width)
+    };
+    let sidebar = Rect::new(top.x, top.y, side_w, top_h);
+    let right = Rect::new(top.x + side_w, top.y, top.width - side_w, top_h);
+
+    let mut editor = None;
+    let mut diff = None;
+    let mut chat_rect: Option<Rect> = None;
+
+    if right.width > 0 {
+        // Vertical split inside the right region: the editor/diff upper band and
+        // the chat below. When chat is minimized the upper band fills the height.
+        let upper = if has_c && (has_e || has_d) {
+            let upper_h = (right.height * 3 / 5).min(right.height.saturating_sub(CHAT_MIN_HEIGHT));
+            let chat_h = right.height - upper_h;
+            chat_rect = Some(Rect::new(right.x, right.y + upper_h, right.width, chat_h));
+            Rect::new(right.x, right.y, right.width, upper_h)
+        } else if has_e || has_d {
+            // No visible chat here: editor/diff take the whole right height.
+            right
+        } else {
+            // Only the chat is visible on the right: it fills the region.
+            chat_rect = Some(right);
+            Rect::new(right.x, right.y, right.width, 0)
+        };
+        // Horizontal split of the upper band between editor and diff.
+        if upper.height > 0 || upper.width > 0 {
+            match (has_e, has_d) {
+                (true, true) => {
+                    let editor_w = upper.width / 2;
+                    editor = Some(Rect::new(upper.x, upper.y, editor_w, upper.height));
+                    diff = Some(Rect::new(upper.x + editor_w, upper.y, upper.width - editor_w, upper.height));
+                }
+                (true, false) => editor = Some(upper),
+                (false, true) => diff = Some(upper),
+                (false, false) => {}
+            }
+        }
+    }
+
+    // Dock the minimized horizontal bars at the bottom, stacked in pane order.
+    let mut bar_y = body.y + top_h;
+    for pane in [Pane::Editor, Pane::Diff, Pane::Chat] {
+        let min = match pane {
+            Pane::Editor => panes.min_editor,
+            Pane::Diff => panes.min_diff,
+            Pane::Chat => panes.min_chat,
+            Pane::Sidebar => false,
+        };
+        if !min {
+            continue;
+        }
+        let bar = Rect::new(body.x, bar_y, body.width, MIN_BAR_HEIGHT);
+        match pane {
+            Pane::Editor => editor = Some(bar),
+            Pane::Diff => diff = Some(bar),
+            Pane::Chat => chat_rect = Some(bar),
+            Pane::Sidebar => {}
+        }
+        bar_y += MIN_BAR_HEIGHT;
+    }
+
+    let chat = chat_rect.unwrap_or(Rect::new(body.x, body.y, 0, 0));
     Layout {
         mode: Mode::Workspace,
         toolbar: None,
-        sidebar: Some(Rect::new(area.x, area.y, side_w, body_h)),
-        editor: Some(Rect::new(right_x, area.y, editor_w, upper_h)),
-        diff: Some(Rect::new(right_x + editor_w, area.y, right_w - editor_w, upper_h)),
-        chat: Rect::new(right_x, area.y + upper_h, right_w, body_h - upper_h),
+        sidebar: Some(sidebar),
+        editor,
+        diff,
+        chat,
         status,
+        show_chat: chat_rect.is_some(),
+        zoom: None,
+        minimized,
     }
 }
 
@@ -203,6 +387,116 @@ mod tests {
         let (_, expanded) = split_sidebar(side, 3, true);
         assert!(expanded.height > collapsed.height, "expanding grows the panel");
         assert!(expanded.height <= 40 * APPS_PANEL_MAX_PCT / 100);
+    }
+
+    // ---- Zoom / minimize (S14) ----
+
+    fn ws(w: u16, h: u16, p: Panes) -> Layout {
+        compute_panes(area(w, h), Mode::Workspace, p)
+    }
+
+    /// All present workspace rects (chat only when shown) plus the status line.
+    fn present(l: &Layout) -> Vec<Rect> {
+        let mut v: Vec<Rect> = [l.sidebar, l.editor, l.diff].into_iter().flatten().collect();
+        if l.show_chat {
+            v.push(l.chat);
+        }
+        v.push(l.status);
+        v
+    }
+
+    fn assert_tiles(l: &Layout, w: u16, h: u16, label: &str) {
+        let rects = present(l);
+        let total: u32 = rects.iter().map(|r| r.width as u32 * r.height as u32).sum();
+        assert_eq!(total, w as u32 * h as u32, "coverage {label}");
+        for (i, a) in rects.iter().enumerate() {
+            for b in &rects[i + 1..] {
+                assert!(!a.intersects(*b), "{a:?} overlaps {b:?} ({label})");
+            }
+        }
+    }
+
+    #[test]
+    fn zoom_gives_the_focused_pane_the_whole_body_and_hides_the_others() {
+        let body = Rect::new(0, 0, 160, 49);
+        let pickers: [(Pane, fn(&Layout) -> Option<Rect>); 4] = [
+            (Pane::Sidebar, |l| l.sidebar),
+            (Pane::Editor, |l| l.editor),
+            (Pane::Diff, |l| l.diff),
+            (Pane::Chat, |l| if l.show_chat { Some(l.chat) } else { None }),
+        ];
+        for (pane, pick) in pickers {
+            let l = ws(160, 50, Panes { zoom: Some(pane), ..Default::default() });
+            assert_eq!(pick(&l), Some(body), "zoomed {pane:?} fills the body");
+            assert_eq!(l.zoom, Some(pane));
+            // Exactly the zoomed pane plus the status line are present.
+            assert_eq!(present(&l), vec![body, l.status]);
+            assert_tiles(&l, 160, 50, "zoom");
+        }
+    }
+
+    #[test]
+    fn un_zooming_returns_the_exact_previous_layout() {
+        let base = ws(160, 50, Panes::default());
+        let zoomed = ws(160, 50, Panes { zoom: Some(Pane::Editor), ..Default::default() });
+        assert_ne!(zoomed, base);
+        let restored = ws(160, 50, Panes { zoom: None, ..Default::default() });
+        assert_eq!(restored, base, "clearing zoom returns the exact base rects");
+    }
+
+    #[test]
+    fn minimizing_the_editor_gives_the_diff_its_width_and_vice_versa() {
+        let base = ws(160, 50, Panes::default());
+        let base_diff = base.diff.unwrap();
+        let min_e = ws(160, 50, Panes { min_editor: true, ..Default::default() });
+        let diff = min_e.diff.unwrap();
+        assert_eq!(diff.x, base.sidebar.unwrap().x + base.sidebar.unwrap().width, "diff starts at the right column");
+        assert_eq!(diff.width, base.editor.unwrap().width + base_diff.width, "diff takes the editor width too");
+        assert_eq!(min_e.editor.unwrap().height, MIN_BAR_HEIGHT, "editor is a title bar");
+
+        let min_d = ws(160, 50, Panes { min_diff: true, ..Default::default() });
+        let editor = min_d.editor.unwrap();
+        assert_eq!(editor.width, base.editor.unwrap().width + base_diff.width, "editor takes the diff width too");
+        assert_eq!(min_d.diff.unwrap().height, MIN_BAR_HEIGHT);
+    }
+
+    #[test]
+    fn minimizing_the_chat_lets_the_editor_and_diff_take_the_height() {
+        let base = ws(160, 50, Panes::default());
+        let l = ws(160, 50, Panes { min_chat: true, ..Default::default() });
+        assert_eq!(l.chat.height, MIN_BAR_HEIGHT, "chat collapses to a title bar");
+        assert!(l.show_chat, "the chat title bar is still shown");
+        assert!(l.editor.unwrap().height > base.editor.unwrap().height, "editor grew taller");
+        assert_eq!(l.editor.unwrap().height, l.diff.unwrap().height);
+    }
+
+    #[test]
+    fn minimizing_the_sidebar_is_a_three_column_strip_and_the_right_grows() {
+        let base = ws(160, 50, Panes::default());
+        let l = ws(160, 50, Panes { min_sidebar: true, ..Default::default() });
+        assert_eq!(l.sidebar.unwrap().width, MIN_STRIP_WIDTH, "sidebar is a 3-column strip");
+        assert_eq!(l.sidebar.unwrap().height, base.sidebar.unwrap().height);
+        // The editor/diff/chat region starts after the strip and is wider now.
+        assert_eq!(l.editor.unwrap().x, MIN_STRIP_WIDTH);
+        assert!(l.diff.unwrap().width + l.editor.unwrap().width > base.editor.unwrap().width + base.diff.unwrap().width);
+    }
+
+    #[test]
+    fn every_combination_of_minimized_panes_tiles_the_body_without_overlap() {
+        for (w, h) in [(80, 20), (100, 33), (160, 50), (255, 80)] {
+            // All 15 non-empty subsets of the four panes (bitmask over 1..=15).
+            for mask in 1u8..=15 {
+                let panes = Panes {
+                    zoom: None,
+                    min_sidebar: mask & 1 != 0,
+                    min_editor: mask & 2 != 0,
+                    min_diff: mask & 4 != 0,
+                    min_chat: mask & 8 != 0,
+                };
+                let l = ws(w, h, panes);
+                assert_tiles(&l, w, h, &format!("{w}x{h} mask {mask}"));
+            }
+        }
     }
 
     #[test]

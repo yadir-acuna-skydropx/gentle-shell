@@ -18,7 +18,7 @@ use crate::apps_panel::{AppsPanel, View};
 use crate::editor::{Editor, SaveOutcome};
 use crate::highlight::{self, Highlighter};
 use crate::icons::{self, IconMode};
-use crate::layout::{self, Layout, Mode};
+use crate::layout::{self, Layout, Mode, Pane};
 use crate::pane::{self, PtyPane};
 use crate::predict::{Engine, PredictMode};
 use crate::tree::{self, Entry, GitStatus};
@@ -58,6 +58,39 @@ pub enum Action {
     /// A request for the apps engine (reply / refresh).
     Apps(ClientMsg),
     Quit,
+}
+
+/// A clickable minimize / zoom button on a pane's top border (S14). Captured
+/// during draw so a click runs the action even when the pane is not focused.
+#[derive(Debug, Clone, Copy)]
+pub struct TitleButton {
+    pub pane: Pane,
+    pub row: u16,
+    /// `[start, end)` columns of the minimize button.
+    pub min_range: (u16, u16),
+    /// `[start, end)` columns of the zoom button.
+    pub zoom_range: (u16, u16),
+}
+
+/// Maps a focus target to the layout pane it belongs to (the apps panel lives
+/// inside the sidebar unit).
+fn focus_pane(focus: Focus) -> Pane {
+    match focus {
+        Focus::Sidebar | Focus::Apps => Pane::Sidebar,
+        Focus::Editor => Pane::Editor,
+        Focus::Diff => Pane::Diff,
+        Focus::Chat => Pane::Chat,
+    }
+}
+
+/// Default focus for a pane.
+fn pane_focus(pane: Pane) -> Focus {
+    match pane {
+        Pane::Sidebar => Focus::Sidebar,
+        Pane::Editor => Focus::Editor,
+        Pane::Diff => Focus::Diff,
+        Pane::Chat => Focus::Chat,
+    }
 }
 
 pub struct App {
@@ -107,6 +140,17 @@ pub struct App {
     pub tree_area: Option<Rect>,
     /// Apps-panel region of the sidebar, captured in the last draw.
     pub apps_area: Option<Rect>,
+    /// Zoomed pane (S14); `None` for the normal split.
+    pub zoom: Option<Pane>,
+    /// Per-pane minimized flags (S14).
+    pub min_sidebar: bool,
+    pub min_editor: bool,
+    pub min_diff: bool,
+    pub min_chat: bool,
+    /// Minimize/zoom buttons captured in the last draw (S14).
+    pub title_buttons: Vec<TitleButton>,
+    /// Minimized pane regions captured in the last draw; a click restores them.
+    pub minimized_regions: Vec<(Pane, Rect)>,
 }
 
 impl App {
@@ -140,6 +184,13 @@ impl App {
             apps_req_id: 0,
             tree_area: None,
             apps_area: None,
+            zoom: None,
+            min_sidebar: false,
+            min_editor: false,
+            min_diff: false,
+            min_chat: false,
+            title_buttons: Vec::new(),
+            minimized_regions: Vec::new(),
         };
         app.rescan();
         app
@@ -200,26 +251,149 @@ impl App {
         c
     }
 
-    /// Layout actually rendered for `area`.
-    pub fn compute_layout(&self, area: Rect) -> Layout {
-        layout::compute(area, self.mode)
-    }
-
-    /// Area the chat PTY occupies (inside its border in workspace mode).
-    pub fn chat_inner(&self, area: Rect) -> Rect {
-        let l = self.compute_layout(area);
-        match l.mode {
-            Mode::Workspace => Block::default().borders(Borders::ALL).inner(l.chat),
-            Mode::Chat => l.chat,
+    /// Zoom / minimize state to feed the layout engine (S14).
+    pub fn panes(&self) -> layout::Panes {
+        layout::Panes {
+            zoom: self.zoom,
+            min_sidebar: self.min_sidebar,
+            min_editor: self.min_editor,
+            min_diff: self.min_diff,
+            min_chat: self.min_chat,
         }
     }
 
-    /// Focus actually in effect: panes hidden by the layout fall back to the chat.
+    /// Layout actually rendered for `area`.
+    pub fn compute_layout(&self, area: Rect) -> Layout {
+        layout::compute_panes(area, self.mode, self.panes())
+    }
+
+    /// Inner area the chat PTY should be resized to, or `None` when the chat
+    /// must keep its last real size: minimized (collapsed to a title bar) or
+    /// hidden because another pane is zoomed (S14, S4). When the chat is zoomed
+    /// this returns the full body inner area.
+    pub fn chat_inner(&self, area: Rect) -> Option<Rect> {
+        let l = self.compute_layout(area);
+        if !l.show_chat || l.is_minimized(Pane::Chat) {
+            return None;
+        }
+        Some(match l.mode {
+            Mode::Workspace => Block::default().borders(Borders::ALL).inner(l.chat),
+            Mode::Chat => l.chat,
+        })
+    }
+
+    /// Focus actually in effect: panes hidden by the layout fall back to the
+    /// chat, and while a pane is zoomed the focus follows the zoomed pane.
     pub fn effective_focus(&self) -> Focus {
         match self.layout.map(|l| l.mode) {
             Some(Mode::Chat) => Focus::Chat,
             _ if self.mode == Mode::Chat => Focus::Chat,
-            _ => self.focus,
+            _ => match self.zoom {
+                Some(z) if focus_pane(self.focus) != z => pane_focus(z),
+                _ => self.focus,
+            },
+        }
+    }
+
+    fn is_min(&self, pane: Pane) -> bool {
+        match pane {
+            Pane::Sidebar => self.min_sidebar,
+            Pane::Editor => self.min_editor,
+            Pane::Diff => self.min_diff,
+            Pane::Chat => self.min_chat,
+        }
+    }
+
+    fn set_min(&mut self, pane: Pane, value: bool) {
+        match pane {
+            Pane::Sidebar => self.min_sidebar = value,
+            Pane::Editor => self.min_editor = value,
+            Pane::Diff => self.min_diff = value,
+            Pane::Chat => self.min_chat = value,
+        }
+    }
+
+    /// Number of workspace panes that are not minimized.
+    fn unminimized_count(&self) -> usize {
+        Pane::ALL.iter().filter(|p| !self.is_min(**p)).count()
+    }
+
+    /// Next non-minimized pane after `from`, as a focus target.
+    fn next_unminimized_focus(&self, from: Pane) -> Focus {
+        let idx = Pane::ALL.iter().position(|p| *p == from).unwrap_or(0);
+        for off in 1..=4 {
+            let p = Pane::ALL[(idx + off) % 4];
+            if !self.is_min(p) {
+                return pane_focus(p);
+            }
+        }
+        Focus::Chat
+    }
+
+    /// Reports the "available in workspace mode" status when not in workspace
+    /// (S14 item 7). Returns true when the command should be refused.
+    fn not_workspace(&mut self) -> bool {
+        if self.mode != Mode::Workspace {
+            self.status_msg = Some("available in workspace mode".into());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// prefix `z`: toggle zoom on the focused pane (S14).
+    pub fn zoom_focused(&mut self) {
+        if self.not_workspace() {
+            return;
+        }
+        self.toggle_zoom(focus_pane(self.effective_focus()));
+    }
+
+    /// Toggles zoom on a specific pane and focuses it when zooming in.
+    pub fn toggle_zoom(&mut self, pane: Pane) {
+        if self.zoom == Some(pane) {
+            self.zoom = None;
+        } else {
+            self.zoom = Some(pane);
+            self.focus = pane_focus(pane);
+        }
+    }
+
+    /// prefix `m`: minimize the focused pane (S14).
+    pub fn minimize_focused(&mut self) {
+        if self.not_workspace() {
+            return;
+        }
+        self.toggle_minimize(focus_pane(self.effective_focus()));
+    }
+
+    /// Minimizes a pane, or restores it when already minimized. Minimizing the
+    /// last visible pane is refused; focus moves off a pane we minimize.
+    pub fn toggle_minimize(&mut self, pane: Pane) {
+        if self.is_min(pane) {
+            self.set_min(pane, false);
+            return;
+        }
+        if self.unminimized_count() <= 1 {
+            self.status_msg = Some("can\u{2019}t minimize the last visible pane".into());
+            return;
+        }
+        self.set_min(pane, true);
+        if focus_pane(self.focus) == pane {
+            self.focus = self.next_unminimized_focus(pane);
+        }
+    }
+
+    /// prefix `d`: the "changes only" view — focus the diff and zoom it (S14).
+    pub fn changes_only(&mut self) {
+        if self.not_workspace() {
+            return;
+        }
+        if self.zoom == Some(Pane::Diff) {
+            self.zoom = None;
+        } else {
+            self.focus = Focus::Diff;
+            self.zoom = Some(Pane::Diff);
         }
     }
 
@@ -324,6 +498,18 @@ impl App {
         // Ctrl+] opens the prefix chord (handled before overlays so it still works there).
         if key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.prefix = true;
+            return Action::None;
+        }
+
+        // Esc restores a zoomed pane when not inside an editing context (the
+        // editor and the chat keep Esc for themselves); the diff and sidebar
+        // are read-only, so Esc backs out of "changes only" (S14).
+        if key.code == KeyCode::Esc
+            && self.zoom.is_some()
+            && self.overlay.is_none()
+            && matches!(self.effective_focus(), Focus::Sidebar | Focus::Diff)
+        {
+            self.zoom = None;
             return Action::None;
         }
 
@@ -476,6 +662,18 @@ impl App {
                 self.toggle_apps_panel();
                 Action::None
             }
+            KeyCode::Char('z') => {
+                self.zoom_focused();
+                Action::None
+            }
+            KeyCode::Char('m') => {
+                self.minimize_focused();
+                Action::None
+            }
+            KeyCode::Char('d') => {
+                self.changes_only();
+                Action::None
+            }
             KeyCode::Char('?') => {
                 self.toggle_overlay(Overlay::Help);
                 Action::None
@@ -544,7 +742,12 @@ impl App {
     }
 
     fn cycle_focus(&mut self) {
-        let order = self.visible_focuses();
+        // Tab skips minimized panes (they are title bars); prefix 1-4 can still
+        // focus them explicitly to restore with prefix m.
+        let order: Vec<Focus> = self.visible_focuses().into_iter().filter(|f| !self.is_min(focus_pane(*f))).collect();
+        if order.is_empty() {
+            return;
+        }
         let idx = order.iter().position(|&f| f == self.focus).unwrap_or(0);
         self.focus = order[(idx + 1) % order.len()];
     }
@@ -741,6 +944,28 @@ impl App {
                 _ => self.overlay = None,
             }
             return Action::None;
+        }
+        // Title-bar minimize / zoom buttons act on their pane even when it is
+        // not focused (S14 item 3).
+        for b in self.title_buttons.clone() {
+            if row == b.row {
+                if col >= b.min_range.0 && col < b.min_range.1 {
+                    self.toggle_minimize(b.pane);
+                    return Action::None;
+                }
+                if col >= b.zoom_range.0 && col < b.zoom_range.1 {
+                    self.toggle_zoom(b.pane);
+                    return Action::None;
+                }
+            }
+        }
+        // A click on a minimized pane's title bar or strip restores it (S14).
+        for (pane, rect) in self.minimized_regions.clone() {
+            if rect_contains(rect, col, row) {
+                self.set_min(pane, false);
+                self.focus = pane_focus(pane);
+                return Action::None;
+            }
         }
         let Some(l) = self.layout else { return Action::None };
         if let Some(tb) = l.toolbar {
@@ -952,6 +1177,84 @@ fn app_dot_style(status: AppState) -> Style {
 /// Truncates `s` to `w` columns (char-based; glyphs here are single-width).
 fn fit(s: &str, w: usize) -> String {
     s.chars().take(w).collect()
+}
+
+/// Truncates `s` to `w` columns and right-pads it with spaces to exactly `w`.
+fn fit_pad(s: &str, w: usize) -> String {
+    let mut out: String = s.chars().take(w).collect();
+    let len = out.chars().count();
+    if len < w {
+        out.push_str(&" ".repeat(w - len));
+    }
+    out
+}
+
+/// Labels for the title-bar minimize and zoom buttons (S14 item 3). The ASCII
+/// fallback (GENTLE_PARTITIONER_ICONS=ascii) avoids the box-drawing glyph.
+fn button_labels(icons: IconMode) -> (&'static str, &'static str) {
+    if icons == IconMode::Ascii {
+        ("[_]", "[^]")
+    } else {
+        ("[_]", "[\u{25a1}]")
+    }
+}
+
+/// Draws the minimize/zoom buttons at the right end of a pane's top border and
+/// returns their click target, or `None` when the pane is too narrow (the title
+/// is kept readable; the buttons are dropped first, S14 item 3).
+fn draw_title_buttons(frame: &mut Frame, pane: Pane, rect: Rect, icons: IconMode, focused: bool) -> Option<TitleButton> {
+    let (min_s, zoom_s) = button_labels(icons);
+    let min_w = min_s.chars().count() as u16;
+    let total = min_w + zoom_s.chars().count() as u16;
+    // Leave room for the title and the border corner before showing buttons.
+    if rect.height == 0 || rect.width < total + 6 {
+        return None;
+    }
+    let row = rect.y;
+    let start = rect.x + rect.width - 1 - total;
+    let style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
+    let buf = frame.buffer_mut();
+    buf.set_string(start, row, min_s, style);
+    buf.set_string(start + min_w, row, zoom_s, style);
+    Some(TitleButton { pane, row, min_range: (start, start + min_w), zoom_range: (start + min_w, start + total) })
+}
+
+/// Draws a minimized horizontal pane (editor/diff/chat) as a one-row title bar
+/// (S14 item 2). The whole bar is clickable to restore it.
+fn draw_min_bar(frame: &mut Frame, title: &str, rect: Rect, focused: bool, icons: IconMode) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let marker = if icons == IconMode::Ascii { "_" } else { "\u{25ac}" };
+    let style = if focused {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let text = fit_pad(&format!(" {marker} {title} · click to restore "), rect.width as usize);
+    frame.render_widget(Paragraph::new(Line::styled(text, style)), rect);
+}
+
+/// Draws the minimized sidebar as a 3-column vertical strip showing its icon
+/// (S14 item 2). The whole strip is clickable to restore it.
+fn draw_min_strip(frame: &mut Frame, rect: Rect, focused: bool, icons: IconMode) {
+    if rect.width == 0 || rect.height == 0 {
+        return;
+    }
+    let icon = if icons == IconMode::Ascii { "F" } else { "\u{f07b}" };
+    let style = if focused {
+        Style::default().fg(Color::Black).bg(Color::Cyan)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let w = rect.width as usize;
+    let lines: Vec<Line<'static>> = (0..rect.height)
+        .map(|i| {
+            let s = if i == 0 { format!(" {icon}") } else { String::new() };
+            Line::styled(fit_pad(&s, w), style)
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), rect);
 }
 
 /// Builds the apps-panel content lines for a pane (or overlay) `w` columns wide.
@@ -1199,6 +1502,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
     app.tree_area = None;
     app.apps_area = None;
     if let Some(side) = l.sidebar {
+        if l.is_minimized(Pane::Sidebar) {
+            // Collapsed to a vertical icon strip (S14); the tree/apps click
+            // regions are left empty so only a restore click lands.
+            draw_min_strip(frame, side, focus == Focus::Sidebar || focus == Focus::Apps, app.icons);
+        } else {
         // The sidebar is split into the file tree (top) and the apps panel (bottom, S12).
         let (tree_area, apps_area) =
             layout::split_sidebar(side, app.apps.apps.len() as u16, app.apps.is_expanded());
@@ -1215,9 +1523,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
         }
         frame.render_widget(Paragraph::new(lines).block(block), tree_area);
         draw_apps_panel(frame, app, apps_area, focus == Focus::Apps);
+        }
     }
 
-    if let (Some(ed), Some(df)) = (l.editor, l.diff) {
+    if let Some(ed) = l.editor {
+        if l.is_minimized(Pane::Editor) {
+            draw_min_bar(frame, "Editor", ed, focus == Focus::Editor, app.icons);
+        } else {
         // Left pane: the editable buffer. Take the highlighter out so it can be
         // borrowed mutably alongside the editor; it is restored below.
         let ghost = if focus == Focus::Editor { app.ghost.clone() } else { None };
@@ -1289,6 +1601,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
             }
         }
         app.highlighter = highlighter;
+        }
+    }
+
+    if let Some(df) = l.diff {
+        if l.is_minimized(Pane::Diff) {
+            draw_min_bar(frame, "Agent changes", df, focus == Focus::Diff, app.icons);
+        } else {
         // Right pane: the agent's changes (read-only).
         match &app.viewer {
             Some(v) => {
@@ -1314,18 +1633,28 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
                 frame.render_widget(Paragraph::new("").block(pane_block(" Agent changes ".into(), focus == Focus::Diff)), df);
             }
         }
+        }
     }
 
+    // Chat: full pane (render the PTY), a minimized title bar (no PTY render,
+    // keeps its last size per S4), or hidden while another pane is zoomed.
     let chat = match l.mode {
+        Mode::Chat => Some(l.chat),
         Mode::Workspace => {
-            let block = pane_block(" Chat · gentle-shell ".into(), focus == Focus::Chat);
-            let inner = block.inner(l.chat);
-            frame.render_widget(block, l.chat);
-            inner
+            if l.is_minimized(Pane::Chat) {
+                draw_min_bar(frame, "Chat", l.chat, focus == Focus::Chat, app.icons);
+                None
+            } else if l.show_chat {
+                let block = pane_block(" Chat · gentle-shell ".into(), focus == Focus::Chat);
+                let inner = block.inner(l.chat);
+                frame.render_widget(block, l.chat);
+                Some(inner)
+            } else {
+                None
+            }
         }
-        Mode::Chat => l.chat,
     };
-    if let Some(pty) = pty {
+    if let (Some(chat), Some(pty)) = (chat, pty) {
         pty.with_screen(|screen| {
             pane::render_screen(screen, chat, frame.buffer_mut());
             let (row, col) = screen.cursor_position();
@@ -1333,6 +1662,36 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
                 frame.set_cursor_position(Position::new(chat.x + col.min(chat.width.saturating_sub(1)), chat.y + row.min(chat.height.saturating_sub(1))));
             }
         });
+    }
+
+    // Capture the minimize/zoom buttons (normal panes) and the clickable
+    // regions of minimized panes, and paint the buttons over the top borders
+    // (S14 item 3). Workspace only; chat mode is unaffected (S7).
+    app.title_buttons.clear();
+    app.minimized_regions.clear();
+    if l.mode == Mode::Workspace {
+        let icons = app.icons;
+        let mut buttons = Vec::new();
+        let mut regions = Vec::new();
+        let panes = [
+            (Pane::Sidebar, l.sidebar, focus == Focus::Sidebar || focus == Focus::Apps),
+            (Pane::Editor, l.editor, focus == Focus::Editor),
+            (Pane::Diff, l.diff, focus == Focus::Diff),
+            (Pane::Chat, if l.show_chat { Some(l.chat) } else { None }, focus == Focus::Chat),
+        ];
+        for (pane, rect, foc) in panes {
+            let Some(rect) = rect else { continue };
+            if rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+            if l.is_minimized(pane) {
+                regions.push((pane, rect));
+            } else if let Some(tb) = draw_title_buttons(frame, pane, rect, icons, foc) {
+                buttons.push(tb);
+            }
+        }
+        app.title_buttons = buttons;
+        app.minimized_regions = regions;
     }
 
     app.overlay_area = None;
@@ -1377,7 +1736,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
     }
 
     let status = if app.prefix {
-        Line::styled(format!(" {PREFIX_LABEL} … w workspace · t files · c changes · a apps · Tab/1-4 focus · ? help · q quit · ] send {PREFIX_LABEL}"), Style::default().fg(Color::Black).bg(Color::Cyan))
+        Line::styled(format!(" {PREFIX_LABEL} … w workspace · t files · c changes · a apps · z zoom · m min · d changes-only · Tab/1-4 focus · ? help · q quit · ] send {PREFIX_LABEL}"), Style::default().fg(Color::Black).bg(Color::Cyan))
     } else if let Some(msg) = &app.status_msg {
         Line::styled(format!(" {msg}"), Style::default().fg(Color::Black).bg(Color::Yellow))
     } else {
@@ -1385,8 +1744,21 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
             Mode::Chat => "chat",
             Mode::Workspace => "workspace",
         };
+        // Report the zoomed pane and the minimized panes (S14 item 6).
+        let mut extra = String::new();
+        if let Some(z) = app.zoom {
+            if l.mode == Mode::Workspace {
+                extra.push_str(&format!(" · zoom: {}", z.name()));
+            }
+        }
+        let mins: Vec<&str> =
+            Pane::ALL.iter().filter(|p| l.mode == Mode::Workspace && app.is_min(**p)).map(|p| p.name()).collect();
+        if !mins.is_empty() {
+            extra.push_str(&format!(" · min: {}", mins.join(",")));
+        }
         Line::styled(
-            format!(" gentle-partitioner · {mode} · focus {:?} · {PREFIX_LABEL} then ? for help", focus).to_lowercase(),
+            format!(" gentle-partitioner · {mode} · focus {:?}{extra} · {PREFIX_LABEL} then ? for help", focus)
+                .to_lowercase(),
             Style::default().fg(Color::DarkGray),
         )
     };
@@ -1400,6 +1772,9 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "  t      files tool (overlay)".into(),
         "  c      worktree changes tool (overlay)".into(),
         "  a      apps panel (toggle in workspace / overlay in chat)".into(),
+        "  z      zoom the focused pane (maximize / restore)".into(),
+        "  m      minimize the focused pane (restore with m or a click)".into(),
+        "  d      changes only (focus + zoom the agent-changes pane)".into(),
         "  Tab    next pane   1-4 sidebar / editor / changes / chat".into(),
         "  q      quit (stops gentle-shell)".into(),
         format!("  ]      send a literal {PREFIX_LABEL} to the chat"),
@@ -1408,8 +1783,10 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "Editor: type to edit · Enter/Backspace/Delete · Tab · arrows · Home/End".into(),
         "        PageUp/PageDown · Ctrl+Home/End · Ctrl+S save · Ctrl+R reload".into(),
         "        ● marks unsaved edits · Esc back to chat".into(),
-        "Agent changes: ↑↓ PgUp PgDn scroll · Esc back to chat".into(),
+        "Agent changes: ↑↓ PgUp PgDn scroll · Esc back / restore zoom".into(),
         "Apps: ↑↓ select · Enter app→items→reply · type to reply · Esc back".into(),
+        "Panes: [_] minimize · [□] zoom on each title bar; click a minimized".into(),
+        "       title bar or strip to restore it.".into(),
         "Mouse: click selects panes and places the cursor; wheel scrolls.".into(),
     ]
     .into_iter()
@@ -1978,6 +2355,166 @@ mod tests {
         app.set_apps_offline();
         let t = render(&mut app, 120, 40);
         assert!(screen_text(&t).contains("apps engine offline"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---- Pane zoom / minimize (S14) ----
+
+    fn workspace(name: &str) -> (PathBuf, App) {
+        let root = fixture(name);
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        render(&mut app, 120, 40);
+        (root, app)
+    }
+
+    fn prefix_key(app: &mut App, c: char) {
+        app.handle_key(prefix());
+        app.handle_key(ch(c));
+    }
+
+    #[test]
+    fn prefix_z_toggles_zoom_on_the_focused_pane() {
+        let (root, mut app) = workspace("zoom-toggle");
+        prefix_key(&mut app, '2'); // focus editor
+        assert_eq!(app.focus, Focus::Editor);
+        prefix_key(&mut app, 'z');
+        assert_eq!(app.zoom, Some(Pane::Editor));
+        render(&mut app, 120, 40);
+        let l = app.layout.unwrap();
+        assert_eq!(l.editor, Some(Rect::new(0, 0, 120, 39)), "editor fills the body");
+        assert_eq!((l.sidebar, l.diff, l.show_chat), (None, None, false));
+        prefix_key(&mut app, 'z');
+        assert_eq!(app.zoom, None, "second z restores");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prefix_d_is_changes_only_and_esc_restores_it() {
+        let (root, mut app) = workspace("changes-only");
+        prefix_key(&mut app, 'd');
+        assert_eq!((app.focus, app.zoom), (Focus::Diff, Some(Pane::Diff)));
+        render(&mut app, 120, 40);
+        assert_eq!(app.layout.unwrap().diff, Some(Rect::new(0, 0, 120, 39)));
+        // Esc on the (read-only) diff restores the zoom.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.zoom, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prefix_m_minimizes_and_moves_focus_off_the_pane() {
+        let (root, mut app) = workspace("min-focus");
+        prefix_key(&mut app, '2'); // focus editor
+        prefix_key(&mut app, 'm');
+        assert!(app.min_editor, "editor minimized");
+        assert_eq!(app.focus, Focus::Diff, "focus moved to the next visible pane");
+        render(&mut app, 120, 40);
+        // The diff now owns the full right width (editor is a 1-row bar).
+        let l = app.layout.unwrap();
+        assert_eq!(l.editor.unwrap().height, 1);
+        assert_eq!(l.diff.unwrap().width, 120 - l.sidebar.unwrap().width);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn minimizing_the_last_visible_pane_is_refused() {
+        let (root, mut app) = workspace("min-last");
+        prefix_key(&mut app, '1');
+        prefix_key(&mut app, 'm'); // sidebar
+        prefix_key(&mut app, '2');
+        prefix_key(&mut app, 'm'); // editor
+        prefix_key(&mut app, '3');
+        prefix_key(&mut app, 'm'); // diff
+        assert_eq!(app.unminimized_count(), 1);
+        prefix_key(&mut app, '4'); // focus chat (the last visible)
+        prefix_key(&mut app, 'm');
+        assert!(!app.min_chat, "the last visible pane cannot be minimized");
+        assert_eq!(app.status_msg.as_deref(), Some("can\u{2019}t minimize the last visible pane"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prefix_m_on_a_minimized_pane_restores_it() {
+        let (root, mut app) = workspace("min-restore");
+        prefix_key(&mut app, '2');
+        prefix_key(&mut app, 'm');
+        assert!(app.min_editor);
+        prefix_key(&mut app, '2'); // explicitly re-focus the minimized editor
+        prefix_key(&mut app, 'm');
+        assert!(!app.min_editor, "m on a minimized pane restores it");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn zoom_and_minimize_are_workspace_only() {
+        let root = fixture("zoom-chat-mode");
+        let mut app = App::new(root.clone()); // chat mode
+        render(&mut app, 120, 40);
+        for c in ['z', 'm', 'd'] {
+            prefix_key(&mut app, c);
+            assert_eq!(app.status_msg.as_deref(), Some("available in workspace mode"));
+            assert_eq!((app.zoom, app.min_editor), (None, false));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clicking_the_title_buttons_minimizes_and_zooms_an_unfocused_pane() {
+        let (root, mut app) = workspace("title-buttons");
+        assert_eq!(app.effective_focus(), Focus::Chat, "editor is not focused");
+        let btn = app.title_buttons.iter().find(|b| b.pane == Pane::Editor).copied().expect("editor buttons");
+        // Click the minimize button → editor minimized even though unfocused.
+        app.handle_mouse(click(btn.min_range.0, btn.row));
+        assert!(app.min_editor);
+        render(&mut app, 120, 40);
+        // Click the diff zoom button → diff zoomed.
+        let z = app.title_buttons.iter().find(|b| b.pane == Pane::Diff).copied().expect("diff buttons");
+        app.handle_mouse(click(z.zoom_range.0, z.row));
+        assert_eq!(app.zoom, Some(Pane::Diff));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clicking_a_minimized_strip_restores_it() {
+        let (root, mut app) = workspace("min-strip-click");
+        prefix_key(&mut app, '1');
+        prefix_key(&mut app, 'm'); // minimize sidebar
+        render(&mut app, 120, 40);
+        let (_, strip) = app.minimized_regions.iter().find(|(p, _)| *p == Pane::Sidebar).copied().expect("strip");
+        assert_eq!(strip.width, layout::MIN_STRIP_WIDTH);
+        app.handle_mouse(click(strip.x, strip.y + 2));
+        assert!(!app.min_sidebar, "clicking the strip restores the sidebar");
+        assert_eq!(app.focus, Focus::Sidebar);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn chat_inner_is_none_when_minimized_and_full_when_zoomed() {
+        let (root, mut app) = workspace("chat-pty");
+        let area = Rect::new(0, 0, 120, 40);
+        assert!(app.chat_inner(area).is_some(), "normal chat resizes the PTY");
+        app.min_chat = true;
+        assert_eq!(app.chat_inner(area), None, "minimized chat keeps its last size");
+        app.min_chat = false;
+        app.zoom = Some(Pane::Chat);
+        let inner = app.chat_inner(area).expect("zoomed chat resizes");
+        // Full body (39 rows) minus the pane border.
+        assert_eq!(inner, Rect::new(1, 1, 118, 37));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn status_line_reports_zoom_and_minimized_panes() {
+        let (root, mut app) = workspace("status-s14");
+        prefix_key(&mut app, '1');
+        prefix_key(&mut app, 'm'); // minimize sidebar
+        let t = render(&mut app, 120, 40);
+        assert!(screen_text(&t).contains("min: sidebar"), "status lists minimized panes");
+        prefix_key(&mut app, '3');
+        prefix_key(&mut app, 'z'); // zoom diff
+        let t = render(&mut app, 120, 40);
+        assert!(screen_text(&t).contains("zoom: diff"), "status reports the zoomed pane");
         fs::remove_dir_all(root).unwrap();
     }
 }

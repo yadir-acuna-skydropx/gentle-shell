@@ -279,10 +279,15 @@ else is forwarded to the chat.
 | `t` | Files tool (overlay) |
 | `c` | Worktree changes tool (overlay) |
 | `a` | Apps panel (toggle expand/collapse in workspace · overlay in chat) |
+| `z` | Zoom (maximize) the focused pane; press again to restore |
+| `m` | Minimize the focused pane to its title bar; press again to restore |
+| `d` | Changes only — focus and zoom the agent-changes pane |
 | `?` | Help overlay |
-| `Tab` | Next pane · `1`-`4` focus sidebar / editor / changes / chat |
+| `Tab` | Next pane (skips minimized) · `1`-`4` focus sidebar / editor / changes / chat |
 | `q` | Quit (stops gentle-shell) |
 | `]` | Send a literal `Ctrl+]` to the chat |
+
+`z`, `m` and `d` are workspace-only; in chat mode they report *available in workspace mode*.
 
 - **Sidebar:** `↑↓` (or `k`/`j`) move · `Enter`/`→` open · `←` collapse / go to
   parent · `Esc` back to chat.
@@ -302,7 +307,8 @@ else is forwarded to the chat.
   - Opening another file or quitting with unsaved edits warns first; repeat the
     action to discard.
   - Binary, unreadable and oversized files stay read-only.
-- **Agent changes (right pane):** `↑↓` `PgUp` `PgDn` scroll · `Esc` back to chat.
+- **Agent changes (right pane):** `↑↓` `PgUp` `PgDn` scroll · `Esc` back to chat (or restores the zoom when this pane is zoomed).
+- **Zoom & minimize (S14):** every pane's top border carries two small buttons at its right end — `[_]` minimize and `[□]` zoom (`[_]`/`[^]` with `GENTLE_PARTITIONER_ICONS=ascii`). A click runs that pane's action even when it is not focused. A **zoomed** pane fills the whole body and hides the others; `z` again, or `Esc` outside an editing context, restores it. A **minimized** pane collapses to a one-row title bar (the sidebar to a 3-column icon strip) while the rest grow; several panes may be minimized but never all four. Click a minimized title bar or strip to restore it. The status line shows the zoomed pane and the minimized ones. While the chat is minimized its PTY keeps its last size, so gentle-shell does not reflow.
 - **Apps panel:** `↑↓` select an app or item · `Enter` drills in (app → items →
   reply box) · type to edit the reply, `Enter` sends it, `Esc` steps back one
   level and then to the chat. Click an app or item to select and focus it.

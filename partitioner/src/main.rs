@@ -392,7 +392,9 @@ fn spawn_pty(
     predict: Option<&PredictHandles>,
 ) -> Result<PtyPane> {
     let size = terminal.size()?;
-    let inner = app.chat_inner(Rect::new(0, 0, size.width, size.height));
+    let full = Rect::new(0, 0, size.width, size.height);
+    // At spawn nothing is minimized or zoomed, so this is always Some.
+    let inner = app.chat_inner(full).unwrap_or(full);
 
     let mut cmd = CommandBuilder::new(&command[0]);
     for arg in &command[1..] {
@@ -421,8 +423,11 @@ fn spawn_pty(
 /// only changed cells reach the real terminal (S3).
 fn redraw(terminal: &mut Terminal<Backend>, app: &mut App, pty: &mut PtyPane) -> Result<()> {
     let size = terminal.size()?;
-    let inner = app.chat_inner(Rect::new(0, 0, size.width, size.height));
-    pty.resize(inner.height, inner.width);
+    // When the chat is minimized or hidden by a zoomed pane, keep the PTY at its
+    // last real size so gentle-shell does not reflow (S4, S14).
+    if let Some(inner) = app.chat_inner(Rect::new(0, 0, size.width, size.height)) {
+        pty.resize(inner.height, inner.width);
+    }
     terminal.draw(|f| draw(f, app, Some(&*pty)))?;
     Ok(())
 }
