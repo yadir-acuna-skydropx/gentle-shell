@@ -32,4 +32,14 @@ pub trait Connector: Send {
     fn poll(&mut self) -> Result<Vec<Item>>;
     /// Sends a reply to `item_id`. Called on the connector's thread.
     fn reply(&mut self, item_id: &str, text: &str) -> Result<()>;
+    /// Returns the children of a hierarchical item. The default refuses, so a
+    /// flat connector (Slack) needs no change beyond compiling.
+    fn expand(&mut self, _item_id: &str) -> Result<Vec<Item>> {
+        Err("not supported".to_string())
+    }
+    /// Runs an action on an item, returning a success detail (e.g. a created
+    /// path). The default refuses.
+    fn action(&mut self, _item_id: &str, _action_id: &str) -> Result<String> {
+        Err("not supported".to_string())
+    }
 }

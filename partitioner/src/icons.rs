@@ -59,12 +59,21 @@ const IMAGE: &str = "\u{f1c5}"; // nf-fa-file_image_o
 const FILE: &str = "\u{f15b}"; // nf-fa-file (generic default)
 // App glyphs for the apps panel (S12).
 const SLACK: &str = "\u{f198}"; // nf-fa-slack
+const GITHUB: &str = "\u{f09b}"; // nf-fa-github
 const APP: &str = "\u{f0ac}"; // nf-fa-globe (generic app)
+// GitHub item-kind glyphs for the apps panel (S15).
+const PULL_REQUEST: &str = "\u{f407}"; // nf-oct-git_pull_request
+const ISSUE: &str = "\u{f41b}"; // nf-oct-issue_opened
+const BRANCH: &str = "\u{f418}"; // nf-oct-git_branch
+const REPO: &str = "\u{f401}"; // nf-oct-repo
+const WORKTREE: &str = "\u{f126}"; // nf-fa-code_fork
+const SECTION: &str = "\u{f0ca}"; // nf-fa-list_ul
 
 /// Every glyph the Nerd Font set can render; used to assert each is one column.
 pub const GLYPHS: &[&str] = &[
     FOLDER, FOLDER_OPEN, PYTHON, RUST, JS, TS, REACT, JSON, MARKDOWN, CONFIG, SHELL, SQL, HTML, CSS, GO, JAVA, CLANG,
-    CPP, LOCK, TXT, GIT, DOCKER, MAKE, NPM, IMAGE, FILE, SLACK, APP,
+    CPP, LOCK, TXT, GIT, DOCKER, MAKE, NPM, IMAGE, FILE, SLACK, GITHUB, APP, PULL_REQUEST, ISSUE, BRANCH, REPO,
+    WORKTREE, SECTION,
 ];
 
 /// Glyph for an app row in the apps panel. Uses the Nerd Font brand glyph when
@@ -74,7 +83,35 @@ pub fn app_icon(id: &str, mode: IconMode) -> &'static str {
         IconMode::Ascii => "#",
         IconMode::Nerd => match id {
             "slack" => SLACK,
+            "github" => GITHUB,
             _ => APP,
+        },
+    }
+}
+
+/// Glyph for a hierarchical item by its `kind` (S15). Returns an empty string
+/// when there is no icon for the kind; the ASCII fallback uses plain markers.
+pub fn kind_icon(kind: Option<&str>, mode: IconMode) -> &'static str {
+    match mode {
+        IconMode::Ascii => match kind {
+            Some("section") => "+",
+            Some("dir") | Some("repo") => ">",
+            Some("pr") => "P",
+            Some("issue") => "I",
+            Some("branch") => "B",
+            Some("worktree") => "W",
+            _ => " ",
+        },
+        IconMode::Nerd => match kind {
+            Some("section") => SECTION,
+            Some("dir") => FOLDER,
+            Some("repo") => REPO,
+            Some("pr") => PULL_REQUEST,
+            Some("issue") => ISSUE,
+            Some("branch") => BRANCH,
+            Some("worktree") => WORKTREE,
+            Some("file") => FILE,
+            _ => " ",
         },
     }
 }

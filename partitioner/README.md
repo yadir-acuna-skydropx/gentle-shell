@@ -40,8 +40,9 @@ repainted — only the changed cells of that fragment are written out.
   It lists connectable apps with a coloured status dot and an item count;
   expanding an app shows its messages with a reply box. The connections run in a
   separate Rust process, `gentle-apps`, spoken to over JSON-lines on stdio. The
-  first app is **Slack** (the live connector lands in T13; for now it reports
-  *not connected*). Disable the engine and panel with `--no-apps`.
+  apps are **Slack** (mentions + threaded replies) and **GitHub** (repos,
+  branches, trees, PRs, issues and local worktrees, with simple actions).
+  Disable the engine and panel with `--no-apps`.
 
 ## Apps engine (`gentle-apps`)
 
@@ -59,19 +60,31 @@ use the same definitions):
 - **engine → partitioner**
   - `{"type":"apps","apps":[{"id":"slack","name":"Slack","status":"disconnected|connecting|connected|error","detail":"…"}]}` — the full app list, on start and on any status change;
   - `{"type":"items","app":"slack","items":[{"id":"…","title":"#channel · author","text":"…","ts":"…","link":"…"}]}` — the full current item list for one app;
-  - `{"type":"result","id":N,"ok":true|false,"error":"…"?}` — the correlated outcome of a request.
+  - `{"type":"result","id":N,"ok":true|false,"error":"…"?}` — the correlated outcome of a `reply`/`refresh`/`expand` request;
+  - `{"type":"children","id":N,"app":"github","item":"<item id>","items":[…]}` — the children of an `expand`;
+  - `{"type":"actionresult","id":N,"ok":true|false,"message":"…"?,"error":"…"?}` — the outcome of an `action`.
 - **partitioner → engine**
   - `{"type":"reply","id":N,"app":"slack","item":"<item id>","text":"…"}`;
   - `{"type":"refresh","id":N,"app":"slack"}`;
+  - `{"type":"expand","id":N,"app":"github","item":"<item id>"}`;
+  - `{"type":"action","id":N,"app":"github","item":"<item id>","action":"<action id>"}`;
   - `{"type":"shutdown"}`.
 - An unknown message type gets a `result` error when it carries an `id`, and is
   ignored otherwise.
 
+An **item** may carry three optional, backward-compatible fields: `kind` (an
+icon hint), `expandable` (has children reachable via `expand`), and `actions`
+(`[{"id","label","confirm"}]`). A flat item without them (Slack) parses and
+serializes exactly as before.
+
 Inside the engine each app is a **`Connector`** (`id`, `name`, `status`, `poll`,
-`reply`) driven on its **own thread**, so a slow app never blocks the others or
-the stdin loop. `gentle-apps` with no args runs the stdio engine;
-`gentle-apps --help`/`--version` work, and the `gentle-apps slack …`
-subcommands manage the Slack login (below).
+`reply`, and the default-refusing `expand`/`action`) driven on its **own
+thread**, so a slow app never blocks the others or the stdin loop. `gentle-apps`
+with no args runs the stdio engine; `gentle-apps --help`/`--version` work, and
+the `gentle-apps slack …` subcommands manage the Slack login (below). The
+panel navigates a hierarchical app with a breadcrumb (Enter expands, Esc steps
+up, `r` refreshes the level), and `a` (or Enter on a leaf) opens an action menu;
+an action marked `confirm` prompts **Run <label>? y/n** before it runs.
 
 ## Connect Slack
 
@@ -146,6 +159,36 @@ never another.
   `assistant.search.context`).
 - Enabling PKCE marks the app as a **public client** and is **one-way**; it
   cannot be undone.
+
+## Connect GitHub
+
+The GitHub connector **reuses your `gh` CLI session**: it runs `gh auth token`
+(no shell) when it starts and again once after a `401`, and keeps the token
+**only in memory** — it is never logged, printed, `Debug`-formatted or sent over
+the protocol. If `gh` is missing or logged out the app shows *disconnected* with
+the detail ``run `gh auth login` ``. HTTP uses the shared ureq helper with
+`Authorization: Bearer`, `Accept: application/vnd.github+json` and
+`X-GitHub-Api-Version: 2022-11-28`; the base URL is overridable for tests via
+`GENTLE_APPS_GITHUB_API`.
+
+It **polls every 60 s** (respecting `X-RateLimit-Remaining`/`Reset` and
+`403`/`429` with `Retry-After`, backing off up to 60 s). The top-level items are
+sections, each titled with its count and expandable:
+
+1. **Review requested** — `is:pr is:open review-requested:@me archived:false`; children are PRs `repo#123 · title · author`.
+2. **My PRs** — `is:pr is:open author:@me archived:false`; children are PRs with the CI state from the GraphQL `statusCheckRollup` of the head commit: `✓` success, `✗` failure, `●` pending, `–` none (fetched lazily on expand, so a poll stays under ~10 requests).
+3. **Assigned issues** — `is:issue is:open assignee:@me archived:false`.
+4. **Repositories** — `GET /user/repos?affiliation=owner,collaborator,organization_member&sort=pushed&per_page=50` → `owner/name · default branch · pushed <relative time>`. Expand a repo → its branches (the default branch and branches with an open PR are marked); expand a branch → the root tree; expand a dir → its subtree, lazily per level; files are leaves showing their size. Each level is capped at 500 entries with a trailing `… N more`.
+5. **Worktrees (local)** — `git worktree list --porcelain` in the engine's cwd: one child per worktree with its path, branch (or *detached*) and *dirty*/*clean* state. Outside a git repo it shows *no local repository*.
+
+### Actions (with confirmation in the panel)
+
+- **open** — on a PR, issue, repo, branch or file: opens the github.com URL with `xdg-open` (no shell). No confirmation.
+- **worktree_add** — on a branch, only when the local repo's `origin` matches that GitHub repo (https/ssh URLs are normalized). Runs `git fetch origin <branch>`, then `git worktree add <repo-parent>/<repo-name>-<sanitized-branch> <branch>` (or `-b <branch> origin/<branch>` when there is no local branch). Refuses if the target dir exists; returns the created path. **Confirmation required.**
+- **checkout** — on a branch, only for the local matching repo and only if `git status --porcelain` is empty, else it refuses with *working tree has changes — commit or stash first*. Never uses `--force` and never stashes or discards. **Confirmation required.**
+
+All git calls use `std::process::Command` with args (no shell), a ~60 s timeout,
+and capture stderr into the error message.
 
 ## Prediction engine & server
 

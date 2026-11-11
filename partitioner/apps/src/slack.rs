@@ -242,7 +242,7 @@ fn match_to_item(m: &serde_json::Value, users: &HashMap<String, String>) -> Opti
     let permalink = m.get("permalink").and_then(|p| p.as_str()).unwrap_or("").to_string();
     let id = format!("{channel_id}:{ts}");
     Some((
-        Item { id, title, text, ts: ts.clone(), link: permalink.clone() },
+        Item { id, title, text, ts: ts.clone(), link: permalink.clone(), ..Default::default() },
         MatchRef { channel: channel_id, ts, permalink },
     ))
 }

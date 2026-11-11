@@ -565,31 +565,24 @@ impl App {
             self.overlay = None;
         }
         self.apps.view = View::Apps;
+        self.apps.reset_nav();
         self.focus = Focus::Chat;
     }
 
-    /// Panel navigation: Up/Down select; Enter drills in (app → items → reply);
-    /// Esc steps back one level, then to the chat.
+    /// Panel navigation: Up/Down select; Enter drills in (app → items →
+    /// children, or the reply editor / action menu on a leaf); Esc steps back
+    /// one level, then to the chat. A pending confirmation or an open action
+    /// menu take priority over the level navigation.
     fn apps_key(&mut self, key: KeyEvent) -> Action {
+        if self.apps.confirm.is_some() {
+            return self.apps_confirm_key(key);
+        }
+        if self.apps.menu.is_some() {
+            return self.apps_menu_key(key);
+        }
         match self.apps.view {
             View::Reply => self.apps_reply_key(key),
-            View::Items => {
-                let len = self.apps.current_items().len();
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k') => self.apps.item_sel = clamp_index(self.apps.item_sel, -1, len),
-                    KeyCode::Down | KeyCode::Char('j') => self.apps.item_sel = clamp_index(self.apps.item_sel, 1, len),
-                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                        if self.apps.selected_item_id().is_some() {
-                            self.apps.view = View::Reply;
-                            self.apps.reply.clear();
-                            self.apps.reply_status = None;
-                        }
-                    }
-                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.apps.view = View::Apps,
-                    _ => {}
-                }
-                Action::None
-            }
+            View::Items => self.apps_items_key(key),
             View::Apps => {
                 let len = self.apps.apps.len();
                 match key.code {
@@ -599,6 +592,7 @@ impl App {
                         if let Some(id) = self.apps.selected_app_id() {
                             self.apps.view = View::Items;
                             self.apps.item_sel = 0;
+                            self.apps.reset_nav();
                             let rid = self.next_apps_id();
                             return Action::Apps(ClientMsg::Refresh { id: rid, app: id });
                         }
@@ -608,6 +602,129 @@ impl App {
                 }
                 Action::None
             }
+        }
+    }
+
+    /// Item-level navigation: expand an expandable item (with a breadcrumb),
+    /// open the action menu on a leaf with actions, or open the reply editor on
+    /// a flat item (Slack, unchanged). `a` opens the action menu; `r` refreshes
+    /// the current level; Esc/Left steps up one level then back to the app list.
+    fn apps_items_key(&mut self, key: KeyEvent) -> Action {
+        let app = self.apps.selected_app_id().unwrap_or_default();
+        let len = self.apps.visible_items().len();
+        let sel = self.apps.visible_sel();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.apps.set_visible_sel(clamp_index(sel, -1, len)),
+            KeyCode::Down | KeyCode::Char('j') => self.apps.set_visible_sel(clamp_index(sel, 1, len)),
+            KeyCode::Char('a') => {
+                if let Some(it) = self.apps.selected_visible_item() {
+                    self.apps.open_menu(&it);
+                }
+            }
+            KeyCode::Char('r') => {
+                let rid = self.next_apps_id();
+                if let Some(frame) = self.apps.nav.last() {
+                    let parent = frame.parent_id.clone();
+                    self.apps.reload_current_level(rid);
+                    return Action::Apps(ClientMsg::Expand { id: rid, app, item: parent });
+                } else {
+                    return Action::Apps(ClientMsg::Refresh { id: rid, app });
+                }
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(it) = self.apps.selected_visible_item() {
+                    if it.expandable {
+                        let rid = self.next_apps_id();
+                        self.apps.push_nav(&it, rid);
+                        return Action::Apps(ClientMsg::Expand { id: rid, app, item: it.id });
+                    } else if !it.actions.is_empty() {
+                        self.apps.open_menu(&it);
+                    } else if self.apps.nav.is_empty() {
+                        // A flat item (Slack): open the reply editor as before.
+                        self.apps.view = View::Reply;
+                        self.apps.reply.clear();
+                        self.apps.reply_status = None;
+                    }
+                }
+            }
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+                if !self.apps.pop_nav() {
+                    self.apps.view = View::Apps;
+                    self.apps.reset_nav();
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Action-menu navigation: Up/Down select; Enter runs the action (asking for
+    /// confirmation first when the action requires it); Esc closes the menu.
+    fn apps_menu_key(&mut self, key: KeyEvent) -> Action {
+        let (len, sel) = match &self.apps.menu {
+            Some(m) => (m.actions.len(), m.sel),
+            None => return Action::None,
+        };
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(m) = self.apps.menu.as_mut() {
+                    m.sel = clamp_index(sel, -1, len);
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(m) = self.apps.menu.as_mut() {
+                    m.sel = clamp_index(sel, 1, len);
+                }
+            }
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.apps.menu = None,
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let app = self.apps.selected_app_id().unwrap_or_default();
+                if let Some(m) = self.apps.menu.take() {
+                    if let Some(action) = m.actions.get(m.sel).cloned() {
+                        if action.confirm {
+                            self.apps.confirm = Some(crate::apps_panel::Confirm {
+                                item_id: m.item_id,
+                                action_id: action.id,
+                                label: action.label,
+                            });
+                        } else {
+                            let rid = self.next_apps_id();
+                            self.apps.pending_action = Some(rid);
+                            self.apps.action_status = Some("running\u{2026}".into());
+                            return Action::Apps(ClientMsg::Action {
+                                id: rid,
+                                app,
+                                item: m.item_id,
+                                action: action.id,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Confirmation prompt: `y` runs the action, `n`/Esc cancels.
+    fn apps_confirm_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let app = self.apps.selected_app_id().unwrap_or_default();
+                if let Some(c) = self.apps.confirm.take() {
+                    let rid = self.next_apps_id();
+                    self.apps.pending_action = Some(rid);
+                    self.apps.action_status = Some("running\u{2026}".into());
+                    return Action::Apps(ClientMsg::Action { id: rid, app, item: c.item_id, action: c.action_id });
+                }
+                Action::None
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.apps.confirm = None;
+                self.apps.action_status = Some("cancelled".into());
+                Action::None
+            }
+            _ => Action::None,
         }
     }
 
@@ -1054,11 +1171,11 @@ impl App {
                 }
             }
             View::Items | View::Reply => {
-                // Row 0 is the app header; items start at row 1.
+                // Row 0 is the app/breadcrumb header; items start at row 1.
                 if rel >= 1 {
                     let idx = rel - 1;
-                    if idx < self.apps.current_items().len() {
-                        self.apps.item_sel = idx;
+                    if idx < self.apps.visible_items().len() {
+                        self.apps.set_visible_sel(idx);
                     }
                 }
             }
@@ -1094,8 +1211,9 @@ impl App {
         if let Some(ap) = self.apps_area {
             if rect_contains(ap, col, row) {
                 if self.apps.is_expanded() {
-                    let len = self.apps.current_items().len();
-                    self.apps.item_sel = clamp_index(self.apps.item_sel, dir, len);
+                    let len = self.apps.visible_items().len();
+                    let sel = self.apps.visible_sel();
+                    self.apps.set_visible_sel(clamp_index(sel, dir, len));
                 } else {
                     self.apps.app_sel = clamp_index(self.apps.app_sel, dir, self.apps.apps.len());
                 }
@@ -1295,36 +1413,66 @@ fn apps_list_lines(app: &App, w: usize, focused: bool) -> Vec<Line<'static>> {
         .collect()
 }
 
-/// Expanded view: the selected app's items (title + one-line preview) and, when
-/// replying, a reply input box at the bottom.
+/// Expanded view: the selected app's items. A flat app (Slack) keeps the
+/// title + one-line preview; a hierarchical app (GitHub) shows a breadcrumb
+/// header and kind icons, plus the action menu / confirmation / result line.
 fn apps_items_lines(app: &mut App, w: usize, focused: bool) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
-    let (dot_style, header) = match app.apps.apps.get(app.apps.app_sel) {
-        Some(a) => (
-            app_dot_style(a.status),
-            format!("{} {}", icons::app_icon(&a.id, app.icons), a.name),
-        ),
-        None => (Style::default(), String::new()),
+    let app_name = app.apps.apps.get(app.apps.app_sel).map(|a| a.name.clone()).unwrap_or_default();
+    let app_id = app.apps.apps.get(app.apps.app_sel).map(|a| a.id.clone()).unwrap_or_default();
+    let dot_style = app.apps.apps.get(app.apps.app_sel).map(|a| app_dot_style(a.status)).unwrap_or_default();
+    let nav_depth = app.apps.nav.len();
+
+    // Header: the app name at the base level, else the breadcrumb.
+    let header = if nav_depth == 0 {
+        format!("{} {}", icons::app_icon(&app_id, app.icons), app_name)
+    } else {
+        app.apps.breadcrumb(&app_name)
     };
     out.push(Line::from(vec![
         Span::styled("\u{25cf} ", dot_style),
         Span::styled(fit(&header, w.saturating_sub(2)), Style::default().add_modifier(Modifier::BOLD)),
     ]));
 
-    let items = app.apps.current_items().to_vec();
+    // A loading or errored level shows a short notice instead of stale items.
+    if let Some(frame) = app.apps.nav.last() {
+        if frame.loading {
+            out.push(Line::styled("  loading\u{2026}", Style::default().fg(Color::DarkGray)));
+            return out;
+        }
+        if let Some(err) = &frame.error {
+            out.push(Line::styled(format!("  {}", fit(err, w.saturating_sub(2))), Style::default().fg(Color::Red)));
+            return out;
+        }
+    }
+
+    let items = app.apps.visible_items().to_vec();
+    let sel = app.apps.visible_sel();
     if items.is_empty() {
-        out.push(Line::styled("  no messages", Style::default().fg(Color::DarkGray)));
+        out.push(Line::styled("  (empty)", Style::default().fg(Color::DarkGray)));
     }
     for (i, it) in items.iter().enumerate() {
         let mut title_style = Style::default();
-        if focused && i == app.apps.item_sel {
+        if focused && i == sel {
             title_style = title_style.add_modifier(Modifier::REVERSED);
         }
-        out.push(Line::styled(fit(&it.title, w), title_style));
-        let preview: String = it.text.lines().next().unwrap_or("").to_string();
-        out.push(Line::styled(format!("  {}", fit(&preview, w.saturating_sub(2))), Style::default().fg(Color::DarkGray)));
+        if nav_depth == 0 && it.kind.is_none() {
+            // Flat Slack item: title + one-line preview (unchanged).
+            out.push(Line::styled(fit(&it.title, w), title_style));
+            let preview: String = it.text.lines().next().unwrap_or("").to_string();
+            out.push(Line::styled(
+                format!("  {}", fit(&preview, w.saturating_sub(2))),
+                Style::default().fg(Color::DarkGray),
+            ));
+        } else {
+            let glyph = icons::kind_icon(it.kind.as_deref(), app.icons);
+            let marker = if it.expandable { "\u{203a}" } else { " " };
+            let label = fit(&format!("{marker}{glyph} {}", it.title), w);
+            out.push(Line::styled(label, title_style));
+        }
     }
 
+    // The reply editor (Slack) at the bottom.
     if app.apps.view == View::Reply {
         out.push(Line::styled("\u{2500}".repeat(w), Style::default().fg(Color::DarkGray)));
         let box_w = w.saturating_sub(2);
@@ -1337,6 +1485,28 @@ fn apps_items_lines(app: &mut App, w: usize, focused: bool) -> Vec<Line<'static>
         if let Some(status) = &app.apps.reply_status {
             out.push(Line::styled(fit(status, w), Style::default().fg(Color::Yellow)));
         }
+    }
+
+    // The action menu, confirmation prompt, and last action result.
+    if let Some(menu) = &app.apps.menu {
+        out.push(Line::styled("\u{2500}".repeat(w), Style::default().fg(Color::DarkGray)));
+        out.push(Line::styled("Actions", Style::default().add_modifier(Modifier::BOLD)));
+        for (i, a) in menu.actions.iter().enumerate() {
+            let mut st = Style::default();
+            if i == menu.sel {
+                st = st.add_modifier(Modifier::REVERSED);
+            }
+            out.push(Line::styled(fit(&format!("  {}", a.label), w), st));
+        }
+    }
+    if let Some(c) = &app.apps.confirm {
+        out.push(Line::styled(
+            fit(&format!("Run {}? y/n", c.label), w),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ));
+    }
+    if let Some(status) = &app.apps.action_status {
+        out.push(Line::styled(fit(status, w), Style::default().fg(Color::Cyan)));
     }
     out
 }
@@ -2247,7 +2417,7 @@ mod tests {
         AppStatus { id: id.into(), name: name.into(), status, detail: None }
     }
     fn app_item(id: &str, title: &str) -> AppItem {
-        AppItem { id: id.into(), title: title.into(), text: "body line".into(), ts: "1".into(), link: "l".into() }
+        AppItem { id: id.into(), title: title.into(), text: "body line".into(), ts: "1".into(), link: "l".into(), ..Default::default() }
     }
 
     #[test]
@@ -2314,6 +2484,136 @@ mod tests {
         app.handle_key(key(KeyCode::Enter)); // open reply
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None, "empty reply sends nothing");
         assert_eq!(app.apps.pending_reply, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn expandable(id: &str, title: &str, kind: &str) -> AppItem {
+        AppItem {
+            id: id.into(),
+            title: title.into(),
+            kind: Some(kind.into()),
+            expandable: true,
+            ..Default::default()
+        }
+    }
+    fn branch_item(id: &str, title: &str) -> AppItem {
+        use gentle_apps::protocol::ItemAction;
+        AppItem {
+            id: id.into(),
+            title: title.into(),
+            kind: Some("branch".into()),
+            expandable: true,
+            actions: vec![
+                ItemAction { id: "open".into(), label: "Open".into(), confirm: false },
+                ItemAction { id: "checkout".into(), label: "Checkout".into(), confirm: true },
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn github_panel_expands_with_a_breadcrumb_and_esc_steps_up() {
+        let root = fixture("gh-nav");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("github", "GitHub", AppStatusKind::Connected)] });
+        app.apply_apps_msg(EngineMsg::Items {
+            app: "github".into(),
+            items: vec![expandable("sec:repos", "Repositories (1)", "section")],
+        });
+        render(&mut app, 120, 40);
+        app.handle_key(key(KeyCode::Enter)); // enter the app → Items + Refresh
+        assert_eq!(app.apps.view, View::Items);
+
+        // Enter on the expandable section sends an expand with a new level.
+        let act = app.handle_key(key(KeyCode::Enter));
+        let id = match act {
+            Action::Apps(ClientMsg::Expand { id, app: a, item }) => {
+                assert_eq!((a.as_str(), item.as_str()), ("github", "sec:repos"));
+                id
+            }
+            other => panic!("expected an expand, got {other:?}"),
+        };
+        assert_eq!(app.apps.nav.len(), 1);
+        // Children fill the level; the breadcrumb shows the path.
+        app.apply_apps_msg(EngineMsg::Children {
+            id,
+            app: "github".into(),
+            item: "sec:repos".into(),
+            items: vec![branch_item("branch|o|r|sha|main", "main (default)")],
+        });
+        let t = render(&mut app, 120, 40);
+        assert!(screen_text(&t).contains("GitHub › Repositories (1)"), "breadcrumb missing");
+
+        // Esc pops back to the section list, then to the app list.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.apps.nav.len(), 0);
+        assert_eq!(app.apps.view, View::Items);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.apps.view, View::Apps);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_action_menu_and_confirmation_run_an_action() {
+        let root = fixture("gh-action");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("github", "GitHub", AppStatusKind::Connected)] });
+        app.apply_apps_msg(EngineMsg::Items {
+            app: "github".into(),
+            items: vec![branch_item("branch|o|r|sha|main", "main (default)")],
+        });
+        render(&mut app, 120, 40);
+        app.handle_key(key(KeyCode::Enter)); // enter app → Items
+
+        // `a` opens the action menu for the selected branch.
+        app.handle_key(ch('a'));
+        assert!(app.apps.menu.is_some());
+        // Move to the "Checkout" action (confirm = true) and select it.
+        app.handle_key(key(KeyCode::Down));
+        let act = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(act, Action::None, "a confirm action waits for y/n");
+        assert!(app.apps.confirm.is_some());
+        assert!(app.apps.menu.is_none());
+
+        // `y` dispatches the action request.
+        let act = app.handle_key(ch('y'));
+        let id = match act {
+            Action::Apps(ClientMsg::Action { id, app: a, item, action }) => {
+                assert_eq!((a.as_str(), item.as_str(), action.as_str()), ("github", "branch|o|r|sha|main", "checkout"));
+                id
+            }
+            other => panic!("expected an action, got {other:?}"),
+        };
+        // The correlated result is shown in the status line.
+        app.apply_apps_msg(EngineMsg::ActionResult { id, ok: true, message: Some("checked out main".into()), error: None });
+        assert_eq!(app.apps.action_status.as_deref(), Some("checked out main"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn github_confirmation_can_be_declined() {
+        let root = fixture("gh-decline");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("github", "GitHub", AppStatusKind::Connected)] });
+        app.apply_apps_msg(EngineMsg::Items {
+            app: "github".into(),
+            items: vec![branch_item("branch|o|r|sha|main", "main")],
+        });
+        render(&mut app, 120, 40);
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(ch('a'));
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter)); // select checkout → confirm
+        assert!(app.apps.confirm.is_some());
+        assert_eq!(app.handle_key(ch('n')), Action::None);
+        assert!(app.apps.confirm.is_none());
+        assert_eq!(app.apps.action_status.as_deref(), Some("cancelled"));
         fs::remove_dir_all(root).unwrap();
     }
 

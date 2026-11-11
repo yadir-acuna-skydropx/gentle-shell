@@ -7,6 +7,7 @@
 pub mod config;
 pub mod connector;
 pub mod engine;
+pub mod github;
 pub mod http;
 pub mod oauth;
 pub mod pkce;
@@ -33,12 +34,18 @@ pub fn select_store() -> Box<dyn TokenStore> {
     }
 }
 
-/// Builds the default connector set (Slack, reading its client id from
-/// `apps.toml` and its token from the selected store).
+/// Builds the default connector set: Slack (client id from `apps.toml`, token
+/// from the selected store) and GitHub (token from the `gh` CLI session). The
+/// GitHub connector operates on the engine's cwd, which the partitioner sets to
+/// its root.
 pub fn default_connectors() -> Vec<Box<dyn connector::Connector>> {
     let home = home_dir();
     let cfg = oauth::SlackConfig::from_env();
     let meta = config::load(&home);
     let store = select_store();
-    vec![Box::new(slack::SlackConnector::new(cfg, meta.client_id, store, home))]
+    let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    vec![
+        Box::new(slack::SlackConnector::new(cfg, meta.client_id, store, home)),
+        Box::new(github::GithubConnector::new(github::GithubConfig::from_env(), repo_root)),
+    ]
 }

@@ -11,6 +11,8 @@ use crate::protocol::{parse_client_line, AppStatus, ClientMsg, EngineMsg, Parsed
 enum Cmd {
     Reply { id: u64, item: String, text: String },
     Refresh { id: u64 },
+    Expand { id: u64, item: String },
+    Action { id: u64, item: String, action: String },
     Stop,
 }
 
@@ -86,6 +88,18 @@ where
                 }
                 None => write_msg(&mut output, &unknown_app(id, &app))?,
             },
+            Ev::Client(ClientMsg::Expand { id, app, item }) => match senders.iter().find(|(a, _)| *a == app) {
+                Some((_, s)) => {
+                    let _ = s.send(Cmd::Expand { id, item });
+                }
+                None => write_msg(&mut output, &unknown_app(id, &app))?,
+            },
+            Ev::Client(ClientMsg::Action { id, app, item, action }) => match senders.iter().find(|(a, _)| *a == app) {
+                Some((_, s)) => {
+                    let _ = s.send(Cmd::Action { id, item, action });
+                }
+                None => write_msg(&mut output, &unknown_app_action(id, &app))?,
+            },
         }
     }
 
@@ -117,6 +131,10 @@ where
 
 fn unknown_app(id: u64, app: &str) -> EngineMsg {
     EngineMsg::Result { id, ok: false, error: Some(format!("unknown app: {app}")) }
+}
+
+fn unknown_app_action(id: u64, app: &str) -> EngineMsg {
+    EngineMsg::ActionResult { id, ok: false, message: None, error: Some(format!("unknown app: {app}")) }
 }
 
 fn write_msg<W: Write>(output: &mut W, msg: &EngineMsg) -> std::io::Result<()> {
@@ -188,6 +206,35 @@ fn connector_loop(mut c: Box<dyn Connector>, cmd_rx: Receiver<Cmd>, tx: Sender<E
                         let _ = tx.send(Ev::Emit(EngineMsg::Result { id: rid, ok: false, error: Some(e) }));
                     }
                 }
+                report_status(&mut c, &id, &tx, &mut last_status);
+            }
+            Ok(Cmd::Expand { id: rid, item }) => {
+                match c.expand(&item) {
+                    Ok(items) => {
+                        let _ = tx.send(Ev::Emit(EngineMsg::Children {
+                            id: rid,
+                            app: id.clone(),
+                            item,
+                            items,
+                        }));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Ev::Emit(EngineMsg::Result { id: rid, ok: false, error: Some(e) }));
+                    }
+                }
+                report_status(&mut c, &id, &tx, &mut last_status);
+            }
+            Ok(Cmd::Action { id: rid, item, action }) => {
+                let msg = match c.action(&item, &action) {
+                    Ok(detail) => EngineMsg::ActionResult {
+                        id: rid,
+                        ok: true,
+                        message: Some(detail),
+                        error: None,
+                    },
+                    Err(e) => EngineMsg::ActionResult { id: rid, ok: false, message: None, error: Some(e) },
+                };
+                let _ = tx.send(Ev::Emit(msg));
                 report_status(&mut c, &id, &tx, &mut last_status);
             }
             Err(RecvTimeoutError::Timeout) => {
@@ -276,10 +323,27 @@ mod tests {
             self.replies.lock().unwrap().push((item_id.to_string(), text.to_string()));
             Ok(())
         }
+        fn expand(&mut self, item_id: &str) -> crate::connector::Result<Vec<Item>> {
+            if item_id == "bad" {
+                return Err("cannot expand".into());
+            }
+            Ok(vec![item(&format!("{item_id}/child"))])
+        }
+        fn action(&mut self, item_id: &str, action_id: &str) -> crate::connector::Result<String> {
+            if action_id == "boom" {
+                return Err("action failed".into());
+            }
+            Ok(format!("did {action_id} on {item_id}"))
+        }
     }
 
     fn item(id: &str) -> Item {
-        Item { id: id.into(), title: "t".into(), text: "x".into(), ts: "1".into(), link: "l".into() }
+        Item { id: id.into(), title: "t".into(), text: "x".into(), ts: "1".into(), link: "l".into(), ..Default::default() }
+    }
+    // Same as `item`, under a distinct name so a `Children { item, .. }` match arm
+    // (which binds a local `item`) can still build the expected child.
+    fn item_named(id: &str) -> Item {
+        item(id)
     }
 
     fn run_collect(connectors: Vec<Box<dyn Connector>>, input: &str) -> Vec<EngineMsg> {
@@ -329,6 +393,56 @@ mod tests {
         let input = "{\"type\":\"reply\",\"id\":9,\"app\":\"mock\",\"item\":\"i\",\"text\":\"x\"}\n";
         let msgs = run_collect(vec![Box::new(mock)], input);
         assert!(msgs.iter().any(|m| matches!(m, EngineMsg::Result { id: 9, ok: false, error: Some(e) } if e == "reply rejected")));
+    }
+
+    #[test]
+    fn expand_routes_to_the_connector_and_returns_children() {
+        let mock = Mock { id: "mock".into(), items: vec![], replies: Arc::default(), fail_reply: false };
+        let input = concat!(
+            "{\"type\":\"expand\",\"id\":21,\"app\":\"mock\",\"item\":\"sec\"}\n",
+            "{\"type\":\"shutdown\"}\n"
+        );
+        let msgs = run_collect(vec![Box::new(mock)], input);
+        assert!(msgs.iter().any(|m| matches!(
+            m,
+            EngineMsg::Children { id: 21, app, item, items }
+                if app == "mock" && item == "sec" && items == &vec![item_named("sec/child")]
+        )));
+    }
+
+    #[test]
+    fn a_failing_expand_is_reported_as_an_error_result() {
+        let mock = Mock { id: "mock".into(), items: vec![], replies: Arc::default(), fail_reply: false };
+        let input = "{\"type\":\"expand\",\"id\":22,\"app\":\"mock\",\"item\":\"bad\"}\n";
+        let msgs = run_collect(vec![Box::new(mock)], input);
+        assert!(msgs.iter().any(|m| matches!(m, EngineMsg::Result { id: 22, ok: false, error: Some(e) } if e == "cannot expand")));
+    }
+
+    #[test]
+    fn action_routes_and_returns_an_action_result_with_a_message() {
+        let mock = Mock { id: "mock".into(), items: vec![], replies: Arc::default(), fail_reply: false };
+        let input = "{\"type\":\"action\",\"id\":23,\"app\":\"mock\",\"item\":\"i\",\"action\":\"open\"}\n";
+        let msgs = run_collect(vec![Box::new(mock)], input);
+        assert!(msgs.iter().any(|m| matches!(
+            m,
+            EngineMsg::ActionResult { id: 23, ok: true, message: Some(msg), .. } if msg == "did open on i"
+        )));
+    }
+
+    #[test]
+    fn a_failing_action_is_reported_as_an_error_action_result() {
+        let mock = Mock { id: "mock".into(), items: vec![], replies: Arc::default(), fail_reply: false };
+        let input = "{\"type\":\"action\",\"id\":24,\"app\":\"mock\",\"item\":\"i\",\"action\":\"boom\"}\n";
+        let msgs = run_collect(vec![Box::new(mock)], input);
+        assert!(msgs.iter().any(|m| matches!(m, EngineMsg::ActionResult { id: 24, ok: false, error: Some(e), .. } if e == "action failed")));
+    }
+
+    #[test]
+    fn an_action_on_an_unknown_app_yields_an_action_result_error() {
+        let mock = Mock { id: "mock".into(), items: vec![], replies: Arc::default(), fail_reply: false };
+        let input = "{\"type\":\"action\",\"id\":25,\"app\":\"ghost\",\"item\":\"i\",\"action\":\"open\"}\n";
+        let msgs = run_collect(vec![Box::new(mock)], input);
+        assert!(msgs.iter().any(|m| matches!(m, EngineMsg::ActionResult { id: 25, ok: false, error: Some(e), .. } if e.contains("ghost"))));
     }
 
     #[test]

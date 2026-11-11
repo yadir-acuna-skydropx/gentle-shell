@@ -28,14 +28,42 @@ pub struct AppStatus {
     pub detail: Option<String>,
 }
 
-/// One actionable message surfaced by a connector (e.g. a Slack mention).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One action a connector offers on an [`Item`] (shown in the panel's action
+/// menu). `confirm` asks the panel to prompt "Run <label>? y/n" first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ItemAction {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+/// `skip_serializing_if` helper: keeps the old wire shape for flat items.
+fn is_false(b: &bool) -> bool {
+    !b
+}
+
+/// One actionable message surfaced by a connector (e.g. a Slack mention) or a
+/// hierarchical node (a GitHub section, repo, branch, tree entry…).
+///
+/// The last three fields are optional and default-absent, so an old flat item
+/// (Slack) still parses and still serializes to its original shape.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Item {
     pub id: String,
     pub title: String,
     pub text: String,
     pub ts: String,
     pub link: String,
+    /// Optional category hint for the panel icon (e.g. `"pr"`, `"repo"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    /// True when the item has children reachable via an `expand` request.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expandable: bool,
+    /// Actions offered on this item (open, worktree_add, checkout…).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ItemAction>,
 }
 
 /// Engine → partitioner messages.
@@ -53,6 +81,18 @@ pub enum EngineMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// Correlated children of an `expand` request.
+    Children { id: u64, app: String, item: String, items: Vec<Item> },
+    /// Correlated outcome of an `action` request. `message` carries a success
+    /// detail (e.g. the created worktree path); `error` carries a failure.
+    ActionResult {
+        id: u64,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 }
 
 /// Partitioner → engine messages.
@@ -61,6 +101,10 @@ pub enum EngineMsg {
 pub enum ClientMsg {
     Reply { id: u64, app: String, item: String, text: String },
     Refresh { id: u64, app: String },
+    /// Request the children of a hierarchical item.
+    Expand { id: u64, app: String, item: String },
+    /// Run an action on an item.
+    Action { id: u64, app: String, item: String, action: String },
     Shutdown,
 }
 
@@ -150,6 +194,7 @@ mod tests {
                 text: "hi".into(),
                 ts: "123".into(),
                 link: "https://x".into(),
+                ..Default::default()
             }],
         });
         round_trip_engine(EngineMsg::Result { id: 7, ok: true, error: None });
@@ -160,7 +205,70 @@ mod tests {
     fn every_client_message_round_trips() {
         round_trip_client(ClientMsg::Reply { id: 1, app: "slack".into(), item: "i1".into(), text: "hola".into() });
         round_trip_client(ClientMsg::Refresh { id: 2, app: "slack".into() });
+        round_trip_client(ClientMsg::Expand { id: 3, app: "github".into(), item: "sec:repos".into() });
+        round_trip_client(ClientMsg::Action {
+            id: 4,
+            app: "github".into(),
+            item: "branch|o|r|main|abc".into(),
+            action: "open".into(),
+        });
         round_trip_client(ClientMsg::Shutdown);
+    }
+
+    #[test]
+    fn children_and_action_result_round_trip() {
+        round_trip_engine(EngineMsg::Children {
+            id: 9,
+            app: "github".into(),
+            item: "sec:repos".into(),
+            items: vec![Item {
+                id: "repo|o|r".into(),
+                title: "o/r".into(),
+                text: String::new(),
+                ts: String::new(),
+                link: "https://github.com/o/r".into(),
+                kind: Some("repo".into()),
+                expandable: true,
+                actions: vec![ItemAction { id: "open".into(), label: "Open".into(), confirm: false }],
+            }],
+        });
+        round_trip_engine(EngineMsg::ActionResult {
+            id: 10,
+            ok: true,
+            message: Some("/tmp/r-main".into()),
+            error: None,
+        });
+        round_trip_engine(EngineMsg::ActionResult { id: 11, ok: false, message: None, error: Some("boom".into()) });
+    }
+
+    #[test]
+    fn expand_and_action_parse_from_the_wire() {
+        assert_eq!(
+            parse_client_line(r#"{"type":"expand","id":5,"app":"github","item":"sec:repos"}"#),
+            Parsed::Msg(ClientMsg::Expand { id: 5, app: "github".into(), item: "sec:repos".into() })
+        );
+        assert_eq!(
+            parse_client_line(r#"{"type":"action","id":6,"app":"github","item":"i","action":"open"}"#),
+            Parsed::Msg(ClientMsg::Action {
+                id: 6,
+                app: "github".into(),
+                item: "i".into(),
+                action: "open".into()
+            })
+        );
+    }
+
+    #[test]
+    fn an_old_flat_item_without_the_new_fields_still_parses() {
+        // Backward compatibility: a Slack-shaped item (no kind/expandable/actions)
+        // deserializes with the new fields defaulted (absent, not expandable).
+        let line = r##"{"id":"C1:1.2","title":"#general","text":"hi","ts":"1.2","link":"l"}"##;
+        let item: Item = serde_json::from_str(line).unwrap();
+        assert_eq!(item.kind, None);
+        assert!(!item.expandable);
+        assert!(item.actions.is_empty());
+        // And it serializes back to exactly the old shape (no new keys).
+        assert_eq!(serde_json::to_string(&item).unwrap(), line);
     }
 
     #[test]
