@@ -17,6 +17,8 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 - **S10 Mold, do not invent.** "yo nobusco invtar queiro es moldea lo que ya exite a una vs propia". "empzia a trbjar en el desarollo, para ir viendo mejoras, q podamos aplcair". Own code on the same crates Herdr/Peemux use; no fork.
 - **S11 Do not hurt the experience.** "mejorar la experiencia de usario sin impactar el renderizado los recursos, la usabilidad". Idle loop does not repaint; redraw only on input, PTY output or resize.
 
+- **S12 Apps panel and engine.** "un cuadad pequeno en la parte inferio izquieda nos conecmto a slack". "esto lo debe hacer un motor indepenite y debe estar escrio en ruts la coexion". "el recuador inferio izaiuerdo sear para coenfctar dindees apps, y sera un tipo de menu alter deplgable empzamos con salk pero muy prabmele se vna agrgar mas motres y mas apps". User decisions (L23): "Proceso aparte (recomendado)".
+- **S13 Slack mentions and reply.** "solo va amsotrar los mensjaes en lo que nos eticket, y un recudaro para contestar". User decisions (L23): "Creo la app y te paso el token"; "Keyring del sistema (recomendado)"; "Responder en el hilo del mensaje".
 ## Tasks
 
 - T1 [x] S2, S3, S7, S11 — scaffold `partitioner/` crate; pure layout engine (chat-only + tool bar, partitioned sidebar/editor/diff/chat) with unit tests. Route: inline. Commit: `d6c095df7`
@@ -31,6 +33,8 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 - T9 [x] S4 — bug: clicking an expanded folder name must collapse it again (click toggles like Enter). Route: inline. Commit: `878aef981`
 - T10 [x] S4 — Nerd Font icons in the sidebar and overlays: open/closed folder glyphs, per-language file glyphs and colors (e.g. Python for .py). User choice L19: install JetBrainsMono Nerd Font. Route: inline. Commit: `878aef981`
 - T11 [x] S5 — editor syntax highlighting per language, rainbow brackets by nesting level, and highlight of the bracket matching the one at the cursor. Route: worker. Commit: `878aef981`
+- T12 [ ] S12 — apps engine: separate Rust binary `gentle-apps` (own crate) spawned by the partitioner, JSON-lines protocol over stdio, connector trait for future apps; bottom-left collapsible apps panel under the sidebar with the app menu. Route: worker. Commit: —
+- T13 [ ] S12, S13 — Slack connector: user token in the system keyring, `gentle-apps slack login`, mentions of the user only, reply in the thread as the user, Slack app manifest + docs. Route: worker. Risk: item 2 (credentials). Commit: —
 
 ## Log
 
@@ -56,3 +60,4 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 - L20 (evidence, T9-T11): root cause T9 = click_sidebar called expand-only (idempotent insert); now toggles like the Files overlay. Own tokenizer for highlighting (no syntect/tree-sitter: no C build, +50 KB binary). 89 lib (2 ignored) + 2 cli + 11 server green twice; 1000 lines highlighted < 50 ms (release); smoke exit 0; installed to ~/.cargo/bin. JetBrainsMono Nerd Font Mono installed (16 files) in ~/.local/share/fonts/JetBrainsMonoNerd.
 - L21 (user, verbatim, with a screenshot of the workspace): "va quedando bien , ahro necsio, q un cuadad pequeno en la parte inferio izquieda nos conecmto a slack, pero solo va amsotrar los mensjaes en lo que nos eticket, y un recudaro para contestar, esto lo debe hacer un motor indepenite y debe estar escrio en ruts la coexion el recuador inferio izaiuerdo sear para coenfctar dindees apps, y sera un tipo de menu alter deplgable empzamos con salk pero muy prabmele se vna agrgar mas motres y mas apps"
 - L22 (observation from the screenshot): icons render as hex boxes, so the terminal font is not yet set to JetBrainsMono Nerd Font Mono.
+- L23 (user decisions, apps): auth = "Creo la app y te paso el token"; token storage = "Keyring del sistema (recomendado)"; engine = "Proceso aparte (recomendado)"; reply = "Responder en el hilo del mensaje". Environment: gnome-keyring running with org.freedesktop.secrets on the session bus.
