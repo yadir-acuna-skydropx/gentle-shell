@@ -3,6 +3,28 @@
 //! never forces the others to be rebuilt (S3).
 use ratatui::layout::Rect;
 
+/// Splits a workspace sidebar into the file tree (top) and the apps panel
+/// (bottom, S12). The panel is a bordered box sized to its content when
+/// collapsed (a header plus one row per app) or up to
+/// [`APPS_PANEL_MAX_PCT`]% of the sidebar when expanded; the tree always keeps
+/// at least [`APPS_TREE_MIN`] rows when the sidebar is tall enough. The two
+/// rects never overlap and together cover the whole sidebar.
+pub fn split_sidebar(sidebar: Rect, app_count: u16, expanded: bool) -> (Rect, Rect) {
+    // Bordered box: top+bottom border (2) + one row per app, at least 3 tall.
+    let collapsed = (app_count + 2).max(3);
+    let want = if expanded {
+        (sidebar.height * APPS_PANEL_MAX_PCT / 100).max(collapsed)
+    } else {
+        collapsed
+    };
+    let max_panel = sidebar.height.saturating_sub(APPS_TREE_MIN);
+    let panel_h = want.min(max_panel);
+    let tree_h = sidebar.height - panel_h;
+    let tree = Rect::new(sidebar.x, sidebar.y, sidebar.width, tree_h);
+    let apps = Rect::new(sidebar.x, sidebar.y + tree_h, sidebar.width, panel_h);
+    (tree, apps)
+}
+
 /// Chat mode shows only the chat plus a lateral tool bar (S7);
 /// workspace mode shows sidebar, editor | diff, and chat (S4-S6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -19,6 +41,10 @@ pub const TOOLBAR_WIDTH: u16 = 14;
 pub const SIDEBAR_MIN: u16 = 24;
 pub const SIDEBAR_MAX: u16 = 40;
 pub const CHAT_MIN_HEIGHT: u16 = 8;
+/// Rows the tree keeps when the apps panel shares the sidebar (S12).
+pub const APPS_TREE_MIN: u16 = 5;
+/// Share of the sidebar the expanded apps panel may take (percent).
+pub const APPS_PANEL_MAX_PCT: u16 = 45;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
@@ -145,6 +171,38 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn sidebar_split_never_overlaps_and_covers_the_sidebar() {
+        for h in [10u16, 20, 30, 49, 80] {
+            for apps in [1u16, 3, 8] {
+                for expanded in [false, true] {
+                    let side = Rect::new(0, 0, 30, h);
+                    let (tree, panel) = split_sidebar(side, apps, expanded);
+                    // Cover exactly, stacked, no overlap.
+                    assert_eq!(tree.height + panel.height, h, "cover {h} {apps} {expanded}");
+                    assert_eq!(tree.y, side.y);
+                    assert_eq!(panel.y, tree.y + tree.height);
+                    assert!(!tree.intersects(panel) || panel.height == 0, "overlap {h} {apps} {expanded}");
+                    assert_eq!((tree.width, panel.width), (30, 30));
+                    // The tree keeps its minimum whenever the sidebar can afford it.
+                    if h >= APPS_TREE_MIN + 3 {
+                        assert!(tree.height >= APPS_TREE_MIN, "tree min {h} {apps} {expanded}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn collapsed_panel_fits_its_app_rows_and_expands_larger() {
+        let side = Rect::new(0, 0, 30, 40);
+        let (_, collapsed) = split_sidebar(side, 3, false);
+        assert_eq!(collapsed.height, 5, "3 apps + 2 borders");
+        let (_, expanded) = split_sidebar(side, 3, true);
+        assert!(expanded.height > collapsed.height, "expanding grows the panel");
+        assert!(expanded.height <= 40 * APPS_PANEL_MAX_PCT / 100);
     }
 
     #[test]

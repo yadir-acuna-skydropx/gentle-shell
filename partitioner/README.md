@@ -35,6 +35,43 @@ repainted — only the changed cells of that fragment are written out.
   engine is served on a loopback HTTP endpoint (random port, bearer token) so
   the `gentle-shell` child can use it for its own prompt editor. Disable it all
   with `--no-predict`.
+- **Apps panel (S12).** A collapsible **apps panel** sits bottom-left under the
+  sidebar (and opens as an overlay in chat mode via the toolbar's **Apps** tool).
+  It lists connectable apps with a coloured status dot and an item count;
+  expanding an app shows its messages with a reply box. The connections run in a
+  separate Rust process, `gentle-apps`, spoken to over JSON-lines on stdio. The
+  first app is **Slack** (the live connector lands in T13; for now it reports
+  *not connected*). Disable the engine and panel with `--no-apps`.
+
+## Apps engine (`gentle-apps`)
+
+The partitioner spawns the independent `gentle-apps` binary (found next to the
+current executable first, then on `PATH`) and talks to it over **NDJSON on
+stdio** — one JSON object per line, flushed after every message, logs only on
+stderr. Lines are capped at 1 MiB; an oversized or invalid line is skipped and
+logged, never a panic. The child is restarted with exponential backoff
+(1, 2, 4, 8, 16, max 30 s) and killed on quit; while it is down the panel shows
+*apps engine offline*.
+
+Protocol (shared types live in the `gentle-apps` library target, so both sides
+use the same definitions):
+
+- **engine → partitioner**
+  - `{"type":"apps","apps":[{"id":"slack","name":"Slack","status":"disconnected|connecting|connected|error","detail":"…"}]}` — the full app list, on start and on any status change;
+  - `{"type":"items","app":"slack","items":[{"id":"…","title":"#channel · author","text":"…","ts":"…","link":"…"}]}` — the full current item list for one app;
+  - `{"type":"result","id":N,"ok":true|false,"error":"…"?}` — the correlated outcome of a request.
+- **partitioner → engine**
+  - `{"type":"reply","id":N,"app":"slack","item":"<item id>","text":"…"}`;
+  - `{"type":"refresh","id":N,"app":"slack"}`;
+  - `{"type":"shutdown"}`.
+- An unknown message type gets a `result` error when it carries an `id`, and is
+  ignored otherwise.
+
+Inside the engine each app is a **`Connector`** (`id`, `name`, `status`, `poll`,
+`reply`) driven on its **own thread**, so a slow app never blocks the others or
+the stdin loop. `gentle-apps` with no args runs the stdio engine;
+`gentle-apps --help`/`--version` work, and `gentle-apps slack login` is a
+placeholder until T13.
 
 ## Prediction engine & server
 
@@ -148,6 +185,7 @@ Other flags:
 gentle-partitioner --help        # usage
 gentle-partitioner --version     # version
 gentle-partitioner --no-predict  # disable the prediction engine and server
+gentle-partitioner --no-apps     # disable the apps engine and the apps panel
 ```
 
 The child process inherits the current working directory, with
@@ -166,6 +204,7 @@ else is forwarded to the chat.
 | `w` | Toggle workspace (files · editor · agent changes · chat) |
 | `t` | Files tool (overlay) |
 | `c` | Worktree changes tool (overlay) |
+| `a` | Apps panel (toggle expand/collapse in workspace · overlay in chat) |
 | `?` | Help overlay |
 | `Tab` | Next pane · `1`-`4` focus sidebar / editor / changes / chat |
 | `q` | Quit (stops gentle-shell) |
@@ -190,6 +229,9 @@ else is forwarded to the chat.
     action to discard.
   - Binary, unreadable and oversized files stay read-only.
 - **Agent changes (right pane):** `↑↓` `PgUp` `PgDn` scroll · `Esc` back to chat.
+- **Apps panel:** `↑↓` select an app or item · `Enter` drills in (app → items →
+  reply box) · type to edit the reply, `Enter` sends it, `Esc` steps back one
+  level and then to the chat. Click an app or item to select and focus it.
 - **Overlays:** `↑↓` move · `Enter` open · `Esc` close.
 - **Mouse:** click selects panes and places the editor cursor, opens files and
   tools; the wheel scrolls the chat, the editor, the diff, or the sidebar
@@ -229,8 +271,16 @@ else is forwarded to the chat.
   JSON helpers, and the repo/history seeding (S9).
 - **`predict_server.rs`** — the loopback HTTP server exposing the engine to the
   `gentle-shell` child with a bearer token (S9).
+- **`apps_client.rs`** — supervises the independent `gentle-apps` process:
+  spawn, a reader thread that decodes NDJSON into UI events, a writer with
+  incrementing request ids, exponential-backoff restart, and kill-on-quit (S12).
+- **`apps_panel.rs`** — the apps-panel state (app list, per-app items, reply box
+  with UTF-8 horizontal scroll) and its message/ result handling (S12).
 - **`keys.rs`** — encodes crossterm key events as the bytes a terminal sends to
   a PTY child.
+- **`apps/`** — the `gentle-apps` workspace member: the shared `protocol`
+  (NDJSON message types), the `Connector` trait, the threaded stdio `engine`,
+  and the Slack placeholder connector. Builds the `gentle-apps` binary (S12).
 
 ## Roadmap
 
@@ -246,6 +296,11 @@ else is forwarded to the chat.
 - **T10 (S4)** — Nerd Font icons in the sidebar and overlays: **done**.
 - **T11 (S5)** — editor syntax highlighting, rainbow brackets and matching
   bracket: **done**.
+- **T12 (S12)** — apps engine (`gentle-apps`), the JSON-lines stdio protocol, the
+  `Connector` trait and the bottom-left collapsible apps panel with a Slack
+  placeholder: **done**.
+- **T13 (S12, S13)** — the live Slack connector (token in the system keyring,
+  mentions of the user, reply in the thread): **next**.
 
 ## Fast development loop
 

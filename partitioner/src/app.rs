@@ -12,6 +12,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use gentle_apps::protocol::{ClientMsg, EngineMsg, Status as AppState};
+
+use crate::apps_panel::{AppsPanel, View};
 use crate::editor::{Editor, SaveOutcome};
 use crate::highlight::{self, Highlighter};
 use crate::icons::{self, IconMode};
@@ -25,11 +28,13 @@ use crate::viewer::{self, DiffKind, Viewer};
 pub const PREFIX_LABEL: &str = "Ctrl+]";
 
 /// Lateral tool bar entries in chat mode (S7): label and prefix key.
-pub const TOOLS: [(&str, char); 5] = [("Files", 't'), ("Changes", 'c'), ("Workspace", 'w'), ("Help", '?'), ("Quit", 'q')];
+pub const TOOLS: [(&str, char); 6] =
+    [("Files", 't'), ("Changes", 'c'), ("Workspace", 'w'), ("Apps", 'a'), ("Help", '?'), ("Quit", 'q')];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Sidebar,
+    Apps,
     Editor,
     Diff,
     Chat,
@@ -40,6 +45,7 @@ pub enum Overlay {
     Files,
     Changes,
     Help,
+    Apps,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,6 +55,8 @@ pub enum Action {
     Forward(Vec<u8>),
     /// Scroll the chat scrollback (positive = older output).
     ScrollChat(isize),
+    /// A request for the apps engine (reply / refresh).
+    Apps(ClientMsg),
     Quit,
 }
 
@@ -91,6 +99,14 @@ pub struct App {
     /// Cached syntax highlighter for the open editor buffer (T11); `None`
     /// until a file is opened.
     pub highlighter: Option<Highlighter>,
+    /// Bottom-left apps panel state (S12).
+    pub apps: AppsPanel,
+    /// Incrementing id for apps-engine requests.
+    apps_req_id: u64,
+    /// File-tree region of the sidebar, captured in the last draw.
+    pub tree_area: Option<Rect>,
+    /// Apps-panel region of the sidebar, captured in the last draw.
+    pub apps_area: Option<Rect>,
 }
 
 impl App {
@@ -120,6 +136,10 @@ impl App {
             ghost: None,
             icons: IconMode::from_env(),
             highlighter: None,
+            apps: AppsPanel::default(),
+            apps_req_id: 0,
+            tree_area: None,
+            apps_area: None,
         };
         app.rescan();
         app
@@ -314,9 +334,126 @@ impl App {
         match self.effective_focus() {
             Focus::Chat => Action::Forward(crate::keys::encode(key, self.app_cursor)),
             Focus::Sidebar => self.sidebar_key(key),
+            Focus::Apps => self.apps_key(key),
             Focus::Editor => self.editor_key(key),
             Focus::Diff => self.diff_key(key),
         }
+    }
+
+    /// Applies a decoded engine message to the panel (called by the event loop).
+    pub fn apply_apps_msg(&mut self, msg: EngineMsg) {
+        self.apps.apply(msg);
+    }
+
+    /// Marks the apps engine offline (missing or exited).
+    pub fn set_apps_offline(&mut self) {
+        self.apps.set_offline();
+    }
+
+    fn next_apps_id(&mut self) -> u64 {
+        self.apps_req_id += 1;
+        self.apps_req_id
+    }
+
+    /// Prefix `a`: in workspace, toggle the panel expanded/collapsed and focus
+    /// it; in chat mode, open the panel as an overlay.
+    fn toggle_apps_panel(&mut self) {
+        if self.mode == Mode::Workspace {
+            self.overlay = None;
+            if self.apps.view == View::Apps {
+                self.apps.view = View::Items;
+                self.apps.item_sel = 0;
+            } else {
+                self.apps.view = View::Apps;
+            }
+            self.focus = Focus::Apps;
+        } else {
+            self.apps.view = View::Apps;
+            self.toggle_overlay(Overlay::Apps);
+        }
+    }
+
+    /// Leaves the apps panel: closes its overlay, or returns focus to the chat.
+    fn leave_apps(&mut self) {
+        if self.overlay == Some(Overlay::Apps) {
+            self.overlay = None;
+        }
+        self.apps.view = View::Apps;
+        self.focus = Focus::Chat;
+    }
+
+    /// Panel navigation: Up/Down select; Enter drills in (app → items → reply);
+    /// Esc steps back one level, then to the chat.
+    fn apps_key(&mut self, key: KeyEvent) -> Action {
+        match self.apps.view {
+            View::Reply => self.apps_reply_key(key),
+            View::Items => {
+                let len = self.apps.current_items().len();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => self.apps.item_sel = clamp_index(self.apps.item_sel, -1, len),
+                    KeyCode::Down | KeyCode::Char('j') => self.apps.item_sel = clamp_index(self.apps.item_sel, 1, len),
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        if self.apps.selected_item_id().is_some() {
+                            self.apps.view = View::Reply;
+                            self.apps.reply.clear();
+                            self.apps.reply_status = None;
+                        }
+                    }
+                    KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.apps.view = View::Apps,
+                    _ => {}
+                }
+                Action::None
+            }
+            View::Apps => {
+                let len = self.apps.apps.len();
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => self.apps.app_sel = clamp_index(self.apps.app_sel, -1, len),
+                    KeyCode::Down | KeyCode::Char('j') => self.apps.app_sel = clamp_index(self.apps.app_sel, 1, len),
+                    KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        if let Some(id) = self.apps.selected_app_id() {
+                            self.apps.view = View::Items;
+                            self.apps.item_sel = 0;
+                            let rid = self.next_apps_id();
+                            return Action::Apps(ClientMsg::Refresh { id: rid, app: id });
+                        }
+                    }
+                    KeyCode::Esc => self.leave_apps(),
+                    _ => {}
+                }
+                Action::None
+            }
+        }
+    }
+
+    /// Reply editor: type to edit a single line; Enter sends, Esc cancels back
+    /// to the item list.
+    fn apps_reply_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.apps.view = View::Items;
+                self.apps.reply.clear();
+                self.apps.reply_status = None;
+            }
+            KeyCode::Enter => {
+                let text = self.apps.reply.text.clone();
+                if text.trim().is_empty() {
+                    return Action::None;
+                }
+                let (Some(app), Some(item)) = (self.apps.selected_app_id(), self.apps.selected_item_id()) else {
+                    return Action::None;
+                };
+                let rid = self.next_apps_id();
+                self.apps.pending_reply = Some(rid);
+                self.apps.reply_status = Some("sending\u{2026}".into());
+                return Action::Apps(ClientMsg::Reply { id: rid, app, item, text });
+            }
+            KeyCode::Backspace => self.apps.reply.backspace(),
+            KeyCode::Left => self.apps.reply.left(),
+            KeyCode::Right => self.apps.reply.right(),
+            KeyCode::Char(c) => self.apps.reply.insert(c),
+            _ => {}
+        }
+        Action::None
     }
 
     /// Runs a prefix command (the key after `Ctrl+]`).
@@ -333,6 +470,10 @@ impl App {
             KeyCode::Char('c') => {
                 self.change_selected = 0;
                 self.toggle_overlay(Overlay::Changes);
+                Action::None
+            }
+            KeyCode::Char('a') => {
+                self.toggle_apps_panel();
                 Action::None
             }
             KeyCode::Char('?') => {
@@ -414,6 +555,11 @@ impl App {
             self.overlay = None;
             return Action::None;
         }
+        // The apps overlay shares the panel reducer so chat mode behaves exactly
+        // like the workspace panel.
+        if overlay == Overlay::Apps {
+            return self.apps_key(key);
+        }
         match key.code {
             KeyCode::Esc => self.overlay = None,
             KeyCode::Up | KeyCode::Char('k') => self.overlay_move(overlay, -1),
@@ -421,7 +567,7 @@ impl App {
             KeyCode::Enter => match overlay {
                 Overlay::Files => self.toggle_or_open_selected(),
                 Overlay::Changes => self.open_selected_change(),
-                Overlay::Help => {}
+                Overlay::Help | Overlay::Apps => {}
             },
             _ => {}
         }
@@ -432,7 +578,7 @@ impl App {
         match overlay {
             Overlay::Files => self.selected = clamp_index(self.selected, delta, self.entries.len()),
             Overlay::Changes => self.change_selected = clamp_index(self.change_selected, delta, self.changes().len()),
-            Overlay::Help => {}
+            Overlay::Help | Overlay::Apps => {}
         }
     }
 
@@ -608,9 +754,15 @@ impl App {
                 return Action::None;
             }
         }
-        if let Some(side) = l.sidebar {
-            if rect_contains(side, col, row) {
-                self.click_sidebar(side, row);
+        if let Some(tree) = self.tree_area {
+            if rect_contains(tree, col, row) {
+                self.click_sidebar(tree, row);
+                return Action::None;
+            }
+        }
+        if let Some(ap) = self.apps_area {
+            if rect_contains(ap, col, row) {
+                self.click_apps(ap, col, row);
                 return Action::None;
             }
         }
@@ -657,7 +809,34 @@ impl App {
                     self.open_selected_change();
                 }
             }
+            Overlay::Apps => self.click_apps(area, (area.x + 1).max(0), row),
             Overlay::Help => {}
+        }
+    }
+
+    /// A click inside the apps panel selects the app or item under the cursor
+    /// and focuses the panel. The panel body starts one row below the border.
+    fn click_apps(&mut self, area: Rect, _col: u16, row: u16) {
+        self.focus = Focus::Apps;
+        if row <= area.y || row + 1 >= area.y + area.height {
+            return;
+        }
+        let rel = (row - area.y - 1) as usize;
+        match self.apps.view {
+            View::Apps => {
+                if rel < self.apps.apps.len() {
+                    self.apps.app_sel = rel;
+                }
+            }
+            View::Items | View::Reply => {
+                // Row 0 is the app header; items start at row 1.
+                if rel >= 1 {
+                    let idx = rel - 1;
+                    if idx < self.apps.current_items().len() {
+                        self.apps.item_sel = idx;
+                    }
+                }
+            }
         }
     }
 
@@ -681,9 +860,20 @@ impl App {
 
     fn mouse_wheel(&mut self, col: u16, row: u16, dir: isize) -> Action {
         let Some(l) = self.layout else { return Action::None };
-        if let Some(side) = l.sidebar {
-            if rect_contains(side, col, row) {
+        if let Some(tree) = self.tree_area {
+            if rect_contains(tree, col, row) {
                 self.selected = clamp_index(self.selected, dir, self.entries.len());
+                return Action::None;
+            }
+        }
+        if let Some(ap) = self.apps_area {
+            if rect_contains(ap, col, row) {
+                if self.apps.is_expanded() {
+                    let len = self.apps.current_items().len();
+                    self.apps.item_sel = clamp_index(self.apps.item_sel, dir, len);
+                } else {
+                    self.apps.app_sel = clamp_index(self.apps.app_sel, dir, self.apps.apps.len());
+                }
                 return Action::None;
             }
         }
@@ -745,6 +935,128 @@ fn status_style(s: Option<GitStatus>) -> Style {
 fn pane_block(title: String, focused: bool) -> Block<'static> {
     let style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
     Block::default().borders(Borders::ALL).border_style(style).title(title)
+}
+
+/// Colour of the status dot: green connected, yellow connecting, gray
+/// disconnected, red on error (S12).
+fn app_dot_style(status: AppState) -> Style {
+    let color = match status {
+        AppState::Connected => Color::Green,
+        AppState::Connecting => Color::Yellow,
+        AppState::Disconnected => Color::DarkGray,
+        AppState::Error => Color::Red,
+    };
+    Style::default().fg(color)
+}
+
+/// Truncates `s` to `w` columns (char-based; glyphs here are single-width).
+fn fit(s: &str, w: usize) -> String {
+    s.chars().take(w).collect()
+}
+
+/// Builds the apps-panel content lines for a pane (or overlay) `w` columns wide.
+fn apps_content_lines(app: &mut App, w: usize, _h: usize, focused: bool) -> Vec<Line<'static>> {
+    let w = w.max(1);
+    if app.apps.offline {
+        return vec![Line::styled("apps engine offline", Style::default().fg(Color::DarkGray))];
+    }
+    if app.apps.apps.is_empty() {
+        return vec![Line::styled("connecting\u{2026}", Style::default().fg(Color::DarkGray))];
+    }
+    match app.apps.view {
+        View::Apps => apps_list_lines(app, w, focused),
+        View::Items | View::Reply => apps_items_lines(app, w, focused),
+    }
+}
+
+/// Collapsed view: one row per app with a status dot and item count.
+fn apps_list_lines(app: &App, w: usize, focused: bool) -> Vec<Line<'static>> {
+    app.apps
+        .apps
+        .iter()
+        .enumerate()
+        .map(|(i, a)| {
+            let glyph = icons::app_icon(&a.id, app.icons);
+            let count = app.apps.item_count(&a.id);
+            let selected = focused && i == app.apps.app_sel;
+            let mut label_style = Style::default();
+            if selected {
+                label_style = label_style.add_modifier(Modifier::REVERSED);
+            }
+            let label = fit(&format!("{glyph} {}  ({count})", a.name), w.saturating_sub(2));
+            Line::from(vec![
+                Span::styled("\u{25cf} ", app_dot_style(a.status)),
+                Span::styled(label, label_style),
+            ])
+        })
+        .collect()
+}
+
+/// Expanded view: the selected app's items (title + one-line preview) and, when
+/// replying, a reply input box at the bottom.
+fn apps_items_lines(app: &mut App, w: usize, focused: bool) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let (dot_style, header) = match app.apps.apps.get(app.apps.app_sel) {
+        Some(a) => (
+            app_dot_style(a.status),
+            format!("{} {}", icons::app_icon(&a.id, app.icons), a.name),
+        ),
+        None => (Style::default(), String::new()),
+    };
+    out.push(Line::from(vec![
+        Span::styled("\u{25cf} ", dot_style),
+        Span::styled(fit(&header, w.saturating_sub(2)), Style::default().add_modifier(Modifier::BOLD)),
+    ]));
+
+    let items = app.apps.current_items().to_vec();
+    if items.is_empty() {
+        out.push(Line::styled("  no messages", Style::default().fg(Color::DarkGray)));
+    }
+    for (i, it) in items.iter().enumerate() {
+        let mut title_style = Style::default();
+        if focused && i == app.apps.item_sel {
+            title_style = title_style.add_modifier(Modifier::REVERSED);
+        }
+        out.push(Line::styled(fit(&it.title, w), title_style));
+        let preview: String = it.text.lines().next().unwrap_or("").to_string();
+        out.push(Line::styled(format!("  {}", fit(&preview, w.saturating_sub(2))), Style::default().fg(Color::DarkGray)));
+    }
+
+    if app.apps.view == View::Reply {
+        out.push(Line::styled("\u{2500}".repeat(w), Style::default().fg(Color::DarkGray)));
+        let box_w = w.saturating_sub(2);
+        app.apps.reply.ensure_visible(box_w);
+        let visible = app.apps.reply.visible(box_w);
+        out.push(Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::raw(visible),
+        ]));
+        if let Some(status) = &app.apps.reply_status {
+            out.push(Line::styled(fit(status, w), Style::default().fg(Color::Yellow)));
+        }
+    }
+    out
+}
+
+/// Draws the bottom-left apps panel into `area` (S12).
+fn draw_apps_panel(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) {
+    if area.height == 0 {
+        return;
+    }
+    let block = pane_block(" Apps ".into(), focused);
+    let inner = block.inner(area);
+    let lines = apps_content_lines(app, inner.width as usize, inner.height as usize, focused);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+    // Place the caret in the reply box so typing is visible.
+    if focused && app.apps.view == View::Reply {
+        let box_w = inner.width.saturating_sub(2) as usize;
+        let caret = app.apps.reply.cursor.saturating_sub(app.apps.reply.scroll).min(box_w) as u16;
+        let cx = inner.x + 2 + caret;
+        let cy = inner.y + inner.height.saturating_sub(if app.apps.reply_status.is_some() { 2 } else { 1 });
+        if cx < inner.x + inner.width && cy < inner.y + inner.height {
+            frame.set_cursor_position(Position::new(cx, cy));
+        }
+    }
 }
 
 fn tree_lines(app: &App, height: usize, width: usize) -> Vec<Line<'static>> {
@@ -884,9 +1196,16 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
         frame.render_widget(Paragraph::new(lines).block(block), bar);
     }
 
+    app.tree_area = None;
+    app.apps_area = None;
     if let Some(side) = l.sidebar {
+        // The sidebar is split into the file tree (top) and the apps panel (bottom, S12).
+        let (tree_area, apps_area) =
+            layout::split_sidebar(side, app.apps.apps.len() as u16, app.apps.is_expanded());
+        app.tree_area = Some(tree_area);
+        app.apps_area = Some(apps_area);
         let block = pane_block(format!(" Files · {} ", app.root.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())), focus == Focus::Sidebar);
-        let inner = block.inner(side);
+        let inner = block.inner(tree_area);
         let list_h = inner.height.saturating_sub(1) as usize;
         app.tree_offset = keep_visible(app.selected, app.tree_offset, list_h);
         let mut lines = tree_lines(app, list_h, inner.width as usize);
@@ -894,7 +1213,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
         if let Some(e) = app.entries.get(app.selected) {
             lines.push(Line::styled(entry_details(e), Style::default().fg(Color::DarkGray)));
         }
-        frame.render_widget(Paragraph::new(lines).block(block), side);
+        frame.render_widget(Paragraph::new(lines).block(block), tree_area);
+        draw_apps_panel(frame, app, apps_area, focus == Focus::Apps);
     }
 
     if let (Some(ed), Some(df)) = (l.editor, l.diff) {
@@ -1046,13 +1366,18 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
                 };
                 (" Changes · Enter open · Esc close ", lines)
             }
+            Overlay::Apps => {
+                let w = area.width.saturating_sub(2) as usize;
+                let h = area.height.saturating_sub(2) as usize;
+                (" Apps · Enter open · Esc back ", apps_content_lines(app, w, h, true))
+            }
             Overlay::Help => (" Help · Esc close ", help_lines()),
         };
         frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
     }
 
     let status = if app.prefix {
-        Line::styled(format!(" {PREFIX_LABEL} … w workspace · t files · c changes · Tab/1-4 focus · ? help · q quit · ] send {PREFIX_LABEL}"), Style::default().fg(Color::Black).bg(Color::Cyan))
+        Line::styled(format!(" {PREFIX_LABEL} … w workspace · t files · c changes · a apps · Tab/1-4 focus · ? help · q quit · ] send {PREFIX_LABEL}"), Style::default().fg(Color::Black).bg(Color::Cyan))
     } else if let Some(msg) = &app.status_msg {
         Line::styled(format!(" {msg}"), Style::default().fg(Color::Black).bg(Color::Yellow))
     } else {
@@ -1074,6 +1399,7 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "  w      toggle workspace (files | editor | agent changes | chat)".into(),
         "  t      files tool (overlay)".into(),
         "  c      worktree changes tool (overlay)".into(),
+        "  a      apps panel (toggle in workspace / overlay in chat)".into(),
         "  Tab    next pane   1-4 sidebar / editor / changes / chat".into(),
         "  q      quit (stops gentle-shell)".into(),
         format!("  ]      send a literal {PREFIX_LABEL} to the chat"),
@@ -1083,6 +1409,7 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "        PageUp/PageDown · Ctrl+Home/End · Ctrl+S save · Ctrl+R reload".into(),
         "        ● marks unsaved edits · Esc back to chat".into(),
         "Agent changes: ↑↓ PgUp PgDn scroll · Esc back to chat".into(),
+        "Apps: ↑↓ select · Enter app→items→reply · type to reply · Esc back".into(),
         "Mouse: click selects panes and places the cursor; wheel scrolls.".into(),
     ]
     .into_iter()
@@ -1536,4 +1863,121 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    // ---- Apps panel (S12) ----
+    use gentle_apps::protocol::{AppStatus, Item as AppItem, Status as AppStatusKind};
+
+    fn app_status(id: &str, name: &str, status: AppStatusKind) -> AppStatus {
+        AppStatus { id: id.into(), name: name.into(), status, detail: None }
+    }
+    fn app_item(id: &str, title: &str) -> AppItem {
+        AppItem { id: id.into(), title: title.into(), text: "body line".into(), ts: "1".into(), link: "l".into() }
+    }
+
+    #[test]
+    fn apps_panel_expand_select_reply_and_esc_levels() {
+        let root = fixture("apps-reducer");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Connected)] });
+        app.apply_apps_msg(EngineMsg::Items { app: "slack".into(), items: vec![app_item("a", "#one"), app_item("b", "#two")] });
+        render(&mut app, 120, 40);
+        assert_eq!(app.effective_focus(), Focus::Apps);
+
+        // Enter on the app expands its item list and asks for a refresh.
+        let act = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.apps.view, View::Items);
+        assert!(matches!(act, Action::Apps(ClientMsg::Refresh { app, .. }) if app == "slack"));
+
+        // Select the second item and open the reply box.
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.apps.item_sel, 1);
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.apps.view, View::Reply);
+
+        // Type a reply and send it.
+        for c in "hola".chars() {
+            app.handle_key(ch(c));
+        }
+        assert_eq!(app.apps.reply.text, "hola");
+        let act = app.handle_key(key(KeyCode::Enter));
+        let id = match act {
+            Action::Apps(ClientMsg::Reply { id, app: a, item, text }) => {
+                assert_eq!((a.as_str(), item.as_str(), text.as_str()), ("slack", "b", "hola"));
+                id
+            }
+            other => panic!("expected a reply action, got {other:?}"),
+        };
+        assert_eq!(app.apps.reply_status.as_deref(), Some("sending\u{2026}"));
+
+        // The correlated result flips the status to "sent".
+        app.apply_apps_msg(EngineMsg::Result { id, ok: true, error: None });
+        assert_eq!(app.apps.reply_status.as_deref(), Some("sent"));
+
+        // Esc steps back one level each time, then returns to the chat.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.apps.view, View::Items);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.apps.view, View::Apps);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Chat);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn empty_reply_is_not_sent() {
+        let root = fixture("apps-empty-reply");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Connected)] });
+        app.apply_apps_msg(EngineMsg::Items { app: "slack".into(), items: vec![app_item("a", "#one")] });
+        render(&mut app, 120, 40);
+        app.handle_key(key(KeyCode::Enter)); // expand
+        app.handle_key(key(KeyCode::Enter)); // open reply
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None, "empty reply sends nothing");
+        assert_eq!(app.apps.pending_reply, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prefix_a_in_chat_opens_the_apps_overlay() {
+        let root = fixture("apps-overlay");
+        let mut app = App::new(root.clone());
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Disconnected)] });
+        render(&mut app, 120, 40);
+        app.handle_key(prefix());
+        app.handle_key(ch('a'));
+        assert_eq!(app.overlay, Some(Overlay::Apps));
+        // Keys route to the panel, not the PTY.
+        assert_eq!(app.handle_key(key(KeyCode::Down)), Action::None);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.overlay, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn render_shows_the_apps_header_and_the_slack_row() {
+        let root = fixture("apps-render");
+        let mut app = App::new(root.clone());
+        app.icons = IconMode::Ascii;
+        app.mode = Mode::Workspace;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Disconnected)] });
+        let t = render(&mut app, 120, 40);
+        let text = screen_text(&t);
+        assert!(text.contains("Apps"), "apps header missing: {text:?}");
+        assert!(text.contains("Slack"), "slack row missing");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apps_offline_shows_a_message_without_panicking() {
+        let root = fixture("apps-offline");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.set_apps_offline();
+        let t = render(&mut app, 120, 40);
+        assert!(screen_text(&t).contains("apps engine offline"));
+        fs::remove_dir_all(root).unwrap();
+    }
 }

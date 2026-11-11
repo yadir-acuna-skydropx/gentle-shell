@@ -57,12 +57,27 @@ const MAKE: &str = "\u{f0ad}"; // nf-fa-wrench
 const NPM: &str = "\u{e71e}"; // nf-dev-npm
 const IMAGE: &str = "\u{f1c5}"; // nf-fa-file_image_o
 const FILE: &str = "\u{f15b}"; // nf-fa-file (generic default)
+// App glyphs for the apps panel (S12).
+const SLACK: &str = "\u{f198}"; // nf-fa-slack
+const APP: &str = "\u{f0ac}"; // nf-fa-globe (generic app)
 
 /// Every glyph the Nerd Font set can render; used to assert each is one column.
 pub const GLYPHS: &[&str] = &[
     FOLDER, FOLDER_OPEN, PYTHON, RUST, JS, TS, REACT, JSON, MARKDOWN, CONFIG, SHELL, SQL, HTML, CSS, GO, JAVA, CLANG,
-    CPP, LOCK, TXT, GIT, DOCKER, MAKE, NPM, IMAGE, FILE,
+    CPP, LOCK, TXT, GIT, DOCKER, MAKE, NPM, IMAGE, FILE, SLACK, APP,
 ];
+
+/// Glyph for an app row in the apps panel. Uses the Nerd Font brand glyph when
+/// icons are `Nerd`, and an ASCII marker otherwise.
+pub fn app_icon(id: &str, mode: IconMode) -> &'static str {
+    match mode {
+        IconMode::Ascii => "#",
+        IconMode::Nerd => match id {
+            "slack" => SLACK,
+            _ => APP,
+        },
+    }
+}
 
 fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::Rgb(r, g, b)

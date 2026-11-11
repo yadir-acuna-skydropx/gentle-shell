@@ -1,6 +1,8 @@
 //! gentle-partitioner: Rust host that partitions the terminal and runs
 //! gentle-shell, unchanged, inside its own PTY pane.
 pub mod app;
+pub mod apps_client;
+pub mod apps_panel;
 pub mod editor;
 pub mod highlight;
 pub mod icons;

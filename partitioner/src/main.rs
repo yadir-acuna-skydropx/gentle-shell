@@ -25,6 +25,7 @@ use ratatui::layout::Rect;
 use ratatui::Terminal;
 
 use gentle_partitioner::app::{draw, Action, App, Focus};
+use gentle_partitioner::apps_client::{AppsClient, AppsEvent};
 use gentle_partitioner::pane::PtyPane;
 use gentle_partitioner::predict::{self, Engine};
 use gentle_partitioner::predict_server::PredictServer;
@@ -45,10 +46,12 @@ OPTIONS:
     -h, --help       Print help
     -V, --version    Print version
         --no-predict Disable the local n-gram prediction engine and server
+        --no-apps    Disable the apps engine and the bottom-left apps panel
 
 Without a command it runs `gentle-shell` inside a partitioned terminal.
 Everything after `--` is launched instead of the default command.
 With prediction on, the child sees GENTLE_PREDICT_URL and GENTLE_PREDICT_TOKEN.
+The apps engine (gentle-apps) runs as a separate process unless --no-apps.
 ";
 
 type Backend = CrosstermBackend<io::Stdout>;
@@ -61,6 +64,8 @@ enum Event {
     PtyOutput,
     /// Fresh git statuses computed off the UI thread.
     Statuses(HashMap<PathBuf, GitStatus>),
+    /// An event from the independent apps engine (S12).
+    Apps(AppsEvent),
 }
 
 fn main() {
@@ -89,7 +94,7 @@ fn run() -> Result<i32> {
 
     install_panic_hook();
     let mut terminal = setup_terminal().context("entering raw mode / alternate screen")?;
-    let result = event_loop(&mut terminal, &command, opts.predict);
+    let result = event_loop(&mut terminal, &command, opts.predict, opts.apps);
     // Always restore the terminal, even when the loop failed.
     let _ = restore_terminal();
     result.map(|_| 0)
@@ -98,6 +103,7 @@ fn run() -> Result<i32> {
 struct RunOpts {
     command: Vec<String>,
     predict: bool,
+    apps: bool,
 }
 
 enum ParseOutcome {
@@ -109,6 +115,7 @@ fn parse_args(args: Vec<String>) -> Result<ParseOutcome> {
     let mut iter = args.into_iter();
     let mut command: Vec<String> = Vec::new();
     let mut predict = true;
+    let mut apps = true;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -121,6 +128,9 @@ fn parse_args(args: Vec<String>) -> Result<ParseOutcome> {
             }
             "--no-predict" => {
                 predict = false;
+            }
+            "--no-apps" => {
+                apps = false;
             }
             "--" => {
                 command.extend(iter.by_ref());
@@ -136,7 +146,7 @@ fn parse_args(args: Vec<String>) -> Result<ParseOutcome> {
     if command.is_empty() {
         command.push(DEFAULT_COMMAND.to_string());
     }
-    Ok(ParseOutcome::Run(RunOpts { command, predict }))
+    Ok(ParseOutcome::Run(RunOpts { command, predict, apps }))
 }
 
 /// Shared handles for the prediction engine and its local server.
@@ -205,7 +215,7 @@ fn install_panic_hook() {
     }));
 }
 
-fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enabled: bool) -> Result<()> {
+fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enabled: bool, apps_enabled: bool) -> Result<()> {
     let root = std::env::current_dir().context("reading the current directory")?;
     let mut app = App::new(root.clone());
 
@@ -226,6 +236,27 @@ fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enab
     let (tx, rx) = mpsc::channel::<Event>();
     spawn_input_thread(tx.clone());
     let git_tx = spawn_git_worker(tx.clone(), root.clone());
+
+    // The apps engine runs as a separate process; its events flow through the
+    // same UI channel so redraws happen only on events (S11, S12).
+    let apps = if apps_enabled {
+        // Bridge the apps engine's own channel onto the single UI channel.
+        let (apps_tx, apps_rx) = mpsc::channel::<AppsEvent>();
+        let ui_tx = tx.clone();
+        std::thread::Builder::new()
+            .name("apps-bridge".into())
+            .spawn(move || {
+                while let Ok(ev) = apps_rx.recv() {
+                    if ui_tx.send(Event::Apps(ev)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn apps bridge");
+        Some(AppsClient::spawn(apps_tx))
+    } else {
+        None
+    };
 
     // Coalesce PTY wake-ups: the reader thread flips the flag and only sends a
     // PtyOutput when none is pending, so the UI never floods on fast output.
@@ -250,6 +281,11 @@ fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enab
                         pty.reset_scroll();
                     }
                     Action::ScrollChat(delta) => pty.scroll_chat(delta),
+                    Action::Apps(msg) => {
+                        if let Some(a) = &apps {
+                            a.send(msg);
+                        }
+                    }
                     Action::Quit => break,
                 }
                 // A save asks for a fresh git status off the UI thread.
@@ -265,6 +301,11 @@ fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enab
                     pty.reset_scroll();
                 }
                 Action::ScrollChat(delta) => pty.scroll_chat(delta),
+                Action::Apps(msg) => {
+                    if let Some(a) = &apps {
+                        a.send(msg);
+                    }
+                }
                 Action::Quit => break,
             },
             Event::Input(CtEvent::Paste(text)) => {
@@ -287,6 +328,8 @@ fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enab
                 }
             }
             Event::Statuses(statuses) => app.apply_statuses(statuses),
+            Event::Apps(AppsEvent::Msg(msg)) => app.apply_apps_msg(msg),
+            Event::Apps(AppsEvent::Offline) => app.set_apps_offline(),
         }
 
         // The child owns the session lifetime: when it exits, so do we.
@@ -296,6 +339,10 @@ fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enab
         if needs_redraw {
             redraw(terminal, &mut app, &mut pty)?;
         }
+    }
+    // Kill the apps engine on quit so no child is left behind.
+    if let Some(a) = &apps {
+        a.shutdown();
     }
     Ok(())
 }
