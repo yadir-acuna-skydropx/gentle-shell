@@ -70,8 +70,82 @@ use the same definitions):
 Inside the engine each app is a **`Connector`** (`id`, `name`, `status`, `poll`,
 `reply`) driven on its **own thread**, so a slow app never blocks the others or
 the stdin loop. `gentle-apps` with no args runs the stdio engine;
-`gentle-apps --help`/`--version` work, and `gentle-apps slack login` is a
-placeholder until T13.
+`gentle-apps --help`/`--version` work, and the `gentle-apps slack …`
+subcommands manage the Slack login (below).
+
+## Connect Slack
+
+The Slack connector shows the messages that mention you and lets you reply **in
+the mention's thread, as yourself**. Authentication is a browser OAuth login
+with PKCE — no token is ever pasted or printed.
+
+### 1. Create the Slack app
+
+1. Go to <https://api.slack.com/apps> → **Create New App** → **From an app
+   manifest** → choose the workspace.
+2. Paste `partitioner/apps/slack-manifest.yaml` and create the app.
+3. Verify the redirect URL `http://localhost:47917/callback` and that **PKCE is
+   enabled**. Installing to the workspace separately is **not** needed — the
+   login performs the install.
+4. Copy the **Client ID** from *Basic Information* (it is **not** a secret).
+
+### 2. Log in
+
+```sh
+gentle-apps slack login --client-id <ID>
+```
+
+This opens your browser (via `xdg-open`, and also prints the URL so you can
+paste it if the browser does not open), runs a one-shot loopback server on the
+fixed port **47917**, validates the OAuth `state` in constant time, exchanges
+the authorization code with the PKCE `code_verifier` (**no client secret**) and
+stores the result. The loopback accepts callbacks for up to 5 minutes.
+
+- `gentle-apps slack status` — prints whether Slack is connected and the
+  workspace, never the token.
+- `gentle-apps slack logout` — deletes the keyring token and the workspace/user
+  metadata (the non-secret client id is kept so a re-login needs no
+  `--client-id`).
+
+### What is stored where
+
+- **Secret** (keyring, service `gentle-apps`, account `slack`): the user token
+  (`xoxp-…`) and, only when token rotation is enabled, the refresh token and
+  expiry, as a small JSON blob. One workspace per machine.
+- **Non-secret** (`~/.config/gentle-partitioner/apps.toml`, dir `0700`, file
+  `0600`): `[slack] client_id`, `team_id`, `team_name`, `user_id`. The token
+  never touches this file.
+
+### Scopes and why each is needed
+
+User scopes (the app acts as you, not as a bot):
+
+- `search:read` — `search.messages` to find mentions of you;
+- `chat:write` — `chat.postMessage` to reply in the thread;
+- `users:read` — `users.info` to render `<@U…>` mentions as names;
+- `channels:read`, `groups:read`, `im:read`, `mpim:read` — read channel/DM
+  metadata (names, types) for the item titles;
+- `channels:history`, `groups:history`, `im:history`, `mpim:history` — only for
+  `conversations.replies`, the fallback that finds a mention's parent thread
+  when the permalink has no `thread_ts`.
+
+### How a reply finds the thread
+
+Search results have no `thread_ts`, so the parent is derived in order: (1) the
+`thread_ts` query param of the message permalink; else (2)
+`conversations.replies?channel=…&ts=<ts>&limit=1` → `messages[0].thread_ts`;
+else (3) the message's own `ts`. The reply always targets the mention's channel,
+never another.
+
+### Limits
+
+- Mentions are **polled every 30 s** (real-time user mentions need a bot).
+- Slack's **search index lags** a little, so a new mention can take a moment to
+  appear.
+- `search.messages` is a **legacy** method (migration path:
+  `assistant.search.context`).
+- Enabling PKCE marks the app as a **public client** and is **one-way**; it
+  cannot be undone.
 
 ## Prediction engine & server
 
@@ -280,7 +354,9 @@ else is forwarded to the chat.
   a PTY child.
 - **`apps/`** — the `gentle-apps` workspace member: the shared `protocol`
   (NDJSON message types), the `Connector` trait, the threaded stdio `engine`,
-  and the Slack placeholder connector. Builds the `gentle-apps` binary (S12).
+  and the live Slack connector with its browser OAuth/PKCE login (`pkce`,
+  `oauth`, `http`, `store`, `config`, `slack`). Builds the `gentle-apps` binary
+  (S12, S13).
 
 ## Roadmap
 
@@ -299,8 +375,9 @@ else is forwarded to the chat.
 - **T12 (S12)** — apps engine (`gentle-apps`), the JSON-lines stdio protocol, the
   `Connector` trait and the bottom-left collapsible apps panel with a Slack
   placeholder: **done**.
-- **T13 (S12, S13)** — the live Slack connector (token in the system keyring,
-  mentions of the user, reply in the thread): **next**.
+- **T13 (S12, S13)** — the live Slack connector (browser OAuth + PKCE login,
+  token in the system keyring, mentions of the user, reply in the thread):
+  **done**.
 
 ## Fast development loop
 

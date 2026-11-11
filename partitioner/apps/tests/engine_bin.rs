@@ -33,7 +33,7 @@ fn first_apps_line_lists_slack_disconnected_then_shutdown_exits_zero() {
 }
 
 #[test]
-fn version_and_help_and_slack_login_placeholder() {
+fn version_and_help() {
     let v = Command::new(BIN).arg("--version").output().unwrap();
     assert_eq!(v.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&v.stdout).contains("gentle-apps"));
@@ -41,8 +41,39 @@ fn version_and_help_and_slack_login_placeholder() {
     let h = Command::new(BIN).arg("--help").output().unwrap();
     assert_eq!(h.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&h.stdout).contains("apps engine"));
+}
 
-    let login = Command::new(BIN).args(["slack", "login"]).output().unwrap();
-    assert_eq!(login.status.code(), Some(2));
-    assert!(String::from_utf8_lossy(&login.stderr).contains("not implemented yet (T13)"));
+#[test]
+fn slack_status_with_empty_config_and_no_token_prints_not_connected() {
+    let tmp = std::env::temp_dir().join(format!("gentle-apps-status-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let out = Command::new(BIN)
+        .args(["slack", "status"])
+        .env("HOME", &tmp)
+        .env("GENTLE_APPS_TOKEN_STORE", "memory")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "status exits 0");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("not connected"), "stdout: {stdout}");
+    // The token must never be printed; there is none here, but assert the shape.
+    assert!(!stdout.contains("xoxp"));
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn slack_login_without_client_id_prints_setup_and_exits_two() {
+    let tmp = std::env::temp_dir().join(format!("gentle-apps-login-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+    let out = Command::new(BIN)
+        .args(["slack", "login"])
+        .env("HOME", &tmp)
+        .env("GENTLE_APPS_TOKEN_STORE", "memory")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "exit 2 without a client id");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("api.slack.com/apps"));
+    let _ = std::fs::remove_dir_all(&tmp);
 }

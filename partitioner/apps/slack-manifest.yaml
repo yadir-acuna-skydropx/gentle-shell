@@ -1,0 +1,35 @@
+# Slack app manifest for gentle-apps (T13).
+#
+# Create the app at https://api.slack.com/apps -> "Create New App" ->
+# "From an app manifest" -> choose your workspace -> paste this file.
+#
+# Enabling PKCE marks the app as a public client; this is one-way and cannot be
+# undone. No bot user and no client secret are used: the browser login exchanges
+# the authorization code with a PKCE code_verifier only.
+display_information:
+  name: gentle-apps
+  description: Mentions and thread replies for the gentle-partitioner apps panel.
+
+oauth_config:
+  redirect_urls:
+    - http://localhost:47917/callback
+  scopes:
+    user:
+      - search:read
+      - chat:write
+      - users:read
+      - channels:read
+      - groups:read
+      - im:read
+      - mpim:read
+      - channels:history
+      - groups:history
+      - im:history
+      - mpim:history
+  # PKCE lives under oauth_config (docs.slack.dev/authentication/using-pkce).
+  pkce_enabled: true
+
+settings:
+  org_deploy_enabled: false
+  socket_mode_enabled: false
+  token_rotation_enabled: false
