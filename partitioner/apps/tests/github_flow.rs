@@ -233,6 +233,14 @@ fn tempdir(tag: &str) -> PathBuf {
     base
 }
 
+/// A repo at `<own parent>/repo`, so worktree siblings and cleanup stay inside
+/// a per-test directory (never the system temp dir itself).
+fn repo_in_own_parent(tag: &str) -> (PathBuf, PathBuf) {
+    let parent = tempdir(tag);
+    let repo = parent.join("repo");
+    (parent, repo)
+}
+
 fn connector_with(server: &FakeServer, token: Box<dyn TokenSource>, root: PathBuf) -> (GithubConnector, Arc<Mutex<Vec<String>>>) {
     let (op, urls) = opener();
     let cfg = GithubConfig { api_base: server.base() };
@@ -492,7 +500,7 @@ fn worktrees_section_reports_no_local_repository_outside_a_repo() {
 #[test]
 fn worktree_add_creates_the_worktree_and_refuses_an_existing_dir() {
     let server = FakeServer::start(poll_handler);
-    let repo = tempdir("wtadd");
+    let (own, repo) = repo_in_own_parent("wtadd");
     init_repo(&repo, "https://github.com/octo/repo.git");
     git(&repo, &["branch", "feature"]);
     let (token, _) = FixedToken::single("tok");
@@ -500,10 +508,11 @@ fn worktree_add_creates_the_worktree_and_refuses_an_existing_dir() {
     let created = c.action("branch|octo|repo|bbb|feature", "worktree_add").unwrap();
     assert!(Path::new(&created).is_dir(), "worktree dir exists: {created}");
     assert!(created.ends_with(&format!("{}-feature", repo.file_name().unwrap().to_string_lossy())));
+    assert!(Path::new(&created).starts_with(&own), "worktree stays inside the test dir");
     // Refuse when the target already exists.
     let err = c.action("branch|octo|repo|bbb|feature", "worktree_add").unwrap_err();
     assert!(err.contains("already exists"), "{err}");
-    std::fs::remove_dir_all(repo.parent().unwrap()).ok();
+    std::fs::remove_dir_all(&own).ok();
 }
 
 #[test]
@@ -574,4 +583,56 @@ fn an_unknown_action_is_an_error() {
     let (mut c, _) = connector_with(&server, token, tempdir("unknown"));
     let err = c.action("branch|octo|repo|aaa|main", "frobnicate").unwrap_err();
     assert!(err.contains("unknown action"), "{err}");
+}
+
+fn head_branch(repo: &Path) -> String {
+    let out = std::process::Command::new("git").args(["-C"]).arg(repo).args(["rev-parse", "--abbrev-ref", "HEAD"]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn checkout_rejects_option_like_branch_names_and_keeps_head() {
+    let server = FakeServer::start(poll_handler);
+    let repo = tempdir("checkout-inject");
+    init_repo(&repo, "https://github.com/octo/repo.git");
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, repo.clone());
+    for evil in ["--orphan=x", "-b", "-", "--detach"] {
+        let err = c.action(&format!("branch|octo|repo|s|{evil}"), "checkout").unwrap_err();
+        assert!(err.contains("invalid branch name"), "{evil}: {err}");
+        assert_eq!(head_branch(&repo), "main", "{evil} must not move HEAD");
+    }
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn worktree_add_rejects_option_like_branch_names_and_creates_nothing() {
+    let server = FakeServer::start(poll_handler);
+    let (parent, repo) = repo_in_own_parent("wtadd-inject");
+    init_repo(&repo, "https://github.com/octo/repo.git");
+    let before = std::fs::read_dir(&parent).unwrap().count();
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, repo.clone());
+    for evil in ["-rf", "--upload-pack=touch /tmp/pwned", "--orphan=x"] {
+        let err = c.action(&format!("branch|octo|repo|s|{evil}"), "worktree_add").unwrap_err();
+        assert!(err.contains("invalid branch name"), "{evil}: {err}");
+    }
+    assert_eq!(std::fs::read_dir(&parent).unwrap().count(), before, "nothing created");
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+#[test]
+fn checkout_treats_untracked_only_as_dirty() {
+    let server = FakeServer::start(poll_handler);
+    let repo = tempdir("checkout-untracked");
+    init_repo(&repo, "https://github.com/octo/repo.git");
+    git(&repo, &["branch", "feature"]);
+    std::fs::write(repo.join("new.txt"), "keep me\n").unwrap();
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, repo.clone());
+    let err = c.action("branch|octo|repo|s|feature", "checkout").unwrap_err();
+    assert_eq!(err, "working tree has changes — commit or stash first");
+    assert_eq!(std::fs::read_to_string(repo.join("new.txt")).unwrap(), "keep me\n");
+    assert_eq!(head_branch(&repo), "main");
+    std::fs::remove_dir_all(&repo).ok();
 }

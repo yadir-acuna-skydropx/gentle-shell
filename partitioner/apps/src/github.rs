@@ -781,6 +781,7 @@ impl GithubConnector {
     }
 
     fn worktree_add(&self, owner: &str, name: &str, branch: &str) -> std::result::Result<String, String> {
+        validate_branch(&self.repo_root, branch)?;
         self.require_matching_repo(owner, name)?;
         let parent = self.repo_root.parent().ok_or("repository has no parent directory")?;
         let repo_name = self
@@ -796,7 +797,10 @@ impl GithubConnector {
         // remote is unreachable but a local branch already exists, the worktree
         // add below still succeeds; a truly missing ref fails there with a clear
         // git error.
-        let _ = run_git(&self.repo_root, &["fetch".into(), "origin".into(), branch.into()]);
+        let _ = run_git(
+            &self.repo_root,
+            &["fetch".into(), "origin".into(), "--".into(), format!("refs/heads/{branch}:refs/remotes/origin/{branch}")],
+        );
         let target_str = target.display().to_string();
         let local_exists = run_git(
             &self.repo_root,
@@ -804,7 +808,7 @@ impl GithubConnector {
         )
         .is_ok();
         if local_exists {
-            run_git(&self.repo_root, &["worktree".into(), "add".into(), target_str.clone(), branch.into()])?;
+            run_git(&self.repo_root, &["worktree".into(), "add".into(), "--".into(), target_str.clone(), branch.into()])?;
         } else {
             run_git(
                 &self.repo_root,
@@ -813,6 +817,7 @@ impl GithubConnector {
                     "add".into(),
                     "-b".into(),
                     branch.into(),
+                    "--".into(),
                     target_str.clone(),
                     format!("origin/{branch}"),
                 ],
@@ -822,15 +827,27 @@ impl GithubConnector {
     }
 
     fn checkout(&self, owner: &str, name: &str, branch: &str) -> std::result::Result<String, String> {
+        validate_branch(&self.repo_root, branch)?;
         self.require_matching_repo(owner, name)?;
         let status = run_git(&self.repo_root, &["status".into(), "--porcelain".into()])?;
         if !status.trim().is_empty() {
             return Err("working tree has changes — commit or stash first".to_string());
         }
         // Never --force; never discards data.
-        run_git(&self.repo_root, &["checkout".into(), branch.into()])?;
+        run_git(&self.repo_root, &["checkout".into(), branch.into(), "--".into()])?;
         Ok(format!("checked out {branch}"))
     }
+}
+
+/// Rejects branch names that git could parse as options or that are not
+/// valid branch names, before any git command sees them.
+fn validate_branch(repo_root: &Path, branch: &str) -> std::result::Result<(), String> {
+    let invalid = || format!("invalid branch name: {branch:?}");
+    if branch.is_empty() || branch.starts_with('-') || branch.chars().any(|c| c.is_control()) {
+        return Err(invalid());
+    }
+    run_git(repo_root, &["check-ref-format".into(), "--branch".into(), branch.into()]).map_err(|_| invalid())?;
+    Ok(())
 }
 
 fn more_item(n: usize) -> Item {
