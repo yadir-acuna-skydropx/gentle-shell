@@ -13,7 +13,7 @@ use crate::config;
 use crate::connector::{Connector, Result};
 use crate::http::{self, HttpResponse};
 use crate::oauth::{self, SlackConfig};
-use crate::protocol::{Item, Status};
+use crate::protocol::{Item, ItemAction, Status};
 use crate::store::{SLACK_ACCOUNT, StoredToken, TokenStore};
 
 /// Polling interval for Slack mentions (Tier-2 friendly).
@@ -36,15 +36,64 @@ struct MatchRef {
     permalink: String,
 }
 
+/// Opens a link and reports whether the Slack desktop app is installed.
+/// Injected so tests exercise both the deep-link and the permalink fallback
+/// (S16, L42: "Instalar Slack Desktop + enlaces").
+pub trait SlackLinkOpener: Send {
+    fn open(&self, url: &str) -> std::result::Result<(), String>;
+    /// True when a Slack desktop app can handle `slack://` links.
+    fn slack_desktop_installed(&self) -> bool;
+}
+
+/// Production opener: `xdg-open` to launch (no shell), detecting the desktop app
+/// via a `slack` binary on `PATH` or an `x-scheme-handler/slack` default.
+pub struct DesktopOpener;
+
+impl SlackLinkOpener for DesktopOpener {
+    fn open(&self, url: &str) -> std::result::Result<(), String> {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .spawn()
+            .map(|_| ())
+            .map_err(|e| format!("xdg-open: {e}"))
+    }
+    fn slack_desktop_installed(&self) -> bool {
+        slack_on_path() || slack_scheme_handler()
+    }
+}
+
+/// True when a `slack` executable is on `PATH` (no shell).
+fn slack_on_path() -> bool {
+    let Some(paths) = std::env::var_os("PATH") else { return false };
+    std::env::split_paths(&paths).any(|dir| dir.join("slack").is_file())
+}
+
+/// True when `slack://` has a registered default handler via `xdg-mime`.
+fn slack_scheme_handler() -> bool {
+    std::process::Command::new("xdg-mime")
+        .args(["query", "default", "x-scheme-handler/slack"])
+        .output()
+        .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
+}
+
+/// The `open` action offered on every Slack mention (S16).
+fn open_action() -> ItemAction {
+    ItemAction { id: "open".into(), label: "Open in Slack".into(), confirm: false }
+}
+
 /// The Slack connector.
 pub struct SlackConnector {
     cfg: SlackConfig,
     client_id: Option<String>,
     store: Box<dyn TokenStore>,
+    opener: Box<dyn SlackLinkOpener>,
     agent: ureq::Agent,
     status: Status,
     detail: Option<String>,
     user_id: Option<String>,
+    /// The workspace team id (from `auth.test`), used to build `slack://` links.
+    team_id: Option<String>,
     users: HashMap<String, String>,
     matches: HashMap<String, MatchRef>,
 }
@@ -56,19 +105,65 @@ impl SlackConnector {
         cfg: SlackConfig,
         client_id: Option<String>,
         store: Box<dyn TokenStore>,
+        home: PathBuf,
+    ) -> Self {
+        Self::with_opener(cfg, client_id, store, home, Box::new(DesktopOpener))
+    }
+
+    /// Builds a connector with an injected opener (tests use this to control the
+    /// desktop-installed detection and record the opened URL).
+    pub fn with_opener(
+        cfg: SlackConfig,
+        client_id: Option<String>,
+        store: Box<dyn TokenStore>,
         _home: PathBuf,
+        opener: Box<dyn SlackLinkOpener>,
     ) -> Self {
         SlackConnector {
             cfg,
             client_id,
             store,
+            opener,
             agent: http::agent(),
             status: Status::Disconnected,
             detail: Some(DISCONNECTED_DETAIL.to_string()),
             user_id: None,
+            team_id: None,
             users: HashMap::new(),
             matches: HashMap::new(),
         }
+    }
+
+    /// Opens a mention: the Slack Desktop deep link when the app is installed and
+    /// the team id is known, else the https permalink (S16). The `message`
+    /// parameter is not documented for `slack://channel` in Slack's deep-linking
+    /// reference, so the channel deep link is used with the permalink fallback.
+    fn open_item(&mut self, item_id: &str) -> std::result::Result<String, String> {
+        let mref = self
+            .matches
+            .get(item_id)
+            .cloned()
+            .or_else(|| {
+                item_id.split_once(':').map(|(c, t)| MatchRef {
+                    channel: c.to_string(),
+                    ts: t.to_string(),
+                    permalink: String::new(),
+                })
+            })
+            .ok_or_else(|| format!("unknown item: {item_id}"))?;
+        let url = match (self.opener.slack_desktop_installed(), self.team_id.as_deref()) {
+            (true, Some(team)) if !team.is_empty() => {
+                format!("slack://channel?team={team}&id={}", mref.channel)
+            }
+            _ => {
+                if mref.permalink.is_empty() {
+                    return Err("no permalink to open".to_string());
+                }
+                mref.permalink.clone()
+            }
+        };
+        self.opener.open(&url)?;
+        Ok(format!("opened {url}"))
     }
 
     /// Loads the token, refreshing it first when it is near expiry.
@@ -115,11 +210,14 @@ impl SlackConnector {
         Ok(resp)
     }
 
-    /// auth.test → the user id; sets status on failure.
+    /// auth.test → the user id; also learns the team id for `slack://` links.
+    /// Sets status on failure.
     fn auth_test(&mut self, token: &str) -> std::result::Result<String, String> {
         let resp = self.get("auth.test", "", token)?;
         let v = &resp.body;
         if v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
+            self.team_id =
+                v.get("team_id").and_then(|t| t.as_str()).filter(|s| !s.is_empty()).map(String::from);
             Ok(v.get("user_id").and_then(|u| u.as_str()).unwrap_or_default().to_string())
         } else {
             Err(v.get("error").and_then(|e| e.as_str()).unwrap_or("auth_failed").to_string())
@@ -242,7 +340,15 @@ fn match_to_item(m: &serde_json::Value, users: &HashMap<String, String>) -> Opti
     let permalink = m.get("permalink").and_then(|p| p.as_str()).unwrap_or("").to_string();
     let id = format!("{channel_id}:{ts}");
     Some((
-        Item { id, title, text, ts: ts.clone(), link: permalink.clone(), ..Default::default() },
+        Item {
+            id,
+            title,
+            text,
+            ts: ts.clone(),
+            link: permalink.clone(),
+            actions: vec![open_action()],
+            ..Default::default()
+        },
         MatchRef { channel: channel_id, ts, permalink },
     ))
 }
@@ -460,6 +566,13 @@ impl Connector for SlackConnector {
             Ok(())
         } else {
             Err(resp.body.get("error").and_then(|e| e.as_str()).unwrap_or("post_failed").to_string())
+        }
+    }
+
+    fn action(&mut self, item_id: &str, action_id: &str) -> Result<String> {
+        match action_id {
+            "open" => self.open_item(item_id),
+            other => Err(format!("unknown action: {other}")),
         }
     }
 }

@@ -5,15 +5,17 @@ use ratatui::layout::Rect;
 
 /// Splits a workspace sidebar into the file tree (top) and the apps panel
 /// (bottom, S12). The panel is a bordered box sized to its content when
-/// collapsed (a header plus one row per app) or up to
-/// [`APPS_PANEL_MAX_PCT`]% of the sidebar when expanded; the tree always keeps
-/// at least [`APPS_TREE_MIN`] rows when the sidebar is tall enough. The two
-/// rects never overlap and together cover the whole sidebar.
-pub fn split_sidebar(sidebar: Rect, app_count: u16, expanded: bool) -> (Rect, Rect) {
+/// collapsed (a header plus one row per app) or to `pct`% of the sidebar when
+/// expanded (clamped to [`APPS_PANEL_MIN_PCT`]..=[`APPS_PANEL_MAX_PCT`], S16);
+/// the tree always keeps at least [`APPS_TREE_MIN`] rows when the sidebar is
+/// tall enough, so on a very short terminal the fraction yields to that
+/// minimum. The two rects never overlap and together cover the whole sidebar.
+pub fn split_sidebar(sidebar: Rect, app_count: u16, expanded: bool, pct: u16) -> (Rect, Rect) {
     // Bordered box: top+bottom border (2) + one row per app, at least 3 tall.
     let collapsed = (app_count + 2).max(3);
     let want = if expanded {
-        (sidebar.height * APPS_PANEL_MAX_PCT / 100).max(collapsed)
+        let pct = pct.clamp(APPS_PANEL_MIN_PCT, APPS_PANEL_MAX_PCT);
+        (sidebar.height * pct / 100).max(collapsed)
     } else {
         collapsed
     };
@@ -93,8 +95,13 @@ pub const SIDEBAR_MAX: u16 = 40;
 pub const CHAT_MIN_HEIGHT: u16 = 8;
 /// Rows the tree keeps when the apps panel shares the sidebar (S12).
 pub const APPS_TREE_MIN: u16 = 5;
-/// Share of the sidebar the expanded apps panel may take (percent).
-pub const APPS_PANEL_MAX_PCT: u16 = 45;
+/// Bounds and default for the expanded apps-panel height, as a share of the
+/// sidebar (percent). The user adjusts it in [`APPS_PANEL_STEP`] steps within
+/// [`APPS_PANEL_MIN_PCT`]..=[`APPS_PANEL_MAX_PCT`] (S16).
+pub const APPS_PANEL_MIN_PCT: u16 = 40;
+pub const APPS_PANEL_MAX_PCT: u16 = 70;
+pub const APPS_PANEL_DEFAULT_PCT: u16 = 60;
+pub const APPS_PANEL_STEP: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {
@@ -363,7 +370,7 @@ mod tests {
             for apps in [1u16, 3, 8] {
                 for expanded in [false, true] {
                     let side = Rect::new(0, 0, 30, h);
-                    let (tree, panel) = split_sidebar(side, apps, expanded);
+                    let (tree, panel) = split_sidebar(side, apps, expanded, APPS_PANEL_DEFAULT_PCT);
                     // Cover exactly, stacked, no overlap.
                     assert_eq!(tree.height + panel.height, h, "cover {h} {apps} {expanded}");
                     assert_eq!(tree.y, side.y);
@@ -382,11 +389,42 @@ mod tests {
     #[test]
     fn collapsed_panel_fits_its_app_rows_and_expands_larger() {
         let side = Rect::new(0, 0, 30, 40);
-        let (_, collapsed) = split_sidebar(side, 3, false);
+        let (_, collapsed) = split_sidebar(side, 3, false, APPS_PANEL_DEFAULT_PCT);
         assert_eq!(collapsed.height, 5, "3 apps + 2 borders");
-        let (_, expanded) = split_sidebar(side, 3, true);
+        let (_, expanded) = split_sidebar(side, 3, true, APPS_PANEL_DEFAULT_PCT);
         assert!(expanded.height > collapsed.height, "expanding grows the panel");
         assert!(expanded.height <= 40 * APPS_PANEL_MAX_PCT / 100);
+    }
+
+    #[test]
+    fn expanded_panel_takes_the_requested_fraction_at_40_60_and_70() {
+        // A 50-row sidebar can afford any fraction while keeping the 5-row tree.
+        let side = Rect::new(0, 0, 30, 50);
+        for pct in [APPS_PANEL_MIN_PCT, APPS_PANEL_DEFAULT_PCT, APPS_PANEL_MAX_PCT] {
+            let (tree, panel) = split_sidebar(side, 3, true, pct);
+            assert_eq!(panel.height, 50 * pct / 100, "panel is {pct}% of the sidebar");
+            assert_eq!(tree.height, 50 - panel.height);
+            assert!(tree.height >= APPS_TREE_MIN, "tree keeps its minimum at {pct}%");
+        }
+    }
+
+    #[test]
+    fn out_of_range_fractions_clamp_to_the_40_and_70_bounds() {
+        let side = Rect::new(0, 0, 30, 100);
+        let (_, low) = split_sidebar(side, 3, true, 10);
+        assert_eq!(low.height, 100 * APPS_PANEL_MIN_PCT / 100, "below 40% clamps to 40%");
+        let (_, high) = split_sidebar(side, 3, true, 95);
+        assert_eq!(high.height, 100 * APPS_PANEL_MAX_PCT / 100, "above 70% clamps to 70%");
+    }
+
+    #[test]
+    fn a_short_sidebar_yields_the_fraction_to_the_five_row_tree_minimum() {
+        // 8 rows: 70% would be ~5 panel rows, but the tree keeps 5 so the
+        // panel is capped at height - 5 = 3 and the tree keeps its minimum.
+        let side = Rect::new(0, 0, 30, 8);
+        let (tree, panel) = split_sidebar(side, 3, true, APPS_PANEL_MAX_PCT);
+        assert!(tree.height >= APPS_TREE_MIN, "tree keeps its 5-row minimum");
+        assert_eq!(tree.height + panel.height, 8, "still covers the sidebar");
     }
 
     // ---- Zoom / minimize (S14) ----

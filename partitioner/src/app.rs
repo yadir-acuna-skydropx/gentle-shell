@@ -134,6 +134,9 @@ pub struct App {
     pub highlighter: Option<Highlighter>,
     /// Bottom-left apps panel state (S12).
     pub apps: AppsPanel,
+    /// Expanded apps-panel height as a share of the sidebar, in percent; the
+    /// user adjusts it with `+`/`-` within [40, 70] (S16).
+    pub apps_panel_pct: u16,
     /// Incrementing id for apps-engine requests.
     apps_req_id: u64,
     /// File-tree region of the sidebar, captured in the last draw.
@@ -181,6 +184,7 @@ impl App {
             icons: IconMode::from_env(),
             highlighter: None,
             apps: AppsPanel::default(),
+            apps_panel_pct: layout::APPS_PANEL_DEFAULT_PCT,
             apps_req_id: 0,
             tree_area: None,
             apps_area: None,
@@ -541,6 +545,34 @@ impl App {
         self.apps_req_id
     }
 
+    /// `+` on the focused apps panel: grow the expanded height one 5% step,
+    /// clamped to 70% (S16). The new value is echoed in the status line.
+    pub fn grow_apps_panel(&mut self) {
+        self.apps_panel_pct = (self.apps_panel_pct + layout::APPS_PANEL_STEP).min(layout::APPS_PANEL_MAX_PCT);
+        self.status_msg = Some(format!("apps panel {}%", self.apps_panel_pct));
+    }
+
+    /// `-` on the focused apps panel: shrink the expanded height one 5% step,
+    /// clamped to 40% (S16). The new value is echoed in the status line.
+    pub fn shrink_apps_panel(&mut self) {
+        self.apps_panel_pct =
+            self.apps_panel_pct.saturating_sub(layout::APPS_PANEL_STEP).max(layout::APPS_PANEL_MIN_PCT);
+        self.status_msg = Some(format!("apps panel {}%", self.apps_panel_pct));
+    }
+
+    /// Enters the selected app: expand to its item list and request a refresh
+    /// (shared by Enter on an app row and a click on an app row, S16).
+    fn enter_selected_app(&mut self) -> Action {
+        if let Some(id) = self.apps.selected_app_id() {
+            self.apps.view = View::Items;
+            self.apps.item_sel = 0;
+            self.apps.reset_nav();
+            let rid = self.next_apps_id();
+            return Action::Apps(ClientMsg::Refresh { id: rid, app: id });
+        }
+        Action::None
+    }
+
     /// Prefix `a`: in workspace, toggle the panel expanded/collapsed and focus
     /// it; in chat mode, open the panel as an overlay.
     fn toggle_apps_panel(&mut self) {
@@ -574,6 +606,21 @@ impl App {
     /// one level, then to the chat. A pending confirmation or an open action
     /// menu take priority over the level navigation.
     fn apps_key(&mut self, key: KeyEvent) -> Action {
+        // `+`/`-` adjust the expanded panel height while the panel has focus,
+        // except while typing a reply (where they are literal characters, S16).
+        if self.apps.view != View::Reply {
+            match key.code {
+                KeyCode::Char('+') | KeyCode::Char('=') => {
+                    self.grow_apps_panel();
+                    return Action::None;
+                }
+                KeyCode::Char('-') => {
+                    self.shrink_apps_panel();
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
         if self.apps.confirm.is_some() {
             return self.apps_confirm_key(key);
         }
@@ -589,13 +636,7 @@ impl App {
                     KeyCode::Up | KeyCode::Char('k') => self.apps.app_sel = clamp_index(self.apps.app_sel, -1, len),
                     KeyCode::Down | KeyCode::Char('j') => self.apps.app_sel = clamp_index(self.apps.app_sel, 1, len),
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                        if let Some(id) = self.apps.selected_app_id() {
-                            self.apps.view = View::Items;
-                            self.apps.item_sel = 0;
-                            self.apps.reset_nav();
-                            let rid = self.next_apps_id();
-                            return Action::Apps(ClientMsg::Refresh { id: rid, app: id });
-                        }
+                        return self.enter_selected_app();
                     }
                     KeyCode::Esc => self.leave_apps(),
                     _ => {}
@@ -637,13 +678,15 @@ impl App {
                         let rid = self.next_apps_id();
                         self.apps.push_nav(&it, rid);
                         return Action::Apps(ClientMsg::Expand { id: rid, app, item: it.id });
-                    } else if !it.actions.is_empty() {
-                        self.apps.open_menu(&it);
-                    } else if self.apps.nav.is_empty() {
-                        // A flat item (Slack): open the reply editor as before.
+                    } else if it.kind.is_none() && self.apps.nav.is_empty() {
+                        // A flat item (Slack): Enter opens the reply editor as
+                        // before; its actions (e.g. open) are reached with `a`.
                         self.apps.view = View::Reply;
                         self.apps.reply.clear();
                         self.apps.reply_status = None;
+                    } else if !it.actions.is_empty() {
+                        // A hierarchical leaf (GitHub PR/issue/file): action menu.
+                        self.apps.open_menu(&it);
                     }
                 }
             }
@@ -1056,7 +1099,7 @@ impl App {
     fn mouse_click(&mut self, col: u16, row: u16) -> Action {
         if let Some(overlay) = self.overlay {
             match self.overlay_area {
-                Some(area) if rect_contains(area, col, row) => self.click_overlay(overlay, area, row),
+                Some(area) if rect_contains(area, col, row) => return self.click_overlay(overlay, area, row),
                 // A click anywhere outside the open overlay dismisses it.
                 _ => self.overlay = None,
             }
@@ -1104,8 +1147,7 @@ impl App {
         }
         if let Some(ap) = self.apps_area {
             if rect_contains(ap, col, row) {
-                self.click_apps(ap, col, row);
-                return Action::None;
+                return self.click_apps(ap, col, row);
             }
         }
         if let Some(ed) = l.editor {
@@ -1131,10 +1173,10 @@ impl App {
         Action::None
     }
 
-    fn click_overlay(&mut self, overlay: Overlay, area: Rect, row: u16) {
+    fn click_overlay(&mut self, overlay: Overlay, area: Rect, row: u16) -> Action {
         // Skip the top/bottom borders of the overlay box.
         if row <= area.y || row + 1 >= area.y + area.height {
-            return;
+            return Action::None;
         }
         let rel = (row - area.y - 1) as usize;
         match overlay {
@@ -1151,23 +1193,27 @@ impl App {
                     self.open_selected_change();
                 }
             }
-            Overlay::Apps => self.click_apps(area, (area.x + 1).max(0), row),
+            Overlay::Apps => return self.click_apps(area, (area.x + 1).max(0), row),
             Overlay::Help => {}
         }
+        Action::None
     }
 
     /// A click inside the apps panel selects the app or item under the cursor
     /// and focuses the panel. The panel body starts one row below the border.
-    fn click_apps(&mut self, area: Rect, _col: u16, row: u16) {
+    /// A click on an app row also expands the panel and enters that app (S16),
+    /// returning the resulting refresh request.
+    fn click_apps(&mut self, area: Rect, _col: u16, row: u16) -> Action {
         self.focus = Focus::Apps;
         if row <= area.y || row + 1 >= area.y + area.height {
-            return;
+            return Action::None;
         }
         let rel = (row - area.y - 1) as usize;
         match self.apps.view {
             View::Apps => {
                 if rel < self.apps.apps.len() {
                     self.apps.app_sel = rel;
+                    return self.enter_selected_app();
                 }
             }
             View::Items | View::Reply => {
@@ -1180,6 +1226,7 @@ impl App {
                 }
             }
         }
+        Action::None
     }
 
     fn click_sidebar(&mut self, side: Rect, row: u16) {
@@ -1516,7 +1563,14 @@ fn draw_apps_panel(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) 
     if area.height == 0 {
         return;
     }
-    let block = pane_block(" Apps ".into(), focused);
+    // While expanded, the title carries the current height share so adjusting
+    // it with `+`/`-` is visible (S16).
+    let title = if app.apps.is_expanded() {
+        format!(" Apps · {}% ", app.apps_panel_pct)
+    } else {
+        " Apps ".to_string()
+    };
+    let block = pane_block(title, focused);
     let inner = block.inner(area);
     let lines = apps_content_lines(app, inner.width as usize, inner.height as usize, focused);
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -1679,7 +1733,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
         } else {
         // The sidebar is split into the file tree (top) and the apps panel (bottom, S12).
         let (tree_area, apps_area) =
-            layout::split_sidebar(side, app.apps.apps.len() as u16, app.apps.is_expanded());
+            layout::split_sidebar(side, app.apps.apps.len() as u16, app.apps.is_expanded(), app.apps_panel_pct);
         app.tree_area = Some(tree_area);
         app.apps_area = Some(apps_area);
         let block = pane_block(format!(" Files · {} ", app.root.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())), focus == Focus::Sidebar);
@@ -1954,7 +2008,8 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "        PageUp/PageDown · Ctrl+Home/End · Ctrl+S save · Ctrl+R reload".into(),
         "        ● marks unsaved edits · Esc back to chat".into(),
         "Agent changes: ↑↓ PgUp PgDn scroll · Esc back / restore zoom".into(),
-        "Apps: ↑↓ select · Enter app→items→reply · type to reply · Esc back".into(),
+        "Apps: ↑↓ select · Enter app→items→reply · a actions (open) · Esc back".into(),
+        "      +/- resize the expanded panel (40-70%) · click an app to open it".into(),
         "Panes: [_] minimize · [□] zoom on each title bar; click a minimized".into(),
         "       title bar or strip to restore it.".into(),
         "Mouse: click selects panes and places the cursor; wheel scrolls.".into(),
@@ -2484,6 +2539,48 @@ mod tests {
         app.handle_key(key(KeyCode::Enter)); // open reply
         assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None, "empty reply sends nothing");
         assert_eq!(app.apps.pending_reply, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn plus_and_minus_adjust_the_apps_panel_height_within_40_to_70() {
+        let root = fixture("apps-height");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Connected)] });
+        render(&mut app, 120, 40);
+        assert_eq!(app.apps_panel_pct, layout::APPS_PANEL_DEFAULT_PCT, "default is 60%");
+        // `+` grows in 5% steps and clamps at 70%.
+        app.handle_key(ch('+'));
+        assert_eq!(app.apps_panel_pct, 65);
+        assert_eq!(app.status_msg.as_deref(), Some("apps panel 65%"));
+        app.handle_key(ch('+'));
+        app.handle_key(ch('+'));
+        assert_eq!(app.apps_panel_pct, layout::APPS_PANEL_MAX_PCT, "clamped at 70%");
+        // `-` shrinks in 5% steps and clamps at 40%.
+        for _ in 0..10 {
+            app.handle_key(ch('-'));
+        }
+        assert_eq!(app.apps_panel_pct, layout::APPS_PANEL_MIN_PCT, "clamped at 40%");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clicking_an_app_row_expands_the_panel_and_enters_the_app() {
+        let root = fixture("apps-click-expand");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Connected)] });
+        app.apply_apps_msg(EngineMsg::Items { app: "slack".into(), items: vec![app_item("a", "#one")] });
+        render(&mut app, 120, 40);
+        assert_eq!(app.apps.view, View::Apps, "starts collapsed");
+        let ap = app.apps_area.expect("apps panel region");
+        // Click the first app row (one row below the panel border).
+        let act = app.handle_mouse(click(ap.x + 2, ap.y + 1));
+        assert_eq!(app.focus, Focus::Apps, "the click focuses the panel");
+        assert_eq!(app.apps.view, View::Items, "the click expands into the app");
+        assert!(matches!(act, Action::Apps(ClientMsg::Refresh { app, .. }) if app == "slack"));
         fs::remove_dir_all(root).unwrap();
     }
 

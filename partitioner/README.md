@@ -38,10 +38,12 @@ repainted — only the changed cells of that fragment are written out.
 - **Apps panel (S12).** A collapsible **apps panel** sits bottom-left under the
   sidebar (and opens as an overlay in chat mode via the toolbar's **Apps** tool).
   It lists connectable apps with a coloured status dot and an item count;
-  expanding an app shows its messages with a reply box. The connections run in a
-  separate Rust process, `gentle-apps`, spoken to over JSON-lines on stdio. The
-  apps are **Slack** (mentions + threaded replies) and **GitHub** (repos,
-  branches, trees, PRs, issues and local worktrees, with simple actions).
+  expanding an app shows its items. The expanded panel takes **40–70%** of the
+  sidebar height (default 60%, `+`/`-` to adjust; the file tree keeps ≥ 5 rows).
+  The connections run in a separate Rust process, `gentle-apps`, spoken to over
+  JSON-lines on stdio. The apps are **Slack** (mentions + threaded replies, and
+  *open in Slack Desktop*) and **GitHub** (repos, branches, trees, PRs, issues,
+  local worktrees and **Actions workflows**, with simple actions).
   Disable the engine and panel with `--no-apps`.
 
 ## Apps engine (`gentle-apps`)
@@ -142,6 +144,19 @@ User scopes (the app acts as you, not as a bot):
   `conversations.replies`, the fallback that finds a mention's parent thread
   when the permalink has no `thread_ts`.
 
+### Open a mention in Slack Desktop
+
+Every mention carries an **open** action (reach it with `a`). When the official
+Slack **Desktop** app is installed — a `slack` binary on `PATH` or an
+`x-scheme-handler/slack` default (`xdg-mime query default
+x-scheme-handler/slack`) — it opens the **channel deep link**
+`slack://channel?team=<TEAM_ID>&id=<CHANNEL_ID>` (the team id comes from
+`auth.test`). Slack's deep-linking reference
+(<https://api.slack.com/reference/deep-linking>) documents only `team` and `id`
+for `slack://channel` — there is **no documented `message` parameter** — so the
+channel deep link is used, with the message's **https permalink** as the
+fallback when the desktop app is not installed.
+
 ### How a reply finds the thread
 
 Search results have no `thread_ts`, so the parent is derived in order: (1) the
@@ -176,16 +191,18 @@ It **polls every 60 s** (respecting `X-RateLimit-Remaining`/`Reset` and
 sections, each titled with its count and expandable:
 
 1. **Review requested** — `is:pr is:open review-requested:@me archived:false`; children are PRs `repo#123 · title · author`.
-2. **My PRs** — `is:pr is:open author:@me archived:false`; children are PRs with the CI state from the GraphQL `statusCheckRollup` of the head commit: `✓` success, `✗` failure, `●` pending, `–` none (fetched lazily on expand, so a poll stays under ~10 requests).
+2. **My PRs** — `is:pr is:open author:@me archived:false`; children are PRs with the CI state from the GraphQL `statusCheckRollup` of the head commit: `✓` success, `✗` failure, `●` pending, `–` none (fetched lazily on expand, so a poll stays under ~10 requests). The GraphQL expand re-reads the `gh` token once on a `401`, like the REST calls.
 3. **Assigned issues** — `is:issue is:open assignee:@me archived:false`.
-4. **Repositories** — `GET /user/repos?affiliation=owner,collaborator,organization_member&sort=pushed&per_page=50` → `owner/name · default branch · pushed <relative time>`. Expand a repo → its branches (the default branch and branches with an open PR are marked); expand a branch → the root tree; expand a dir → its subtree, lazily per level; files are leaves showing their size. Each level is capped at 500 entries with a trailing `… N more`.
+4. **Repositories** — `GET /user/repos?affiliation=owner,collaborator,organization_member&sort=pushed&per_page=50` → `owner/name · default branch · pushed <relative time>`. Expand a repo → its branches (the default branch and branches with an open PR are marked); expand a branch → the root tree; expand a dir → its subtree, lazily per level; files are leaves showing their size. Branches are paged (`?per_page=100&page=N`) for up to **5 pages / 500 entries**, then a trailing `… more branches`; tree levels are capped at 500 with a trailing `… N more`.
 5. **Worktrees (local)** — `git worktree list --porcelain` in the engine's cwd: one child per worktree with its path, branch (or *detached*) and *dirty*/*clean* state. Outside a git repo it shows *no local repository*.
+6. **Workflows** — the latest GitHub Actions runs of the **local** repo (the `origin` of the engine's cwd), `GET /repos/{o}/{r}/actions/runs?per_page=20` (one request per poll). Each run shows `<workflow name> · <branch> · <glyph> · <relative time>` with `✓` success, `✗` failure, `●` in-progress/queued, `⊘` cancelled, `–` other; expand a run → its jobs with their conclusion. Outside a local GitHub repo it shows *no local GitHub repository*.
 
 ### Actions (with confirmation in the panel)
 
 - **open** — on a PR, issue, repo, branch or file: opens the github.com URL with `xdg-open` (no shell). No confirmation.
 - **worktree_add** — on a branch, only when the local repo's `origin` matches that GitHub repo (https/ssh URLs are normalized). Runs `git fetch origin <branch>`, then `git worktree add <repo-parent>/<repo-name>-<sanitized-branch> <branch>` (or `-b <branch> origin/<branch>` when there is no local branch). Refuses if the target dir exists; returns the created path. **Confirmation required.**
 - **checkout** — on a branch, only for the local matching repo and only if `git status --porcelain` is empty, else it refuses with *working tree has changes — commit or stash first*. Never uses `--force` and never stashes or discards. **Confirmation required.**
+- **rerun_failed** — on a workflow run, offered **only when the run's conclusion is `failure`**: `POST /repos/{o}/{r}/actions/runs/{id}/rerun-failed-jobs`. **Confirmation required.**
 
 All git calls use `std::process::Command` with args (no shell), a ~60 s timeout,
 and capture stderr into the error message.
@@ -322,6 +339,7 @@ else is forwarded to the chat.
 | `t` | Files tool (overlay) |
 | `c` | Worktree changes tool (overlay) |
 | `a` | Apps panel (toggle expand/collapse in workspace · overlay in chat) |
+| `+` / `-` | (panel focused) resize the expanded panel in 5% steps, 40–70% |
 | `z` | Zoom (maximize) the focused pane; press again to restore |
 | `m` | Minimize the focused pane to its title bar; press again to restore |
 | `d` | Changes only — focus and zoom the agent-changes pane |
@@ -353,8 +371,11 @@ else is forwarded to the chat.
 - **Agent changes (right pane):** `↑↓` `PgUp` `PgDn` scroll · `Esc` back to chat (or restores the zoom when this pane is zoomed).
 - **Zoom & minimize (S14):** every pane's top border carries two small buttons at its right end — `[_]` minimize and `[□]` zoom (`[_]`/`[^]` with `GENTLE_PARTITIONER_ICONS=ascii`). A click runs that pane's action even when it is not focused. A **zoomed** pane fills the whole body and hides the others; `z` again, or `Esc` outside an editing context, restores it. A **minimized** pane collapses to a one-row title bar (the sidebar to a 3-column icon strip) while the rest grow; several panes may be minimized but never all four. Click a minimized title bar or strip to restore it. The status line shows the zoomed pane and the minimized ones. While the chat is minimized its PTY keeps its last size, so gentle-shell does not reflow.
 - **Apps panel:** `↑↓` select an app or item · `Enter` drills in (app → items →
-  reply box) · type to edit the reply, `Enter` sends it, `Esc` steps back one
-  level and then to the chat. Click an app or item to select and focus it.
+  reply box) · type to edit the reply, `Enter` sends it, `a` opens the action
+  menu (e.g. *open*), `Esc` steps back one level and then to the chat. **Click
+  an app row to expand the panel and open that app.** When expanded, `+`/`-`
+  resize the panel between **40% and 70%** of the sidebar (default 60%, shown in
+  the panel title); the file tree always keeps at least five rows.
 - **Overlays:** `↑↓` move · `Enter` open · `Esc` close.
 - **Mouse:** click selects panes and places the editor cursor, opens files and
   tools; the wheel scrolls the chat, the editor, the diff, or the sidebar

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use gentle_apps::connector::Connector;
 use gentle_apps::oauth::{self, BrowserOpener, SlackConfig};
 use gentle_apps::protocol::Status;
-use gentle_apps::slack::SlackConnector;
+use gentle_apps::slack::{SlackConnector, SlackLinkOpener};
 use gentle_apps::store::{MemoryStore, StoredToken, TokenStore, SLACK_ACCOUNT};
 
 // ---------- fake HTTP server ----------
@@ -455,6 +455,89 @@ fn reply_propagates_a_slack_error() {
     let mut c = SlackConnector::new(cfg(&server.base()), Some("cid".into()), seeded_store(plain("xoxp-x")), "/tmp".into());
     c.poll().unwrap();
     assert_eq!(c.reply("C1:100.5", "hola").unwrap_err(), "channel_not_found");
+}
+
+// ---------- deep-link opener (S16) ----------
+
+struct RecOpener {
+    urls: Arc<Mutex<Vec<String>>>,
+    installed: bool,
+}
+impl SlackLinkOpener for RecOpener {
+    fn open(&self, url: &str) -> Result<(), String> {
+        self.urls.lock().unwrap().push(url.to_string());
+        Ok(())
+    }
+    fn slack_desktop_installed(&self) -> bool {
+        self.installed
+    }
+}
+
+fn deep_link_server() -> FakeServer {
+    FakeServer::start(|req| match req.path.as_str() {
+        "/auth.test" => FakeResp::json(r#"{"ok":true,"user_id":"U1","team_id":"T1"}"#),
+        "/search.messages" => FakeResp::json(&search_one(
+            r#"{"id":"C1","name":"general"}"#,
+            "https://x.slack.com/archives/C1/p100?cid=C1",
+        )),
+        _ => FakeResp::json(r#"{"ok":false,"error":"unexpected"}"#),
+    })
+}
+
+#[test]
+fn mention_items_offer_an_open_action() {
+    let server = deep_link_server();
+    let urls = Arc::new(Mutex::new(Vec::new()));
+    let opener = Box::new(RecOpener { urls, installed: true });
+    let mut c = SlackConnector::with_opener(
+        cfg(&server.base()),
+        Some("cid".into()),
+        seeded_store(plain("xoxp-x")),
+        "/tmp".into(),
+        opener,
+    );
+    let items = c.poll().unwrap();
+    assert_eq!(items.len(), 1);
+    assert!(items[0].actions.iter().any(|a| a.id == "open"), "slack items carry an open action");
+    assert!(items[0].kind.is_none(), "slack items stay flat (Enter still replies)");
+}
+
+#[test]
+fn open_uses_the_slack_desktop_deep_link_when_installed() {
+    let server = deep_link_server();
+    let urls = Arc::new(Mutex::new(Vec::new()));
+    let opener = Box::new(RecOpener { urls: urls.clone(), installed: true });
+    let mut c = SlackConnector::with_opener(
+        cfg(&server.base()),
+        Some("cid".into()),
+        seeded_store(plain("xoxp-x")),
+        "/tmp".into(),
+        opener,
+    );
+    c.poll().unwrap();
+    let msg = c.action("C1:100.5", "open").unwrap();
+    assert!(msg.contains("slack://channel?team=T1&id=C1"), "{msg}");
+    assert_eq!(urls.lock().unwrap().as_slice(), &["slack://channel?team=T1&id=C1".to_string()]);
+}
+
+#[test]
+fn open_falls_back_to_the_https_permalink_when_not_installed() {
+    let server = deep_link_server();
+    let urls = Arc::new(Mutex::new(Vec::new()));
+    let opener = Box::new(RecOpener { urls: urls.clone(), installed: false });
+    let mut c = SlackConnector::with_opener(
+        cfg(&server.base()),
+        Some("cid".into()),
+        seeded_store(plain("xoxp-x")),
+        "/tmp".into(),
+        opener,
+    );
+    c.poll().unwrap();
+    c.action("C1:100.5", "open").unwrap();
+    assert_eq!(
+        urls.lock().unwrap().as_slice(),
+        &["https://x.slack.com/archives/C1/p100?cid=C1".to_string()]
+    );
 }
 
 #[test]

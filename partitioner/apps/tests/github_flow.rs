@@ -271,22 +271,245 @@ fn poll_handler(rec: &Recorded) -> FakeResp {
 // ---------- tests ----------
 
 #[test]
-fn poll_returns_five_sections_with_counts_and_few_requests() {
+fn poll_returns_six_sections_with_counts_and_few_requests() {
     let server = FakeServer::start(poll_handler);
     let (token, _) = FixedToken::single("tok");
     let (mut c, _) = connector_with(&server, token, tempdir("poll")); // not a git repo
     let items = c.poll().unwrap();
-    assert_eq!(items.len(), 5);
+    assert_eq!(items.len(), 6);
     assert!(items.iter().all(|i| i.expandable));
     assert_eq!(items[0].title, "Review requested (3)");
     assert_eq!(items[1].title, "My PRs (2)");
     assert_eq!(items[2].title, "Assigned issues (5)");
     assert_eq!(items[3].title, "Repositories (1)");
     assert_eq!(items[4].title, "Worktrees (local) (0)");
+    // No local GitHub repo here, so Workflows is empty and makes no request.
+    assert_eq!(items[5].title, "Workflows (0)");
     assert_eq!(c.status(), Status::Connected);
-    // 3 searches + 1 repos = 4 HTTP requests; well under ~10.
+    // 3 searches + 1 repos = 4 HTTP requests (no runs request); well under ~6.
     assert_eq!(server.requests().len(), 4);
 }
+
+#[test]
+fn poll_counts_workflow_runs_for_a_local_repo_in_one_request() {
+    let server = FakeServer::start(|rec| {
+        if rec.path == "/repos/octo/repo/actions/runs" {
+            FakeResp::json(
+                r#"{"total_count":2,"workflow_runs":[
+                  {"id":1,"name":"CI","head_branch":"main","status":"completed","conclusion":"success","html_url":"https://github.com/octo/repo/actions/runs/1","created_at":"2020-01-01T00:00:00Z"},
+                  {"id":2,"name":"CI","head_branch":"main","status":"completed","conclusion":"failure","html_url":"https://github.com/octo/repo/actions/runs/2","created_at":"2020-01-01T00:00:00Z"}
+                ]}"#,
+            )
+        } else {
+            poll_handler(rec)
+        }
+    });
+    let repo = tempdir("wf-poll");
+    init_repo(&repo, "https://github.com/octo/repo.git");
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, repo.clone());
+    let items = c.poll().unwrap();
+    assert_eq!(items.len(), 6);
+    assert_eq!(items[5].title, "Workflows (2)");
+    // 3 searches + 1 repos + 1 runs = 5 requests; still under ~6.
+    let runs_requests = server.requests().iter().filter(|r| r.path == "/repos/octo/repo/actions/runs").count();
+    assert_eq!(runs_requests, 1, "exactly one runs request per poll");
+    assert!(server.requests().len() <= 6);
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn expand_workflows_lists_runs_with_status_glyphs_and_rerun_on_failure() {
+    let server = FakeServer::start(|rec| {
+        if rec.path == "/repos/octo/repo/actions/runs" {
+            FakeResp::json(
+                r#"{"total_count":3,"workflow_runs":[
+                  {"id":1,"name":"CI","head_branch":"main","status":"completed","conclusion":"success","html_url":"https://github.com/octo/repo/actions/runs/1","created_at":"2020-01-01T00:00:00Z"},
+                  {"id":2,"name":"Deploy","head_branch":"dev","status":"completed","conclusion":"failure","html_url":"https://github.com/octo/repo/actions/runs/2","created_at":"2020-01-01T00:00:00Z"},
+                  {"id":3,"name":"Nightly","head_branch":"main","status":"in_progress","conclusion":null,"html_url":"https://github.com/octo/repo/actions/runs/3","created_at":"2020-01-01T00:00:00Z"}
+                ]}"#,
+            )
+        } else {
+            poll_handler(rec)
+        }
+    });
+    let repo = tempdir("wf-expand");
+    init_repo(&repo, "https://github.com/octo/repo.git");
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, repo.clone());
+    let items = c.expand("sec:workflows").unwrap();
+    assert_eq!(items.len(), 3);
+    assert!(items[0].title.starts_with("CI \u{b7} main \u{b7} \u{2713}"), "success \u{2713}: {}", items[0].title);
+    assert!(items[1].title.starts_with("Deploy \u{b7} dev \u{b7} \u{2717}"), "failure \u{2717}: {}", items[1].title);
+    assert!(items[2].title.contains("\u{25cf}"), "in_progress \u{25cf}: {}", items[2].title);
+    assert!(items.iter().all(|i| i.expandable), "a run expands to its jobs");
+    // rerun_failed is offered only on the failed run.
+    assert!(items[0].actions.iter().all(|a| a.id != "rerun_failed"), "no rerun on success");
+    let rerun = items[1].actions.iter().find(|a| a.id == "rerun_failed").expect("rerun on failure");
+    assert!(rerun.confirm, "rerun asks for confirmation");
+    assert!(items[2].actions.iter().all(|a| a.id != "rerun_failed"), "no rerun while in progress");
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn expand_workflows_reports_no_local_github_repository_outside_a_repo() {
+    let server = FakeServer::start(poll_handler);
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, tempdir("wf-norepo"));
+    let items = c.expand("sec:workflows").unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].title, "no local GitHub repository");
+    assert!(items[0].actions.is_empty());
+}
+
+#[test]
+fn expand_a_run_lists_its_jobs_with_conclusions() {
+    let server = FakeServer::start(|rec| {
+        if rec.path == "/repos/octo/repo/actions/runs/2/jobs" {
+            FakeResp::json(
+                r#"{"jobs":[
+                  {"id":10,"name":"build","status":"completed","conclusion":"success","html_url":"https://github.com/octo/repo/actions/runs/2/job/10"},
+                  {"id":11,"name":"test","status":"completed","conclusion":"failure","html_url":"https://github.com/octo/repo/actions/runs/2/job/11"}
+                ]}"#,
+            )
+        } else {
+            FakeResp::json("{}")
+        }
+    });
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, urls) = connector_with(&server, token, tempdir("wf-jobs"));
+    let jobs = c.expand("run|octo|repo|2").unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].title, "\u{2713} build");
+    assert_eq!(jobs[1].title, "\u{2717} test");
+    assert!(jobs.iter().all(|j| !j.expandable));
+    // open on a job uses its html_url.
+    c.action(&jobs[0].id, "open").unwrap();
+    assert_eq!(urls.lock().unwrap().as_slice(), &["https://github.com/octo/repo/actions/runs/2/job/10".to_string()]);
+}
+
+#[test]
+fn open_and_rerun_failed_hit_the_run_endpoints() {
+    let reran = Arc::new(AtomicUsize::new(0));
+    let reran2 = reran.clone();
+    let server = FakeServer::start(move |rec| {
+        if rec.path == "/repos/octo/repo/actions/runs" {
+            FakeResp::json(
+                r#"{"total_count":1,"workflow_runs":[{"id":2,"name":"CI","head_branch":"main","status":"completed","conclusion":"failure","html_url":"https://github.com/octo/repo/actions/runs/2","created_at":"2020-01-01T00:00:00Z"}]}"#,
+            )
+        } else if rec.path == "/repos/octo/repo/actions/runs/2/rerun-failed-jobs" {
+            reran2.fetch_add(1, Ordering::SeqCst);
+            FakeResp { status: 201, headers: vec![], body: "{}".into() }
+        } else {
+            poll_handler(rec)
+        }
+    });
+    let repo = tempdir("wf-actions");
+    init_repo(&repo, "https://github.com/octo/repo.git");
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, urls) = connector_with(&server, token, repo.clone());
+    let runs = c.expand("sec:workflows").unwrap();
+    let run_id = runs[0].id.clone();
+    // open uses the run html_url.
+    c.action(&run_id, "open").unwrap();
+    assert_eq!(urls.lock().unwrap().as_slice(), &["https://github.com/octo/repo/actions/runs/2".to_string()]);
+    // rerun_failed POSTs to the rerun-failed-jobs endpoint.
+    let msg = c.action(&run_id, "rerun_failed").unwrap();
+    assert!(msg.contains("re-running failed jobs"), "{msg}");
+    assert_eq!(reran.load(Ordering::SeqCst), 1);
+    assert_eq!(c.action(&run_id, "rerun_failed").is_ok(), true);
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Builds a JSON array of `n` branch objects named `<prefix><i>`.
+fn branch_page(prefix: &str, n: usize) -> String {
+    let mut body = String::from("[");
+    for i in 0..n {
+        if i > 0 {
+            body.push(',');
+        }
+        body.push_str(&format!(r#"{{"name":"{prefix}{i}","commit":{{"sha":"s{prefix}{i}"}}}}"#));
+    }
+    body.push(']');
+    body
+}
+
+#[test]
+fn expand_repo_paginates_branches_across_pages() {
+    // A full first page (100) triggers a second request; the short second page
+    // (< 100) ends the walk with everything collected and no marker.
+    let server = FakeServer::start(|rec| {
+        if rec.path == "/user/repos" {
+            poll_handler(rec)
+        } else if rec.path == "/search/issues" {
+            FakeResp::json(r#"{"total_count":0,"items":[]}"#)
+        } else if rec.path == "/repos/octo/repo/pulls" {
+            FakeResp::json("[]")
+        } else if rec.path == "/repos/octo/repo/branches" {
+            if rec.query.contains("page=2") {
+                FakeResp::json(&branch_page("q", 3))
+            } else {
+                FakeResp::json(&branch_page("p", 100))
+            }
+        } else {
+            FakeResp::json("{}")
+        }
+    });
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, tempdir("branch-pages"));
+    c.poll().unwrap();
+    let items = c.expand("repo|octo|repo").unwrap();
+    assert_eq!(items.len(), 103, "100 from page 1 + 3 from page 2, no marker");
+    assert_eq!(items.first().unwrap().title, "p0");
+    assert_eq!(items.last().unwrap().title, "q2");
+    let branch_requests = server.requests().iter().filter(|r| r.path == "/repos/octo/repo/branches").count();
+    assert_eq!(branch_requests, 2, "two pages fetched");
+}
+
+#[test]
+fn branches_beyond_the_page_cap_get_a_more_marker() {
+    // Every page returns a full 100 branches, so the 5-page cap is hit and a
+    // "\u2026 more branches" marker is appended.
+    let server = FakeServer::start(|rec| {
+        if rec.path == "/repos/octo/repo/branches" {
+            FakeResp::json(&branch_page("b", 100))
+        } else {
+            FakeResp::json("[]")
+        }
+    });
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, tempdir("branch-cap"));
+    let items = c.expand("repo|octo|repo").unwrap();
+    // Exactly 5 pages fetched (100 each) = 500, capped, plus the marker.
+    let branch_requests = server.requests().iter().filter(|r| r.path == "/repos/octo/repo/branches").count();
+    assert_eq!(branch_requests, 5, "stops at the 5-page cap");
+    assert_eq!(items.len(), 501, "500 branches + the marker");
+    assert_eq!(items.last().unwrap().title, "\u{2026} more branches");
+}
+
+#[test]
+fn my_prs_graphql_rereads_the_token_once_on_401() {
+    let server = FakeServer::start(|rec| {
+        if rec.path == "/graphql" {
+            if rec.auth.as_deref() == Some("Bearer stale") {
+                FakeResp { status: 401, headers: vec![], body: r#"{"message":"Bad credentials"}"#.into() }
+            } else {
+                FakeResp::json(
+                    r#"{"data":{"search":{"nodes":[{"number":1,"title":"ok","url":"https://github.com/octo/repo/pull/1","repository":{"nameWithOwner":"octo/repo"},"author":{"login":"ann"},"commits":{"nodes":[{"commit":{"statusCheckRollup":{"state":"SUCCESS"}}}]}}]}}}"#,
+                )
+            }
+        } else {
+            FakeResp::json("{}")
+        }
+    });
+    let (token, calls) = FixedToken::sequence(&["stale", "fresh"]);
+    let (mut c, _) = connector_with(&server, token, tempdir("gql-401"));
+    let items = c.expand("sec:mine").unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "token read for stale, then re-read once");
+}
+
+
 
 #[test]
 fn the_token_never_appears_in_the_emitted_items_or_status() {
@@ -326,7 +549,7 @@ fn a_401_rereads_the_token_once_then_succeeds() {
     let (token, calls) = FixedToken::sequence(&["stale", "fresh"]);
     let (mut c, _) = connector_with(&server, token, tempdir("reauth"));
     let items = c.poll().unwrap();
-    assert_eq!(items.len(), 5);
+    assert_eq!(items.len(), 6);
     assert_eq!(c.status(), Status::Connected);
     // The source was read for "stale", then re-read once for "fresh".
     assert_eq!(calls.load(Ordering::SeqCst), 2);
@@ -355,7 +578,7 @@ fn a_rate_limited_response_backs_off_and_retries() {
     let (token, _) = FixedToken::single("tok");
     let (mut c, _) = connector_with(&server, token, tempdir("rl"));
     let items = c.poll().unwrap();
-    assert_eq!(items.len(), 5);
+    assert_eq!(items.len(), 6);
     // The first review-requested search was retried after the back-off.
     assert_eq!(hits.load(Ordering::SeqCst), 2);
 }

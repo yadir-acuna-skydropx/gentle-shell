@@ -23,6 +23,11 @@ use crate::protocol::{Item, ItemAction, Status};
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
 /// Cap on tree entries shown per level, with a trailing "… N more".
 pub const MAX_ENTRIES: usize = 500;
+/// Pages of branches to follow via the `Link` header before marking the rest
+/// truncated (100 per page = up to 500 entries, S16).
+pub const MAX_BRANCH_PAGES: usize = 5;
+/// Latest workflow runs fetched per poll (S16).
+pub const MAX_WORKFLOW_RUNS: usize = 20;
 /// Longest we honour a rate-limit back-off before giving up this cycle.
 const MAX_BACKOFF: u64 = 60;
 /// Timeout for a local git command.
@@ -359,6 +364,24 @@ impl GithubConnector {
         Ok(resp)
     }
 
+    /// POST a JSON body to a REST path (GraphQL and the rerun endpoint),
+    /// re-reading the token once on a 401 exactly like [`Self::api_get`].
+    fn api_post(&mut self, path: &str, body: &str) -> std::result::Result<GithubResponse, String> {
+        let token = match self.ensure_token()? {
+            Some(t) => t,
+            None => return Err(DISCONNECTED_DETAIL.to_string()),
+        };
+        let url = format!("{}{}", self.cfg.api_base, path);
+        let resp = http::github_post_json(&self.agent, &url, body, &token)?;
+        if resp.status == 401 {
+            self.token = self.token_source.token()?;
+            if let Some(t2) = self.token.clone() {
+                return http::github_post_json(&self.agent, &url, body, &t2);
+            }
+        }
+        Ok(resp)
+    }
+
     fn maybe_backoff(
         &self,
         resp: GithubResponse,
@@ -436,9 +459,11 @@ impl GithubConnector {
             "sec:issues" => self.expand_issues(),
             "sec:repos" => self.expand_repos(),
             "sec:worktrees" => self.expand_worktrees(),
+            "sec:workflows" => self.expand_workflows(),
             other if other.starts_with("repo|") => self.expand_repo(other),
             other if other.starts_with("branch|") => self.expand_branch(other),
             other if other.starts_with("tree|") => self.expand_tree(other),
+            other if other.starts_with("run|") => self.expand_run(other),
             other => Err(format!("cannot expand: {other}")),
         }
     }
@@ -454,18 +479,14 @@ impl GithubConnector {
     }
 
     fn expand_mine(&mut self) -> std::result::Result<Vec<Item>, String> {
-        let token = match self.ensure_token()? {
-            Some(t) => t,
-            None => return Err(DISCONNECTED_DETAIL.to_string()),
-        };
         let query = "query($q:String!){search(query:$q,type:ISSUE,first:50){nodes{... on PullRequest{number title url repository{nameWithOwner} author{login} commits(last:1){nodes{commit{statusCheckRollup{state}}}}}}}}";
         let body = serde_json::json!({
             "query": query,
             "variables": { "q": "is:pr is:open author:@me archived:false" }
         })
         .to_string();
-        let url = format!("{}/graphql", self.cfg.api_base);
-        let resp = http::github_post_json(&self.agent, &url, &body, &token)?;
+        // GraphQL re-reads the token once on a 401, like api_get.
+        let resp = self.api_post("/graphql", &body)?;
         let nodes = resp
             .body
             .pointer("/data/search/nodes")
@@ -545,6 +566,92 @@ impl GithubConnector {
         Ok(out)
     }
 
+    /// The local repo's `(owner, name)` from its `origin` remote, when the
+    /// engine's cwd is a GitHub repository.
+    fn local_repo(&self) -> Option<(String, String)> {
+        let origin = run_git(&self.repo_root, &["remote".into(), "get-url".into(), "origin".into()]).ok()?;
+        normalize_remote(&origin)
+    }
+
+    /// The latest workflow runs of the local GitHub repo (S16). Outside a local
+    /// GitHub repo it shows a single hint row. One HTTP request.
+    fn expand_workflows(&mut self) -> std::result::Result<Vec<Item>, String> {
+        match self.local_repo() {
+            Some((owner, name)) => self.fetch_workflow_runs(&owner, &name),
+            None => Ok(vec![no_local_github_item()]),
+        }
+    }
+
+    /// `GET /repos/{o}/{r}/actions/runs?per_page=20` → the latest runs as items.
+    fn fetch_workflow_runs(&mut self, owner: &str, name: &str) -> std::result::Result<Vec<Item>, String> {
+        let resp = self.api_get(&format!("/repos/{owner}/{name}/actions/runs?per_page={MAX_WORKFLOW_RUNS}"))?;
+        let runs = resp.body.get("workflow_runs").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let now = now_unix() as i64;
+        let mut out = Vec::new();
+        for r in &runs {
+            let wf = r.get("name").and_then(|v| v.as_str()).filter(|s| !s.is_empty()).unwrap_or("workflow");
+            let branch = r.get("head_branch").and_then(|v| v.as_str()).unwrap_or("");
+            let status = r.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let conclusion = r.get("conclusion").and_then(|v| v.as_str());
+            let run_id = r.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let html_url = r.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let created = r.get("run_started_at").or_else(|| r.get("created_at")).and_then(|v| v.as_str()).and_then(parse_iso8601);
+            let rel = created.map(|c| relative_time(now - c as i64)).unwrap_or_else(|| "unknown".to_string());
+            let glyph = run_glyph(status, conclusion);
+            let mut actions = vec![open_action()];
+            if conclusion == Some("failure") {
+                actions.push(rerun_failed_action());
+            }
+            let item = Item {
+                id: format!("run|{owner}|{name}|{run_id}"),
+                title: format!("{wf} \u{b7} {branch} \u{b7} {glyph} \u{b7} {rel}"),
+                text: String::new(),
+                ts: String::new(),
+                link: html_url,
+                kind: Some("run".into()),
+                expandable: true,
+                actions,
+            };
+            out.push(self.record(item));
+        }
+        Ok(out)
+    }
+
+    /// Jobs of a workflow run (`GET /…/actions/runs/{id}/jobs`), each with its
+    /// conclusion glyph.
+    fn expand_run(&mut self, id: &str) -> std::result::Result<Vec<Item>, String> {
+        // run|owner|name|runid
+        let parts: Vec<&str> = id.splitn(4, '|').collect();
+        let (owner, name, run_id) = (
+            parts.get(1).copied().unwrap_or(""),
+            parts.get(2).copied().unwrap_or(""),
+            parts.get(3).copied().unwrap_or(""),
+        );
+        let resp = self.api_get(&format!("/repos/{owner}/{name}/actions/runs/{run_id}/jobs"))?;
+        let jobs = resp.body.get("jobs").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+        let mut out = Vec::new();
+        for j in &jobs {
+            let jname = j.get("name").and_then(|v| v.as_str()).unwrap_or("job");
+            let status = j.get("status").and_then(|v| v.as_str()).unwrap_or("");
+            let conclusion = j.get("conclusion").and_then(|v| v.as_str());
+            let job_id = j.get("id").and_then(|v| v.as_u64()).unwrap_or(0);
+            let html_url = j.get("html_url").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let glyph = run_glyph(status, conclusion);
+            let item = Item {
+                id: format!("job|{owner}|{name}|{job_id}"),
+                title: format!("{glyph} {jname}"),
+                text: String::new(),
+                ts: String::new(),
+                link: html_url,
+                kind: Some("job".into()),
+                expandable: false,
+                actions: vec![open_action()],
+            };
+            out.push(self.record(item));
+        }
+        Ok(out)
+    }
+
     fn expand_repo(&mut self, id: &str) -> std::result::Result<Vec<Item>, String> {
         let parts: Vec<&str> = id.splitn(3, '|').collect();
         let (owner, name) = (parts.get(1).copied().unwrap_or(""), parts.get(2).copied().unwrap_or(""));
@@ -568,8 +675,7 @@ impl GithubConnector {
             }
         }
 
-        let resp = self.api_get(&format!("/repos/{owner}/{name}/branches?per_page=100"))?;
-        let arr = resp.body.as_array().cloned().unwrap_or_default();
+        let (arr, truncated) = self.fetch_branches(owner, name)?;
         let mut out = Vec::new();
         for b in arr.iter().take(MAX_ENTRIES) {
             let bname = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -596,10 +702,40 @@ impl GithubConnector {
             };
             out.push(self.record(item));
         }
-        if arr.len() > MAX_ENTRIES {
-            out.push(more_item(arr.len() - MAX_ENTRIES));
+        if truncated {
+            out.push(more_pages_item());
         }
         Ok(out)
+    }
+
+    /// Fetches a repo's branches a page at a time (`?per_page=100&page=N`) up to
+    /// [`MAX_BRANCH_PAGES`] pages / [`MAX_ENTRIES`] entries. Returns the entries
+    /// and whether more remain beyond the cap (for a `… more` marker, S16). A
+    /// short final page (< 100) ends the walk; a full last page at the cap is
+    /// treated as possibly having more.
+    fn fetch_branches(&mut self, owner: &str, name: &str) -> std::result::Result<(Vec<serde_json::Value>, bool), String> {
+        const PER_PAGE: usize = 100;
+        let mut all: Vec<serde_json::Value> = Vec::new();
+        let mut truncated = false;
+        for page in 1..=MAX_BRANCH_PAGES {
+            let resp = self.api_get(&format!("/repos/{owner}/{name}/branches?per_page={PER_PAGE}&page={page}"))?;
+            let arr = resp.body.as_array().cloned().unwrap_or_default();
+            let n = arr.len();
+            all.extend(arr);
+            if n < PER_PAGE {
+                break; // short page: this was the last one
+            }
+            if page == MAX_BRANCH_PAGES || all.len() >= MAX_ENTRIES {
+                // A full page at the cap: there may be more beyond it.
+                truncated = true;
+                break;
+            }
+        }
+        if all.len() > MAX_ENTRIES {
+            all.truncate(MAX_ENTRIES);
+            truncated = true;
+        }
+        Ok((all, truncated))
     }
 
     fn expand_branch(&mut self, id: &str) -> std::result::Result<Vec<Item>, String> {
@@ -763,6 +899,10 @@ impl GithubConnector {
                 let (owner, name, branch) = parse_branch_id(item_id).ok_or("checkout needs a branch")?;
                 self.checkout(&owner, &name, &branch)
             }
+            "rerun_failed" => {
+                let (owner, name, run_id) = parse_run_id(item_id).ok_or("rerun_failed needs a run")?;
+                self.rerun_failed(&owner, &name, &run_id)
+            }
             other => Err(format!("unknown action: {other}")),
         }
     }
@@ -826,6 +966,18 @@ impl GithubConnector {
         Ok(target_str)
     }
 
+    /// Re-runs the failed jobs of a run (`POST /…/runs/{id}/rerun-failed-jobs`).
+    /// Offered only on a failed run and confirmed in the panel first (S16).
+    fn rerun_failed(&mut self, owner: &str, name: &str, run_id: &str) -> std::result::Result<String, String> {
+        let resp = self.api_post(&format!("/repos/{owner}/{name}/actions/runs/{run_id}/rerun-failed-jobs"), "{}")?;
+        if (200..300).contains(&resp.status) {
+            Ok(format!("re-running failed jobs for run {run_id}"))
+        } else {
+            let msg = resp.body.get("message").and_then(|v| v.as_str()).unwrap_or("rerun failed");
+            Err(format!("rerun failed ({}): {msg}", resp.status))
+        }
+    }
+
     fn checkout(&self, owner: &str, name: &str, branch: &str) -> std::result::Result<String, String> {
         validate_branch(&self.repo_root, branch)?;
         self.require_matching_repo(owner, name)?;
@@ -861,6 +1013,61 @@ fn more_item(n: usize) -> Item {
         expandable: false,
         actions: vec![],
     }
+}
+
+/// Marker shown when branches exceed the pagination cap (count unknown, S16).
+fn more_pages_item() -> Item {
+    Item {
+        id: "more".into(),
+        title: "\u{2026} more branches".into(),
+        text: String::new(),
+        ts: String::new(),
+        link: String::new(),
+        kind: Some("more".into()),
+        expandable: false,
+        actions: vec![],
+    }
+}
+
+/// Hint row when the engine's cwd is not a local GitHub repository (S16).
+fn no_local_github_item() -> Item {
+    Item {
+        id: "wf:none".into(),
+        title: "no local GitHub repository".into(),
+        text: String::new(),
+        ts: String::new(),
+        link: String::new(),
+        kind: Some("run".into()),
+        expandable: false,
+        actions: vec![],
+    }
+}
+
+fn rerun_failed_action() -> ItemAction {
+    ItemAction { id: "rerun_failed".into(), label: "Re-run failed jobs".into(), confirm: true }
+}
+
+/// Status/conclusion glyph for a workflow run or job (S16): ✓ success,
+/// ✗ failure, ● in_progress/queued, ⊘ cancelled, – other.
+pub fn run_glyph(status: &str, conclusion: Option<&str>) -> char {
+    if status != "completed" {
+        return '\u{25cf}'; // ● queued / in_progress
+    }
+    match conclusion {
+        Some("success") => '\u{2713}',   // ✓
+        Some("failure") => '\u{2717}',   // ✗
+        Some("cancelled") => '\u{2298}', // ⊘
+        _ => '\u{2013}',                 // – other
+    }
+}
+
+/// `run|owner|name|runid` → `(owner, name, runid)`.
+fn parse_run_id(id: &str) -> Option<(String, String, String)> {
+    let parts: Vec<&str> = id.splitn(4, '|').collect();
+    if parts.first() != Some(&"run") || parts.len() < 4 {
+        return None;
+    }
+    Some((parts[1].to_string(), parts[2].to_string(), parts[3].to_string()))
 }
 
 /// `branch|owner|name|sha|branch` → `(owner, name, branch)`.
@@ -951,6 +1158,12 @@ impl Connector for GithubConnector {
         self.fetch_repos()?;
         let repo_count = self.repos.len();
         let wt_count = self.worktrees()?.map(|w| w.len()).unwrap_or(0);
+        // The latest workflow runs of the LOCAL repo: one request when the cwd
+        // is a GitHub repo, none otherwise (keeps the poll ≤ ~6 requests, S16).
+        let workflow_count = match self.local_repo() {
+            Some((owner, name)) => self.fetch_workflow_runs(&owner, &name)?.len(),
+            None => 0,
+        };
 
         self.status = Status::Connected;
         self.detail = Some("connected".to_string());
@@ -971,6 +1184,7 @@ impl Connector for GithubConnector {
             section("sec:issues", "Assigned issues", issues),
             section("sec:repos", "Repositories", repo_count as u64),
             section("sec:worktrees", "Worktrees (local)", wt_count as u64),
+            section("sec:workflows", "Workflows", workflow_count as u64),
         ])
     }
 
@@ -1061,5 +1275,22 @@ mod tests {
             Some(("octo".into(), "repo".into(), "feat/x".into()))
         );
         assert_eq!(parse_branch_id("repo|octo|repo"), None);
+    }
+
+    #[test]
+    fn run_glyph_maps_status_and_conclusion() {
+        assert_eq!(run_glyph("completed", Some("success")), '\u{2713}');
+        assert_eq!(run_glyph("completed", Some("failure")), '\u{2717}');
+        assert_eq!(run_glyph("completed", Some("cancelled")), '\u{2298}');
+        assert_eq!(run_glyph("completed", Some("timed_out")), '\u{2013}');
+        assert_eq!(run_glyph("completed", None), '\u{2013}');
+        assert_eq!(run_glyph("in_progress", None), '\u{25cf}');
+        assert_eq!(run_glyph("queued", None), '\u{25cf}');
+    }
+
+    #[test]
+    fn parse_run_id_extracts_owner_name_run() {
+        assert_eq!(parse_run_id("run|octo|repo|42"), Some(("octo".into(), "repo".into(), "42".into())));
+        assert_eq!(parse_run_id("branch|octo|repo|s|x"), None);
     }
 }
