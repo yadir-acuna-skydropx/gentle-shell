@@ -45,6 +45,42 @@ repainted — only the changed cells of that fragment are written out.
   *open in Slack Desktop*) and **GitHub** (repos, branches, trees, PRs, issues,
   local worktrees and **Actions workflows**, with simple actions).
   Disable the engine and panel with `--no-apps`.
+- **Code explainer (S17).** Select code in the editor (Shift+arrows/Home/End, or
+  drag the mouse; `Ctrl+C` copies the selection) and press **`e`** — or
+  right-click the selection — to open a popup that **streams an explanation** of
+  the selection and answers follow-up questions in the same conversation. With
+  no selection it explains the current line ±10 lines. It uses **Claude Haiku**
+  over the Anthropic API via a separate Rust process, `gentle-explain`; the API
+  key lives in the system keyring. Disable it with `--no-explain`.
+
+## Code explainer (`gentle-explain`)
+
+The partitioner spawns the independent `gentle-explain` binary (found next to
+the partitioner, else on `PATH`), talks to it over NDJSON on stdio, and
+restarts it with backoff if it exits. The popup shows a *thinking…* state while
+waiting, the streamed text with word wrap and wheel/PgUp/PgDn scroll, inline
+errors, and a one-line question input (Enter asks a follow-up; Esc closes and
+cancels any in-flight request). When no key is stored it shows
+`Set your Anthropic API key: `gentle-explain key set`` and sends nothing.
+
+Manage the key (never printed):
+
+```
+gentle-explain key set     # read the key (no echo / stdin), validate it, store it
+gentle-explain key status  # prints "API key: set" or "API key: not set"
+gentle-explain key clear   # remove the stored key
+```
+
+The key is stored in the system keyring (service `gentle-engines`, account
+`anthropic`) and only ever travels in the `x-api-key` header — never in logs,
+errors, `Debug`, the protocol or panic messages. The model is resolved at
+runtime (`GET /v1/models`, newest **haiku**); override it in
+`~/.config/gentle-partitioner/engines.toml` under `[explain] model = "…"`, and
+set the default output language with `lang` (default `"es"`). The Anthropic API
+version header is pinned to `2026-10-21` (a single constant in
+`engines/src/anthropic.rs`). The shared Anthropic client, keystore and NDJSON
+protocol live in the `gentle-engines` library so the T18 `gentle-arch` engine
+can reuse them.
 
 ## Apps engine (`gentle-apps`)
 
@@ -320,6 +356,7 @@ gentle-partitioner --help        # usage
 gentle-partitioner --version     # version
 gentle-partitioner --no-predict  # disable the prediction engine and server
 gentle-partitioner --no-apps     # disable the apps engine and the apps panel
+gentle-partitioner --no-explain  # disable the code-explainer engine
 ```
 
 The child process inherits the current working directory, with
@@ -420,8 +457,16 @@ else is forwarded to the chat.
   incrementing request ids, exponential-backoff restart, and kill-on-quit (S12).
 - **`apps_panel.rs`** — the apps-panel state (app list, per-app items, reply box
   with UTF-8 horizontal scroll) and its message/ result handling (S12).
+- **`explain_client.rs`** — supervises the independent `gentle-explain` process
+  (spawn, NDJSON reader thread, writer, backoff restart, kill-on-quit), mirroring
+  `apps_client.rs` (S17).
 - **`keys.rs`** — encodes crossterm key events as the bytes a terminal sends to
   a PTY child.
+- **`engines/`** — the `gentle-engines` workspace member: the Anthropic Messages
+  client (`anthropic` — SSE streaming, model resolution, bounded retries), the
+  keyring `keystore`, the NDJSON `protocol`, selection/context caps (`context`),
+  the stdio explainer `engine`/`backend` and the `key` CLI. Builds the
+  `gentle-explain` binary (S17); designed for the T18 `gentle-arch` to reuse.
 - **`apps/`** — the `gentle-apps` workspace member: the shared `protocol`
   (NDJSON message types), the `Connector` trait, the threaded stdio `engine`,
   and the live Slack connector with its browser OAuth/PKCE login (`pkce`,
@@ -448,6 +493,9 @@ else is forwarded to the chat.
 - **T13 (S12, S13)** — the live Slack connector (browser OAuth + PKCE login,
   token in the system keyring, mentions of the user, reply in the thread):
   **done**.
+- **T17 (S17)** — code explainer engine (`gentle-explain`): editor text
+  selection, a streaming explanation popup with follow-up Q&A, Claude Haiku over
+  the Anthropic API with the key in the keyring: **done**.
 
 ## Fast development loop
 

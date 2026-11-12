@@ -49,6 +49,11 @@ pub struct Editor {
     mode: Option<u32>,
     /// `Some(reason)` when the buffer cannot be edited.
     readonly: Option<String>,
+    /// Selection anchor (line, char-col). The selection spans anchor..cursor;
+    /// `None` means no selection.
+    sel_anchor: Option<(usize, usize)>,
+    /// Internal clipboard filled by Ctrl+C (no system clipboard needed).
+    pub clipboard: String,
 }
 
 /// Expands tabs to [`TAB_WIDTH`] columns for display.
@@ -153,6 +158,8 @@ impl Editor {
             load_hash: 0,
             mode: None,
             readonly: Some(reason.to_string()),
+            sel_anchor: None,
+            clipboard: String::new(),
         }
     }
 
@@ -199,6 +206,8 @@ impl Editor {
             load_hash,
             mode,
             readonly: None,
+            sel_anchor: None,
+            clipboard: String::new(),
         }
     }
 
@@ -230,6 +239,111 @@ impl Editor {
         self.lines.len().to_string().len() + 1
     }
 
+    // --- Selection (S17 editor, net-new) ---------------------------------
+
+    /// True when a non-empty selection is active.
+    pub fn has_selection(&self) -> bool {
+        self.selection_range().is_some()
+    }
+
+    /// Clears any active selection.
+    pub fn clear_selection(&mut self) {
+        self.sel_anchor = None;
+    }
+
+    /// The normalized selection as `(start, end)` char-column coordinates, or
+    /// `None` when there is no selection.
+    pub fn selection_range(&self) -> Option<((usize, usize), (usize, usize))> {
+        let a = self.sel_anchor?;
+        let b = (self.cursor_line, self.cursor_col);
+        if a == b {
+            return None;
+        }
+        Some(if a <= b { (a, b) } else { (b, a) })
+    }
+
+    /// The selection in tab-expanded (visual) columns as
+    /// `((start_line, start_vcol), (end_line, end_vcol))`, for rendering the
+    /// highlight. `None` when there is no selection.
+    pub fn selection_visual(&self) -> Option<((usize, usize), (usize, usize))> {
+        let ((sl, sc), (el, ec)) = self.selection_range()?;
+        Some(((sl, expanded_col(&self.lines[sl], sc)), (el, expanded_col(&self.lines[el], ec))))
+    }
+
+    /// The selected text (with `\n` between lines), or `None`.
+    pub fn selected_text(&self) -> Option<String> {
+        let ((sl, sc), (el, ec)) = self.selection_range()?;
+        Some(self.text_between(sl, sc, el, ec))
+    }
+
+    fn text_between(&self, sl: usize, sc: usize, el: usize, ec: usize) -> String {
+        if sl == el {
+            let line = &self.lines[sl];
+            return line[byte_idx(line, sc)..byte_idx(line, ec)].to_string();
+        }
+        let mut out = String::new();
+        let first = &self.lines[sl];
+        out.push_str(&first[byte_idx(first, sc)..]);
+        out.push('\n');
+        for l in &self.lines[sl + 1..el] {
+            out.push_str(l);
+            out.push('\n');
+        }
+        let last = &self.lines[el];
+        out.push_str(&last[..byte_idx(last, ec)]);
+        out
+    }
+
+    /// Copies the selection to the internal clipboard. Returns true if anything
+    /// was copied.
+    pub fn copy_selection(&mut self) -> bool {
+        match self.selected_text() {
+            Some(t) => {
+                self.clipboard = t;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Deletes the selection, leaving the cursor at its start. Returns true if
+    /// anything was removed.
+    fn delete_selection(&mut self) -> bool {
+        let Some(((sl, sc), (el, ec))) = self.selection_range() else {
+            return false;
+        };
+        if sl == el {
+            let line = &mut self.lines[sl];
+            let s = byte_idx(line, sc);
+            let e = byte_idx(line, ec);
+            line.replace_range(s..e, "");
+        } else {
+            let tail = self.lines[el][byte_idx(&self.lines[el], ec)..].to_string();
+            let first = &mut self.lines[sl];
+            let s = byte_idx(first, sc);
+            first.replace_range(s.., "");
+            self.lines[sl].push_str(&tail);
+            self.lines.drain(sl + 1..=el);
+        }
+        self.cursor_line = sl;
+        self.cursor_col = sc;
+        self.sel_anchor = None;
+        self.dirty = true;
+        true
+    }
+
+    /// Before a movement key: start the anchor when extending with Shift, or
+    /// clear the selection on a plain move.
+    fn update_anchor_for_move(&mut self, shift: bool) {
+        if shift {
+            if self.sel_anchor.is_none() {
+                self.sel_anchor = Some((self.cursor_line, self.cursor_col));
+            }
+        } else {
+            self.sel_anchor = None;
+        }
+    }
+
     /// Applies an editing key. Returns true when the buffer content changed.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
         if self.readonly.is_some() || key.kind == KeyEventKind::Release {
@@ -237,21 +351,53 @@ impl Editor {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // Ctrl+C copies the selection to the internal clipboard.
+        if ctrl && matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C')) {
+            self.copy_selection();
+            return false;
+        }
+        // Shift extends the selection on a movement key; a plain move clears it.
+        if matches!(
+            key.code,
+            KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Home | KeyCode::End | KeyCode::PageUp | KeyCode::PageDown
+        ) {
+            self.update_anchor_for_move(shift);
+        }
         match key.code {
             KeyCode::Char(c) if !ctrl && !alt => {
+                if self.has_selection() {
+                    self.delete_selection();
+                }
                 self.insert_char(c);
                 true
             }
             KeyCode::Tab => {
+                if self.has_selection() {
+                    self.delete_selection();
+                }
                 self.insert_char('\t');
                 true
             }
             KeyCode::Enter => {
+                if self.has_selection() {
+                    self.delete_selection();
+                }
                 self.split_line();
                 true
             }
-            KeyCode::Backspace => self.backspace(),
-            KeyCode::Delete => self.delete(),
+            KeyCode::Backspace => {
+                if self.has_selection() {
+                    return self.delete_selection();
+                }
+                self.backspace()
+            }
+            KeyCode::Delete => {
+                if self.has_selection() {
+                    return self.delete_selection();
+                }
+                self.delete()
+            }
             KeyCode::Left => {
                 self.move_left();
                 false
@@ -401,15 +547,33 @@ impl Editor {
         self.move_vert(delta);
     }
 
-    /// Places the cursor from a click inside the editor's inner rect.
-    pub fn click(&mut self, inner_x: u16, inner_y: u16, gutter: usize, col: u16, row: u16) {
-        if self.readonly.is_some() {
-            return;
-        }
+    /// Moves the cursor to the editor coordinate under `(col, row)`.
+    fn set_cursor_from(&mut self, inner_x: u16, inner_y: u16, gutter: usize, col: u16, row: u16) {
         let line = (self.scroll_row + row.saturating_sub(inner_y) as usize).min(self.lines.len() - 1);
         self.cursor_line = line;
         let vis = self.scroll_col + (col.saturating_sub(inner_x) as usize).saturating_sub(gutter);
         self.cursor_col = col_from_visual(&self.lines[line], vis).min(char_len(&self.lines[line]));
+    }
+
+    /// Places the cursor from a click; a plain click clears the selection.
+    pub fn click(&mut self, inner_x: u16, inner_y: u16, gutter: usize, col: u16, row: u16) {
+        if self.readonly.is_some() {
+            return;
+        }
+        self.sel_anchor = None;
+        self.set_cursor_from(inner_x, inner_y, gutter, col, row);
+    }
+
+    /// Extends a selection by dragging: the anchor is dropped at the drag start
+    /// and the cursor follows the pointer (`MouseEventKind::Drag(Left)`).
+    pub fn drag(&mut self, inner_x: u16, inner_y: u16, gutter: usize, col: u16, row: u16) {
+        if self.readonly.is_some() {
+            return;
+        }
+        if self.sel_anchor.is_none() {
+            self.sel_anchor = Some((self.cursor_line, self.cursor_col));
+        }
+        self.set_cursor_from(inner_x, inner_y, gutter, col, row);
     }
 
     /// Keeps the cursor visible within a text area of `height` rows and `width`
@@ -494,6 +658,12 @@ mod tests {
     }
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+    fn shift(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::SHIFT)
+    }
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
     fn roundtrip(name: &str, raw: &[u8]) {
@@ -597,6 +767,89 @@ mod tests {
         let mode = fs::metadata(&f).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);
         assert_eq!(fs::read(&f).unwrap(), b"#echo hi\n");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn shift_arrows_extend_and_a_plain_move_clears_selection() {
+        let d = tmp("sel-shift");
+        fs::write(d.join("f.txt"), "hello world\n").unwrap();
+        let mut e = Editor::open(&d, Path::new("f.txt"));
+        assert!(!e.has_selection());
+        // Shift+Right twice selects "he".
+        e.handle_key(shift(KeyCode::Right));
+        e.handle_key(shift(KeyCode::Right));
+        assert!(e.has_selection());
+        assert_eq!(e.selected_text().as_deref(), Some("he"));
+        // Shift+End extends to end of line.
+        e.handle_key(shift(KeyCode::End));
+        assert_eq!(e.selected_text().as_deref(), Some("hello world"));
+        // A plain (non-shift) move clears the selection.
+        e.handle_key(key(KeyCode::Left));
+        assert!(!e.has_selection());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn drag_selects_and_ctrl_c_copies_across_lines() {
+        let d = tmp("sel-drag");
+        fs::write(d.join("f.txt"), "abc\ndef\n").unwrap();
+        let mut e = Editor::open(&d, Path::new("f.txt"));
+        // Anchor at (0,1) then drag to (1,2): selects "bc\nde".
+        e.cursor_line = 0;
+        e.cursor_col = 1;
+        // inner_x=1, inner_y=1, gutter=0 for simplicity; drag to row for line 1, col for col 2.
+        e.drag(1, 1, 0, 1 + 2, 1 + 1);
+        assert_eq!(e.selected_text().as_deref(), Some("bc\nde"));
+        assert!(e.handle_key(ctrl('c')) == false); // copy does not change content
+        assert_eq!(e.clipboard, "bc\nde");
+        assert!(e.has_selection(), "copy keeps the selection");
+        assert!(!e.dirty, "copy does not dirty the buffer");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn typing_replaces_the_selection_and_delete_removes_it() {
+        let d = tmp("sel-replace");
+        fs::write(d.join("f.txt"), "hello\n").unwrap();
+        let mut e = Editor::open(&d, Path::new("f.txt"));
+        e.handle_key(shift(KeyCode::End)); // select "hello"
+        assert!(e.handle_key(ch('X'))); // typing replaces
+        assert_eq!(e.lines[0], "X");
+        assert!(!e.has_selection());
+
+        // Delete key removes a selection without needing a replacement char.
+        fs::write(d.join("g.txt"), "abcdef\n").unwrap();
+        let mut g = Editor::open(&d, Path::new("g.txt"));
+        g.handle_key(key(KeyCode::Right));
+        g.handle_key(shift(KeyCode::Right));
+        g.handle_key(shift(KeyCode::Right)); // select "bc"
+        assert!(g.handle_key(key(KeyCode::Delete)));
+        assert_eq!(g.lines[0], "adef");
+        assert!(!g.has_selection());
+        // Backspace also deletes a multi-char selection in one step.
+        fs::write(d.join("h.txt"), "one\ntwo\n").unwrap();
+        let mut h = Editor::open(&d, Path::new("h.txt"));
+        h.handle_key(shift(KeyCode::Down));
+        h.handle_key(shift(KeyCode::End)); // select "one\ntwo"
+        assert!(h.handle_key(key(KeyCode::Backspace)));
+        assert_eq!(h.lines, [""]);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn save_is_byte_identical_after_selection_then_clear() {
+        // Selecting, copying and clearing must not change the bytes written.
+        let d = tmp("sel-save");
+        fs::write(d.join("f.txt"), "one\r\ntwo\r\n").unwrap();
+        let mut e = Editor::open(&d, Path::new("f.txt"));
+        e.handle_key(shift(KeyCode::Down));
+        e.handle_key(shift(KeyCode::End));
+        e.handle_key(ctrl('c')); // copy
+        e.handle_key(key(KeyCode::Left)); // clear selection, no edit
+        assert!(!e.dirty);
+        assert_eq!(e.save(), SaveOutcome::Saved);
+        assert_eq!(fs::read(d.join("f.txt")).unwrap(), b"one\r\ntwo\r\n");
         fs::remove_dir_all(d).unwrap();
     }
 

@@ -1,0 +1,19 @@
+[package]
+name = "gentle-engines"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "gentle_engines"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gentle-explain"
+path = "src/bin/gentle-explain.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3", features = ["json"] }
+keyring = { version = "3", default-features = false, features = ["async-secret-service", "crypto-rust", "async-io"] }
+rpassword = "7"

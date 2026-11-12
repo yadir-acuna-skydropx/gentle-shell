@@ -26,6 +26,7 @@ use ratatui::Terminal;
 
 use gentle_partitioner::app::{draw, Action, App, Focus};
 use gentle_partitioner::apps_client::{AppsClient, AppsEvent};
+use gentle_partitioner::explain_client::{ExplainClient, ExplainEvent};
 use gentle_partitioner::pane::PtyPane;
 use gentle_partitioner::predict::{self, Engine};
 use gentle_partitioner::predict_server::PredictServer;
@@ -47,11 +48,13 @@ OPTIONS:
     -V, --version    Print version
         --no-predict Disable the local n-gram prediction engine and server
         --no-apps    Disable the apps engine and the bottom-left apps panel
+        --no-explain Disable the code-explainer engine (gentle-explain)
 
 Without a command it runs `gentle-shell` inside a partitioned terminal.
 Everything after `--` is launched instead of the default command.
 With prediction on, the child sees GENTLE_PREDICT_URL and GENTLE_PREDICT_TOKEN.
 The apps engine (gentle-apps) runs as a separate process unless --no-apps.
+The explainer engine (gentle-explain) runs as a separate process unless --no-explain.
 ";
 
 type Backend = CrosstermBackend<io::Stdout>;
@@ -66,6 +69,8 @@ enum Event {
     Statuses(HashMap<PathBuf, GitStatus>),
     /// An event from the independent apps engine (S12).
     Apps(AppsEvent),
+    /// An event from the independent explainer engine (S17).
+    Explain(ExplainEvent),
 }
 
 fn main() {
@@ -94,7 +99,7 @@ fn run() -> Result<i32> {
 
     install_panic_hook();
     let mut terminal = setup_terminal().context("entering raw mode / alternate screen")?;
-    let result = event_loop(&mut terminal, &command, opts.predict, opts.apps);
+    let result = event_loop(&mut terminal, &command, opts.predict, opts.apps, opts.explain);
     // Always restore the terminal, even when the loop failed.
     let _ = restore_terminal();
     result.map(|_| 0)
@@ -104,6 +109,7 @@ struct RunOpts {
     command: Vec<String>,
     predict: bool,
     apps: bool,
+    explain: bool,
 }
 
 enum ParseOutcome {
@@ -116,6 +122,7 @@ fn parse_args(args: Vec<String>) -> Result<ParseOutcome> {
     let mut command: Vec<String> = Vec::new();
     let mut predict = true;
     let mut apps = true;
+    let mut explain = true;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -132,6 +139,9 @@ fn parse_args(args: Vec<String>) -> Result<ParseOutcome> {
             "--no-apps" => {
                 apps = false;
             }
+            "--no-explain" => {
+                explain = false;
+            }
             "--" => {
                 command.extend(iter.by_ref());
                 break;
@@ -146,7 +156,7 @@ fn parse_args(args: Vec<String>) -> Result<ParseOutcome> {
     if command.is_empty() {
         command.push(DEFAULT_COMMAND.to_string());
     }
-    Ok(ParseOutcome::Run(RunOpts { command, predict, apps }))
+    Ok(ParseOutcome::Run(RunOpts { command, predict, apps, explain }))
 }
 
 /// Shared handles for the prediction engine and its local server.
@@ -215,7 +225,13 @@ fn install_panic_hook() {
     }));
 }
 
-fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enabled: bool, apps_enabled: bool) -> Result<()> {
+fn event_loop(
+    terminal: &mut Terminal<Backend>,
+    command: &[String],
+    predict_enabled: bool,
+    apps_enabled: bool,
+    explain_enabled: bool,
+) -> Result<()> {
     let root = std::env::current_dir().context("reading the current directory")?;
     let mut app = App::new(root.clone());
 
@@ -258,6 +274,26 @@ fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enab
         None
     };
 
+    // The explainer engine also runs as a separate process (S17), bridged onto
+    // the single UI channel so redraws happen only on events (S11).
+    let explain = if explain_enabled {
+        let (ex_tx, ex_rx) = mpsc::channel::<ExplainEvent>();
+        let ui_tx = tx.clone();
+        std::thread::Builder::new()
+            .name("explain-bridge".into())
+            .spawn(move || {
+                while let Ok(ev) = ex_rx.recv() {
+                    if ui_tx.send(Event::Explain(ev)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn explain bridge");
+        Some(ExplainClient::spawn(ex_tx))
+    } else {
+        None
+    };
+
     // Coalesce PTY wake-ups: the reader thread flips the flag and only sends a
     // PtyOutput when none is pending, so the UI never floods on fast output.
     let pty_pending = Arc::new(AtomicBool::new(false));
@@ -286,6 +322,11 @@ fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enab
                             a.send(msg);
                         }
                     }
+                    Action::Explain(msg) => {
+                        if let Some(e) = &explain {
+                            e.send(msg);
+                        }
+                    }
                     Action::Quit => break,
                 }
                 // A save asks for a fresh git status off the UI thread.
@@ -304,6 +345,11 @@ fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enab
                 Action::Apps(msg) => {
                     if let Some(a) = &apps {
                         a.send(msg);
+                    }
+                }
+                Action::Explain(msg) => {
+                    if let Some(e) = &explain {
+                        e.send(msg);
                     }
                 }
                 Action::Quit => break,
@@ -330,6 +376,8 @@ fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enab
             Event::Statuses(statuses) => app.apply_statuses(statuses),
             Event::Apps(AppsEvent::Msg(msg)) => app.apply_apps_msg(msg),
             Event::Apps(AppsEvent::Offline) => app.set_apps_offline(),
+            Event::Explain(ExplainEvent::Msg(msg)) => app.apply_explain_msg(msg),
+            Event::Explain(ExplainEvent::Offline) => app.set_explain_offline(),
         }
 
         // The child owns the session lifetime: when it exits, so do we.
@@ -340,9 +388,12 @@ fn event_loop(terminal: &mut Terminal<Backend>, command: &[String], predict_enab
             redraw(terminal, &mut app, &mut pty)?;
         }
     }
-    // Kill the apps engine on quit so no child is left behind.
+    // Kill the apps and explainer engines on quit so no child is left behind.
     if let Some(a) = &apps {
         a.shutdown();
+    }
+    if let Some(e) = &explain {
+        e.shutdown();
     }
     Ok(())
 }

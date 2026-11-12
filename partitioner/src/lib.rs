@@ -4,6 +4,7 @@ pub mod app;
 pub mod apps_client;
 pub mod apps_panel;
 pub mod editor;
+pub mod explain_client;
 pub mod highlight;
 pub mod icons;
 pub mod keys;

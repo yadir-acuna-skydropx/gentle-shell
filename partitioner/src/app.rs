@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use gentle_apps::protocol::{ClientMsg, EngineMsg, Status as AppState};
+use gentle_engines::protocol::{ClientMsg as ExplainReq, EngineMsg as ExplainMsg, KeyState as ExplainKey};
 
 use crate::apps_panel::{AppsPanel, View};
 use crate::editor::{Editor, SaveOutcome};
@@ -46,6 +47,38 @@ pub enum Overlay {
     Changes,
     Help,
     Apps,
+    /// The code-explainer popup (S17): streaming explanation + follow-up Q&A.
+    Explain,
+}
+
+/// State of the explainer popup (S17). Lives beside [`Overlay::Explain`]; the
+/// API key never reaches this struct.
+#[derive(Debug, Clone, Default)]
+pub struct ExplainUi {
+    /// Id of the in-flight explain/ask request.
+    pub id: u64,
+    /// Monotonic request-id source.
+    next_id: u64,
+    /// "Explain · <path> L<a>-<b>".
+    pub title: String,
+    /// Streamed explanation text so far.
+    pub body: String,
+    /// An inline error (engine offline, API failure, missing key).
+    pub error: Option<String>,
+    /// True while waiting for the first delta.
+    pub thinking: bool,
+    /// True while a request is streaming.
+    pub in_flight: bool,
+    /// The one-line follow-up question input.
+    pub question: String,
+    /// Lines scrolled up from the bottom of the body.
+    pub scroll: usize,
+    /// True when no API key is stored (show the setup hint, send nothing).
+    pub key_missing: bool,
+    /// Resolved model id, for the header.
+    pub model: String,
+    /// True when the engine process is not running.
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,6 +90,8 @@ pub enum Action {
     ScrollChat(isize),
     /// A request for the apps engine (reply / refresh).
     Apps(ClientMsg),
+    /// A request for the explainer engine (explain / ask / cancel).
+    Explain(ExplainReq),
     Quit,
 }
 
@@ -70,6 +105,42 @@ pub struct TitleButton {
     pub min_range: (u16, u16),
     /// `[start, end)` columns of the zoom button.
     pub zoom_range: (u16, u16),
+}
+
+/// The code region to explain plus its surrounding context (S17).
+struct ExplainTarget {
+    path: String,
+    language: String,
+    start_line: usize,
+    end_line: usize,
+    selection: String,
+    before: String,
+    after: String,
+}
+
+/// Maps a file path to a coarse language name for the explain prompt.
+fn language_for(path: &Path) -> String {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let lang = match ext.as_str() {
+        "rs" => "rust",
+        "py" => "python",
+        "js" | "mjs" | "cjs" => "javascript",
+        "ts" | "tsx" => "typescript",
+        "jsx" => "javascript",
+        "go" => "go",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "hpp" | "cxx" => "cpp",
+        "java" => "java",
+        "rb" => "ruby",
+        "sh" | "bash" => "bash",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "json" => "json",
+        "md" => "markdown",
+        "sql" => "sql",
+        other => other,
+    };
+    lang.to_string()
 }
 
 /// Maps a focus target to the layout pane it belongs to (the apps panel lives
@@ -154,6 +225,8 @@ pub struct App {
     pub title_buttons: Vec<TitleButton>,
     /// Minimized pane regions captured in the last draw; a click restores them.
     pub minimized_regions: Vec<(Pane, Rect)>,
+    /// Code-explainer popup state (S17).
+    pub explain: ExplainUi,
 }
 
 impl App {
@@ -195,6 +268,7 @@ impl App {
             min_chat: false,
             title_buttons: Vec::new(),
             minimized_regions: Vec::new(),
+            explain: ExplainUi::default(),
         };
         app.rescan();
         app
@@ -540,6 +614,115 @@ impl App {
         self.apps.set_offline();
     }
 
+    /// Applies a decoded explainer-engine message to the popup (S17).
+    pub fn apply_explain_msg(&mut self, msg: ExplainMsg) {
+        match msg {
+            ExplainMsg::Delta { id, text } => {
+                if id == self.explain.id {
+                    self.explain.body.push_str(&text);
+                    self.explain.thinking = false;
+                }
+            }
+            ExplainMsg::Done { id } => {
+                if id == self.explain.id {
+                    self.explain.in_flight = false;
+                    self.explain.thinking = false;
+                }
+            }
+            ExplainMsg::Error { id, message } => {
+                if id == self.explain.id {
+                    self.explain.error = Some(message);
+                    self.explain.in_flight = false;
+                    self.explain.thinking = false;
+                }
+            }
+            ExplainMsg::Status { key, model } => {
+                self.explain.key_missing = key == ExplainKey::Missing;
+                self.explain.model = model;
+                self.explain.offline = false;
+            }
+        }
+    }
+
+    /// Marks the explainer engine offline (missing or exited).
+    pub fn set_explain_offline(&mut self) {
+        self.explain.offline = true;
+        if self.explain.in_flight {
+            self.explain.in_flight = false;
+            self.explain.thinking = false;
+            self.explain.error = Some("explainer engine offline — retrying…".into());
+        }
+    }
+
+    /// Builds the explain target from the editor selection, or the current line
+    /// ±10 lines when there is no selection (S17).
+    fn explain_target(&self) -> Option<ExplainTarget> {
+        let e = self.editor.as_ref()?;
+        let path = e.path.display().to_string();
+        let language = language_for(&e.path);
+        let total = e.lines.len();
+        let (sl, el, selection, ctx) = match e.selection_range() {
+            Some(((sl, _), (el, _))) => (sl, el, e.selected_text().unwrap_or_default(), 40usize),
+            None => {
+                let c = e.cursor_line;
+                (c, c, e.lines.get(c).cloned().unwrap_or_default(), 10usize)
+            }
+        };
+        let bstart = sl.saturating_sub(ctx);
+        let before = e.lines[bstart..sl].join("\n");
+        let aend = (el + 1 + ctx).min(total);
+        let after = if el + 1 < total { e.lines[el + 1..aend].join("\n") } else { String::new() };
+        Some(ExplainTarget { path, language, start_line: sl, end_line: el, selection, before, after })
+    }
+
+    /// Opens the explainer popup for the current selection / line (prefix `e`
+    /// or a right-click in the editor). Sends nothing when no key is stored.
+    fn open_explain(&mut self) -> Action {
+        let Some(t) = self.explain_target() else {
+            self.status_msg = Some("open a file in the editor to explain code".into());
+            return Action::None;
+        };
+        self.explain.title = format!("Explain · {} L{}-{}", t.path, t.start_line + 1, t.end_line + 1);
+        self.explain.body.clear();
+        self.explain.error = None;
+        self.explain.scroll = 0;
+        self.explain.question.clear();
+        self.overlay = Some(Overlay::Explain);
+        if self.explain.key_missing {
+            self.explain.in_flight = false;
+            self.explain.thinking = false;
+            return Action::None;
+        }
+        self.explain.next_id += 1;
+        let id = self.explain.next_id;
+        self.explain.id = id;
+        self.explain.in_flight = true;
+        self.explain.thinking = true;
+        Action::Explain(ExplainReq::Explain {
+            id,
+            path: t.path,
+            language: t.language,
+            selection: t.selection,
+            context_before: t.before,
+            context_after: t.after,
+        })
+    }
+
+    /// A right-click inside the editor opens the explainer popup (S17).
+    fn mouse_right(&mut self, col: u16, row: u16) -> Action {
+        if self.overlay.is_some() {
+            return Action::None;
+        }
+        let Some(l) = self.layout else { return Action::None };
+        if let Some(ed) = l.editor {
+            if rect_contains(ed, col, row) {
+                self.focus = Focus::Editor;
+                return self.open_explain();
+            }
+        }
+        Action::None
+    }
+
     fn next_apps_id(&mut self) -> u64 {
         self.apps_req_id += 1;
         self.apps_req_id
@@ -838,6 +1021,7 @@ impl App {
                 self.toggle_overlay(Overlay::Help);
                 Action::None
             }
+            KeyCode::Char('e') => self.open_explain(),
             KeyCode::Char('q') => {
                 // A dirty buffer warns once before quitting; a second q quits.
                 if self.editor.as_ref().is_some_and(|e| e.dirty) && !self.pending_quit {
@@ -923,6 +1107,10 @@ impl App {
         if overlay == Overlay::Apps {
             return self.apps_key(key);
         }
+        // The explainer popup has its own reducer (streaming text + question input).
+        if overlay == Overlay::Explain {
+            return self.explain_key(key);
+        }
         match key.code {
             KeyCode::Esc => self.overlay = None,
             KeyCode::Up | KeyCode::Char('k') => self.overlay_move(overlay, -1),
@@ -930,7 +1118,7 @@ impl App {
             KeyCode::Enter => match overlay {
                 Overlay::Files => self.toggle_or_open_selected(),
                 Overlay::Changes => self.open_selected_change(),
-                Overlay::Help | Overlay::Apps => {}
+                Overlay::Help | Overlay::Apps | Overlay::Explain => {}
             },
             _ => {}
         }
@@ -941,7 +1129,66 @@ impl App {
         match overlay {
             Overlay::Files => self.selected = clamp_index(self.selected, delta, self.entries.len()),
             Overlay::Changes => self.change_selected = clamp_index(self.change_selected, delta, self.changes().len()),
-            Overlay::Help | Overlay::Apps => {}
+            Overlay::Help | Overlay::Apps | Overlay::Explain => {}
+        }
+    }
+
+    /// Explainer popup reducer (S17): Enter sends a follow-up `ask`, Esc closes
+    /// (cancelling any in-flight request), typing edits the question line and the
+    /// arrows/PageUp/PageDown scroll the streamed text.
+    fn explain_key(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.overlay = None;
+                if self.explain.in_flight {
+                    self.explain.in_flight = false;
+                    self.explain.thinking = false;
+                    return Action::Explain(ExplainReq::Cancel { id: self.explain.id });
+                }
+                Action::None
+            }
+            KeyCode::Enter => {
+                let q = self.explain.question.trim().to_string();
+                if q.is_empty() || self.explain.key_missing {
+                    return Action::None;
+                }
+                self.explain.next_id += 1;
+                let id = self.explain.next_id;
+                self.explain.id = id;
+                self.explain.in_flight = true;
+                self.explain.thinking = true;
+                self.explain.error = None;
+                self.explain.scroll = 0;
+                self.explain.body.push_str(&format!("\n\n── you: {q}\n\n"));
+                self.explain.question.clear();
+                Action::Explain(ExplainReq::Ask { id, question: q })
+            }
+            KeyCode::Backspace => {
+                self.explain.question.pop();
+                Action::None
+            }
+            KeyCode::Up => {
+                self.explain.scroll = self.explain.scroll.saturating_add(1);
+                Action::None
+            }
+            KeyCode::Down => {
+                self.explain.scroll = self.explain.scroll.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::PageUp => {
+                self.explain.scroll = self.explain.scroll.saturating_add(10);
+                Action::None
+            }
+            KeyCode::PageDown => {
+                self.explain.scroll = self.explain.scroll.saturating_sub(10);
+                Action::None
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.explain.question.push(c);
+                Action::None
+            }
+            _ => Action::None,
         }
     }
 
@@ -964,6 +1211,13 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
+                // Esc first clears an active selection; a second Esc leaves the pane.
+                if self.editor.as_ref().is_some_and(|e| e.has_selection()) {
+                    if let Some(e) = &mut self.editor {
+                        e.clear_selection();
+                    }
+                    return Action::None;
+                }
                 self.ghost = None;
                 self.focus = Focus::Chat;
                 return Action::None;
@@ -1090,10 +1344,32 @@ impl App {
     pub fn handle_mouse(&mut self, ev: MouseEvent) -> Action {
         match ev.kind {
             MouseEventKind::Down(MouseButton::Left) => self.mouse_click(ev.column, ev.row),
+            MouseEventKind::Down(MouseButton::Right) => self.mouse_right(ev.column, ev.row),
+            MouseEventKind::Drag(MouseButton::Left) => self.mouse_drag(ev.column, ev.row),
             MouseEventKind::ScrollUp => self.mouse_wheel(ev.column, ev.row, -1),
             MouseEventKind::ScrollDown => self.mouse_wheel(ev.column, ev.row, 1),
             _ => Action::None,
         }
+    }
+
+    /// A left-drag inside the editor extends the text selection from the drag
+    /// anchor (S17 editor).
+    fn mouse_drag(&mut self, col: u16, row: u16) -> Action {
+        if self.overlay.is_some() {
+            return Action::None;
+        }
+        let Some(l) = self.layout else { return Action::None };
+        if let Some(ed) = l.editor {
+            if rect_contains(ed, col, row) {
+                self.focus = Focus::Editor;
+                if let Some(e) = &mut self.editor {
+                    let gutter = e.gutter_width();
+                    e.drag(ed.x + 1, ed.y + 1, gutter, col, row);
+                }
+                return Action::None;
+            }
+        }
+        Action::None
     }
 
     fn mouse_click(&mut self, col: u16, row: u16) -> Action {
@@ -1194,7 +1470,7 @@ impl App {
                 }
             }
             Overlay::Apps => return self.click_apps(area, (area.x + 1).max(0), row),
-            Overlay::Help => {}
+            Overlay::Help | Overlay::Explain => {}
         }
         Action::None
     }
@@ -1811,6 +2087,44 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
                     })
                     .collect();
                 frame.render_widget(Paragraph::new(lines).block(block), ed);
+                // Overlay the selection highlight on top of the syntax colors by
+                // tinting the background of the selected cells (S17 editor).
+                if focus == Focus::Editor {
+                    if let Some(((sl, sv), (el, ev))) = e.selection_visual() {
+                        let buf = frame.buffer_mut();
+                        for row in sl..=el {
+                            if row < scroll_row || row >= last {
+                                continue;
+                            }
+                            let line_vcols = expanded_lines[row].chars().count();
+                            let (cstart, cend) = if sl == el {
+                                (sv, ev)
+                            } else if row == sl {
+                                (sv, line_vcols + 1)
+                            } else if row == el {
+                                (0, ev)
+                            } else {
+                                (0, line_vcols + 1)
+                            };
+                            let y = inner.y + (row - scroll_row) as u16;
+                            if y >= inner.y + inner.height {
+                                break;
+                            }
+                            for vcol in cstart..cend {
+                                if vcol < scroll_col {
+                                    continue;
+                                }
+                                let x = inner.x + gutter as u16 + (vcol - scroll_col) as u16;
+                                if x >= inner.x + inner.width {
+                                    break;
+                                }
+                                if let Some(cell) = buf.cell_mut(Position::new(x, y)) {
+                                    cell.set_bg(Color::Rgb(55, 65, 95));
+                                }
+                            }
+                        }
+                    }
+                }
                 if focus == Focus::Editor && app.overlay.is_none() {
                     let cx = inner.x + gutter as u16 + e.cursor_visual_col().saturating_sub(scroll_col) as u16;
                     let cy = inner.y + e.cursor_line.saturating_sub(scroll_row) as u16;
@@ -1924,7 +2238,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
         app.overlay_area = Some(area);
         frame.render_widget(Clear, area);
         let block = Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::Cyan));
+        if overlay == Overlay::Explain {
+            let title = format!(" {} · Enter ask · Esc close ", app.explain.title);
+            let w = area.width.saturating_sub(2) as usize;
+            let h = area.height.saturating_sub(2) as usize;
+            let lines = explain_lines(&app.explain, w, h);
+            frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
+        } else {
         let (title, lines) = match overlay {
+            Overlay::Explain => unreachable!("handled above"),
             Overlay::Files => {
                 let h = area.height.saturating_sub(2) as usize;
                 app.tree_offset = keep_visible(app.selected, app.tree_offset, h);
@@ -1957,6 +2279,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
             Overlay::Help => (" Help · Esc close ", help_lines()),
         };
         frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
+        }
     }
 
     let status = if app.prefix {
@@ -2006,7 +2329,8 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "Sidebar: ↑↓ move · Enter/→ open · ← collapse · Esc back to chat".into(),
         "Editor: type to edit · Enter/Backspace/Delete · Tab · arrows · Home/End".into(),
         "        PageUp/PageDown · Ctrl+Home/End · Ctrl+S save · Ctrl+R reload".into(),
-        "        ● marks unsaved edits · Esc back to chat".into(),
+        "        Shift+arrows select · drag selects · Ctrl+C copy · ● unsaved · Esc back".into(),
+        format!("  e      explain the selection / current line (also right-click)"),
         "Agent changes: ↑↓ PgUp PgDn scroll · Esc back / restore zoom".into(),
         "Apps: ↑↓ select · Enter app→items→reply · a actions (open) · Esc back".into(),
         "      +/- resize the expanded panel (40-70%) · click an app to open it".into(),
@@ -2017,6 +2341,84 @@ pub fn help_lines() -> Vec<Line<'static>> {
     .into_iter()
     .map(Line::raw)
     .collect()
+}
+
+/// Wraps `s` to width `w` on word boundaries, preserving blank lines.
+fn wrap_text(s: &str, w: usize) -> Vec<String> {
+    let w = w.max(1);
+    let mut out = Vec::new();
+    for para in s.split('\n') {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut line = String::new();
+        for word in para.split(' ') {
+            if line.is_empty() {
+                line = word.to_string();
+            } else if line.chars().count() + 1 + word.chars().count() <= w {
+                line.push(' ');
+                line.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut line));
+                line = word.to_string();
+            }
+        }
+        if !line.is_empty() {
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// Builds the explainer popup body: a model header, the scrolled + word-wrapped
+/// streaming text (or the key-missing hint / inline error), a separator and the
+/// one-line question input (S17).
+fn explain_lines(e: &ExplainUi, w: usize, h: usize) -> Vec<Line<'static>> {
+    let status = if e.offline {
+        "offline".to_string()
+    } else if e.key_missing {
+        "no API key".to_string()
+    } else if !e.model.is_empty() {
+        e.model.clone()
+    } else {
+        "…".to_string()
+    };
+    let body_rows = h.saturating_sub(3).max(1);
+    let mut content = String::new();
+    if e.key_missing {
+        content.push_str("Set your Anthropic API key: `gentle-explain key set`");
+    } else {
+        content.push_str(&e.body);
+        if e.thinking {
+            if !e.body.is_empty() {
+                content.push('\n');
+            }
+            content.push_str("thinking…");
+        }
+    }
+    let mut wrapped = wrap_text(&content, w);
+    if let Some(err) = &e.error {
+        wrapped.push(format!("⚠ {err}"));
+    }
+    let total = wrapped.len();
+    let max_up = total.saturating_sub(body_rows);
+    let up = e.scroll.min(max_up);
+    let start = max_up - up;
+    let end = (start + body_rows).min(total);
+
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::styled(format!("model: {status}"), Style::default().fg(Color::DarkGray)));
+    for line in &wrapped[start..end] {
+        out.push(Line::raw(line.clone()));
+    }
+    for _ in (end - start)..body_rows {
+        out.push(Line::raw(""));
+    }
+    out.push(Line::styled("─".repeat(w), Style::default().fg(Color::DarkGray)));
+    let prompt = if e.key_missing { String::new() } else { format!("> {}", e.question) };
+    out.push(Line::styled(prompt, Style::default().fg(Color::Cyan)));
+    out
 }
 
 #[cfg(test)]
@@ -2069,6 +2471,119 @@ mod tests {
         assert_eq!(app.handle_key(ch('a')), Action::Forward(b"a".to_vec()));
         app.app_cursor = true;
         assert_eq!(app.handle_key(key(KeyCode::Up)), Action::Forward(b"\x1bOA".to_vec()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- Explain popup (S17) --------------------------------------------
+    use gentle_engines::protocol::{ClientMsg as ExReq, EngineMsg as ExMsg, KeyState as ExKey};
+
+    fn app_with_editor(name: &str) -> (PathBuf, App) {
+        let root = fixture(name);
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.editor = Some(Editor::open(&root, Path::new("src/main.rs")));
+        app.focus = Focus::Editor;
+        render(&mut app, 120, 40);
+        (root, app)
+    }
+
+    fn prefix_e(app: &mut App) -> Action {
+        app.handle_key(prefix());
+        app.handle_key(ch('e'))
+    }
+
+    #[test]
+    fn explain_popup_shows_key_missing_hint_and_sends_nothing() {
+        let (root, mut app) = app_with_editor("explain-nokey");
+        app.apply_explain_msg(ExMsg::Status { key: ExKey::Missing, model: String::new() });
+        assert_eq!(prefix_e(&mut app), Action::None, "no request is sent without a key");
+        assert_eq!(app.overlay, Some(Overlay::Explain));
+        let t = render(&mut app, 120, 40);
+        assert!(screen_text(&t).contains("gentle-explain key set"), "the setup hint is shown");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explain_popup_streams_renders_and_scrolls() {
+        let (root, mut app) = app_with_editor("explain-stream");
+        app.apply_explain_msg(ExMsg::Status { key: ExKey::Set, model: "claude-haiku-4-5".into() });
+        let action = prefix_e(&mut app);
+        let id = match &action {
+            Action::Explain(ExReq::Explain { id, selection, .. }) => {
+                assert!(selection.contains("fn main"));
+                *id
+            }
+            other => panic!("expected an explain request, got {other:?}"),
+        };
+        assert!(app.explain.in_flight && app.explain.thinking);
+        app.apply_explain_msg(ExMsg::Delta { id, text: "Hello ".into() });
+        app.apply_explain_msg(ExMsg::Delta { id, text: "world".into() });
+        assert_eq!(app.explain.body, "Hello world");
+        assert!(!app.explain.thinking);
+        let t = render(&mut app, 120, 40);
+        assert!(screen_text(&t).contains("Hello world"));
+        app.apply_explain_msg(ExMsg::Done { id });
+        assert!(!app.explain.in_flight);
+        // Scroll the streamed text.
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.explain.scroll, 1);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.explain.scroll, 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explain_popup_esc_cancels_the_in_flight_request() {
+        let (root, mut app) = app_with_editor("explain-cancel");
+        app.apply_explain_msg(ExMsg::Status { key: ExKey::Set, model: "m".into() });
+        let id = match prefix_e(&mut app) {
+            Action::Explain(ExReq::Explain { id, .. }) => id,
+            other => panic!("expected an explain request, got {other:?}"),
+        };
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::Explain(ExReq::Cancel { id }));
+        assert_eq!(app.overlay, None);
+        assert!(!app.explain.in_flight);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explain_popup_enter_asks_a_follow_up_in_the_same_conversation() {
+        let (root, mut app) = app_with_editor("explain-ask");
+        app.apply_explain_msg(ExMsg::Status { key: ExKey::Set, model: "m".into() });
+        let first = match prefix_e(&mut app) {
+            Action::Explain(ExReq::Explain { id, .. }) => id,
+            other => panic!("expected an explain request, got {other:?}"),
+        };
+        app.apply_explain_msg(ExMsg::Done { id: first });
+        // Type a question into the popup input, then Enter sends `ask`.
+        for c in "why?".chars() {
+            app.handle_key(ch(c));
+        }
+        assert_eq!(app.explain.question, "why?");
+        match app.handle_key(key(KeyCode::Enter)) {
+            Action::Explain(ExReq::Ask { id, question }) => {
+                assert!(id > first, "a new request id");
+                assert_eq!(question, "why?");
+            }
+            other => panic!("expected an ask request, got {other:?}"),
+        }
+        assert!(app.explain.in_flight && app.explain.question.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn right_click_in_the_editor_opens_the_explain_popup() {
+        let (root, mut app) = app_with_editor("explain-rclick");
+        app.apply_explain_msg(ExMsg::Status { key: ExKey::Set, model: "m".into() });
+        let ed = app.layout.unwrap().editor.expect("an editor pane");
+        let ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: ed.x + 2,
+            row: ed.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(app.handle_mouse(ev), Action::Explain(ExReq::Explain { .. })));
+        assert_eq!(app.overlay, Some(Overlay::Explain));
         fs::remove_dir_all(root).unwrap();
     }
 

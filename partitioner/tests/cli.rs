@@ -16,7 +16,9 @@ fn missing_command_exits_one_with_message() {
 fn help_version_and_unknown_option_exit_codes() {
     let help = Command::new(BIN).arg("--help").output().unwrap();
     assert_eq!(help.status.code(), Some(0));
-    assert!(String::from_utf8_lossy(&help.stdout).contains("gentle-partitioner [OPTIONS] [-- <command> [args...]]"));
+    let help_text = String::from_utf8_lossy(&help.stdout);
+    assert!(help_text.contains("gentle-partitioner [OPTIONS] [-- <command> [args...]]"));
+    assert!(help_text.contains("--no-explain"), "the explainer flag is documented");
     let version = Command::new(BIN).arg("-V").output().unwrap();
     assert_eq!(version.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), "gentle-partitioner 0.1.0");
