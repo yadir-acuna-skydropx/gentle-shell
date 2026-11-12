@@ -12,12 +12,18 @@
 //! - [`engine`] — the stdio request loop around a pluggable [`engine::ExplainBackend`].
 //! - [`backend`] — the real Anthropic-backed explainer.
 pub mod anthropic;
+pub mod arch;
+pub mod arch_engine;
+pub mod arch_protocol;
 pub mod backend;
 pub mod cli;
 pub mod config;
 pub mod context;
 pub mod engine;
+pub mod kb;
 pub mod keystore;
+pub mod scan;
+pub mod tools;
 pub mod protocol;
 
 use std::path::PathBuf;

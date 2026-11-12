@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use gentle_apps::protocol::{ClientMsg, EngineMsg, Status as AppState};
+use gentle_engines::arch_protocol::{ArchClientMsg as ArchReq, ArchEngineMsg as ArchMsg, KeyState as ArchKey};
 use gentle_engines::protocol::{ClientMsg as ExplainReq, EngineMsg as ExplainMsg, KeyState as ExplainKey};
 
 use crate::apps_panel::{AppsPanel, View};
@@ -29,8 +30,15 @@ use crate::viewer::{self, DiffKind, Viewer};
 pub const PREFIX_LABEL: &str = "Ctrl+]";
 
 /// Lateral tool bar entries in chat mode (S7): label and prefix key.
-pub const TOOLS: [(&str, char); 6] =
-    [("Files", 't'), ("Changes", 'c'), ("Workspace", 'w'), ("Apps", 'a'), ("Help", '?'), ("Quit", 'q')];
+pub const TOOLS: [(&str, char); 7] = [
+    ("Files", 't'),
+    ("Changes", 'c'),
+    ("Workspace", 'w'),
+    ("Apps", 'a'),
+    ("Arch", 'A'),
+    ("Help", '?'),
+    ("Quit", 'q'),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -49,6 +57,47 @@ pub enum Overlay {
     Apps,
     /// The code-explainer popup (S17): streaming explanation + follow-up Q&A.
     Explain,
+    /// The architecture engine overlay (S18): review the repo or design from a
+    /// brief, streaming a markdown report.
+    Arch,
+}
+
+/// The three stages of the architecture overlay (S18).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ArchStage {
+    /// Choosing "Review this repo" or "Design from a brief".
+    #[default]
+    Menu,
+    /// Typing a multi-line brief (Ctrl+Enter / Alt+Enter submits).
+    Brief,
+    /// Streaming / showing the report.
+    Report,
+}
+
+/// State of the architecture overlay (S18). The API key never reaches here.
+#[derive(Debug, Clone, Default)]
+pub struct ArchUi {
+    pub stage: ArchStage,
+    /// Selected menu option: 0 = review, 1 = design.
+    pub option: usize,
+    /// The multi-line brief being typed.
+    pub brief: String,
+    /// Streamed report text so far.
+    pub body: String,
+    /// Id of the in-flight request.
+    pub id: u64,
+    next_id: u64,
+    pub error: Option<String>,
+    pub thinking: bool,
+    pub in_flight: bool,
+    /// Lines scrolled up from the bottom of the body.
+    pub scroll: usize,
+    pub key_missing: bool,
+    pub model: String,
+    pub kb_chunks: usize,
+    pub offline: bool,
+    /// The written report path, set on `done` (enables `o` to open it).
+    pub report_path: Option<String>,
 }
 
 /// State of the explainer popup (S17). Lives beside [`Overlay::Explain`]; the
@@ -92,6 +141,10 @@ pub enum Action {
     Apps(ClientMsg),
     /// A request for the explainer engine (explain / ask / cancel).
     Explain(ExplainReq),
+    /// A request for the architecture engine (review / design / cancel).
+    Arch(ArchReq),
+    /// Open a finished report file with the system opener (xdg-open).
+    OpenReport(String),
     Quit,
 }
 
@@ -227,6 +280,8 @@ pub struct App {
     pub minimized_regions: Vec<(Pane, Rect)>,
     /// Code-explainer popup state (S17).
     pub explain: ExplainUi,
+    /// Architecture overlay state (S18).
+    pub arch: ArchUi,
 }
 
 impl App {
@@ -269,6 +324,7 @@ impl App {
             title_buttons: Vec::new(),
             minimized_regions: Vec::new(),
             explain: ExplainUi::default(),
+            arch: ArchUi::default(),
         };
         app.rescan();
         app
@@ -1022,6 +1078,7 @@ impl App {
                 Action::None
             }
             KeyCode::Char('e') => self.open_explain(),
+            KeyCode::Char('A') => self.open_arch(),
             KeyCode::Char('q') => {
                 // A dirty buffer warns once before quitting; a second q quits.
                 if self.editor.as_ref().is_some_and(|e| e.dirty) && !self.pending_quit {
@@ -1111,6 +1168,10 @@ impl App {
         if overlay == Overlay::Explain {
             return self.explain_key(key);
         }
+        // The architecture overlay has its own reducer (menu / brief / report).
+        if overlay == Overlay::Arch {
+            return self.arch_key(key);
+        }
         match key.code {
             KeyCode::Esc => self.overlay = None,
             KeyCode::Up | KeyCode::Char('k') => self.overlay_move(overlay, -1),
@@ -1118,7 +1179,7 @@ impl App {
             KeyCode::Enter => match overlay {
                 Overlay::Files => self.toggle_or_open_selected(),
                 Overlay::Changes => self.open_selected_change(),
-                Overlay::Help | Overlay::Apps | Overlay::Explain => {}
+                Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch => {}
             },
             _ => {}
         }
@@ -1129,7 +1190,7 @@ impl App {
         match overlay {
             Overlay::Files => self.selected = clamp_index(self.selected, delta, self.entries.len()),
             Overlay::Changes => self.change_selected = clamp_index(self.change_selected, delta, self.changes().len()),
-            Overlay::Help | Overlay::Apps | Overlay::Explain => {}
+            Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch => {}
         }
     }
 
@@ -1189,6 +1250,190 @@ impl App {
                 Action::None
             }
             _ => Action::None,
+        }
+    }
+
+    /// Opens the architecture overlay (prefix `A` / the "Arch" tool), starting
+    /// on the two-option menu. The engine's start `status` populates the key /
+    /// model / KB-chunk fields.
+    fn open_arch(&mut self) -> Action {
+        self.overlay = Some(Overlay::Arch);
+        self.arch.stage = ArchStage::Menu;
+        self.arch.option = 0;
+        self.arch.error = None;
+        self.arch.scroll = 0;
+        Action::None
+    }
+
+    /// Architecture overlay reducer (S18): the menu selects review/design, the
+    /// brief stage edits a multi-line brief (Ctrl+Enter / Alt+Enter submits,
+    /// Esc returns to the menu), and the report stage scrolls the stream and
+    /// opens the finished report with `o`.
+    fn arch_key(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match self.arch.stage {
+            ArchStage::Menu => match key.code {
+                KeyCode::Esc => {
+                    self.overlay = None;
+                    Action::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.arch.option = self.arch.option.saturating_sub(1);
+                    Action::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.arch.option = (self.arch.option + 1).min(1);
+                    Action::None
+                }
+                KeyCode::Enter => {
+                    if self.arch.option == 0 {
+                        self.start_arch_review()
+                    } else {
+                        self.arch.stage = ArchStage::Brief;
+                        Action::None
+                    }
+                }
+                _ => Action::None,
+            },
+            ArchStage::Brief => match key.code {
+                KeyCode::Esc => {
+                    self.arch.stage = ArchStage::Menu;
+                    Action::None
+                }
+                // Ctrl+Enter or Alt+Enter submits the brief.
+                KeyCode::Enter if ctrl || alt => self.start_arch_design(),
+                KeyCode::Enter => {
+                    self.arch.brief.push('\n');
+                    Action::None
+                }
+                KeyCode::Backspace => {
+                    self.arch.brief.pop();
+                    Action::None
+                }
+                KeyCode::Char(c) if !ctrl => {
+                    self.arch.brief.push(c);
+                    Action::None
+                }
+                _ => Action::None,
+            },
+            ArchStage::Report => match key.code {
+                KeyCode::Esc => {
+                    self.overlay = None;
+                    if self.arch.in_flight {
+                        self.arch.in_flight = false;
+                        self.arch.thinking = false;
+                        return Action::Arch(ArchReq::Cancel { id: self.arch.id });
+                    }
+                    Action::None
+                }
+                KeyCode::Char('o') => {
+                    if let Some(path) = self.arch.report_path.clone() {
+                        return Action::OpenReport(path);
+                    }
+                    Action::None
+                }
+                KeyCode::Up => {
+                    self.arch.scroll = self.arch.scroll.saturating_add(1);
+                    Action::None
+                }
+                KeyCode::Down => {
+                    self.arch.scroll = self.arch.scroll.saturating_sub(1);
+                    Action::None
+                }
+                KeyCode::PageUp => {
+                    self.arch.scroll = self.arch.scroll.saturating_add(10);
+                    Action::None
+                }
+                KeyCode::PageDown => {
+                    self.arch.scroll = self.arch.scroll.saturating_sub(10);
+                    Action::None
+                }
+                _ => Action::None,
+            },
+        }
+    }
+
+    fn start_arch_review(&mut self) -> Action {
+        if self.arch.key_missing {
+            self.arch.stage = ArchStage::Report;
+            return Action::None;
+        }
+        self.arch.stage = ArchStage::Report;
+        self.arch.body.clear();
+        self.arch.error = None;
+        self.arch.report_path = None;
+        self.arch.scroll = 0;
+        self.arch.next_id += 1;
+        let id = self.arch.next_id;
+        self.arch.id = id;
+        self.arch.in_flight = true;
+        self.arch.thinking = true;
+        Action::Arch(ArchReq::Review { id, path: self.root.display().to_string(), deep: false })
+    }
+
+    fn start_arch_design(&mut self) -> Action {
+        let brief = self.arch.brief.trim().to_string();
+        if brief.is_empty() {
+            return Action::None;
+        }
+        if self.arch.key_missing {
+            self.arch.stage = ArchStage::Report;
+            return Action::None;
+        }
+        self.arch.stage = ArchStage::Report;
+        self.arch.body.clear();
+        self.arch.error = None;
+        self.arch.report_path = None;
+        self.arch.scroll = 0;
+        self.arch.next_id += 1;
+        let id = self.arch.next_id;
+        self.arch.id = id;
+        self.arch.in_flight = true;
+        self.arch.thinking = true;
+        Action::Arch(ArchReq::Design { id, brief, deep: false })
+    }
+
+    /// Applies a decoded architecture-engine message to the overlay (S18).
+    pub fn apply_arch_msg(&mut self, msg: ArchMsg) {
+        match msg {
+            ArchMsg::Delta { id, text } => {
+                if id == self.arch.id {
+                    self.arch.body.push_str(&text);
+                    self.arch.thinking = false;
+                }
+            }
+            ArchMsg::Done { id, path } => {
+                if id == self.arch.id {
+                    self.arch.in_flight = false;
+                    self.arch.thinking = false;
+                    self.arch.report_path = Some(path.clone());
+                    self.status_msg = Some(format!("report written to {path} — press o to open"));
+                }
+            }
+            ArchMsg::Error { id, message } => {
+                if id == self.arch.id {
+                    self.arch.error = Some(message);
+                    self.arch.in_flight = false;
+                    self.arch.thinking = false;
+                }
+            }
+            ArchMsg::Status { key, model, kb_chunks } => {
+                self.arch.key_missing = key == ArchKey::Missing;
+                self.arch.model = model;
+                self.arch.kb_chunks = kb_chunks;
+                self.arch.offline = false;
+            }
+        }
+    }
+
+    /// Marks the architecture engine offline (missing or exited).
+    pub fn set_arch_offline(&mut self) {
+        self.arch.offline = true;
+        if self.arch.in_flight {
+            self.arch.in_flight = false;
+            self.arch.thinking = false;
+            self.arch.error = Some("architecture engine offline — retrying…".into());
         }
     }
 
@@ -1470,7 +1715,7 @@ impl App {
                 }
             }
             Overlay::Apps => return self.click_apps(area, (area.x + 1).max(0), row),
-            Overlay::Help | Overlay::Explain => {}
+            Overlay::Help | Overlay::Explain | Overlay::Arch => {}
         }
         Action::None
     }
@@ -2244,9 +2489,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
             let h = area.height.saturating_sub(2) as usize;
             let lines = explain_lines(&app.explain, w, h);
             frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
+        } else if overlay == Overlay::Arch {
+            let title = " Arch · architecture engine · Esc close ".to_string();
+            let w = area.width.saturating_sub(2) as usize;
+            let h = area.height.saturating_sub(2) as usize;
+            let lines = arch_lines(&app.arch, w, h);
+            frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
         } else {
         let (title, lines) = match overlay {
-            Overlay::Explain => unreachable!("handled above"),
+            Overlay::Explain | Overlay::Arch => unreachable!("handled above"),
             Overlay::Files => {
                 let h = area.height.saturating_sub(2) as usize;
                 app.tree_offset = keep_visible(app.selected, app.tree_offset, h);
@@ -2371,6 +2622,81 @@ fn wrap_text(s: &str, w: usize) -> Vec<String> {
     out
 }
 
+/// Renders the architecture overlay: the two-option menu, the brief editor, or
+/// the streaming report, plus a status header (model / KB chunks / state).
+fn arch_lines(a: &ArchUi, w: usize, h: usize) -> Vec<Line<'static>> {
+    let status = if a.offline {
+        "offline".to_string()
+    } else if a.key_missing {
+        "no API key".to_string()
+    } else if !a.model.is_empty() {
+        format!("{} · KB {} chunks", a.model, a.kb_chunks)
+    } else {
+        format!("KB {} chunks", a.kb_chunks)
+    };
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::styled(format!("engine: {status}"), Style::default().fg(Color::DarkGray)));
+
+    match a.stage {
+        ArchStage::Menu => {
+            out.push(Line::raw(""));
+            out.push(Line::raw("What would you like to do?"));
+            out.push(Line::raw(""));
+            for (i, label) in ["Review this repo", "Design from a brief"].iter().enumerate() {
+                let marker = if i == a.option { "> " } else { "  " };
+                let style = if i == a.option {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                out.push(Line::styled(format!("{marker}{label}"), style));
+            }
+            out.push(Line::raw(""));
+            out.push(Line::styled("↑/↓ select · Enter choose · Esc close", Style::default().fg(Color::DarkGray)));
+        }
+        ArchStage::Brief => {
+            out.push(Line::raw(""));
+            out.push(Line::raw("Describe the system to design (Ctrl+Enter or Alt+Enter to submit):"));
+            out.push(Line::styled("─".repeat(w), Style::default().fg(Color::DarkGray)));
+            for line in wrap_text(&a.brief, w) {
+                out.push(Line::raw(line));
+            }
+            out.push(Line::styled("▌", Style::default().fg(Color::Cyan)));
+        }
+        ArchStage::Report => {
+            let body_rows = h.saturating_sub(2).max(1);
+            let mut content = String::new();
+            if a.key_missing {
+                content.push_str("Set your Anthropic API key: `gentle-arch key set`");
+            } else {
+                content.push_str(&a.body);
+                if a.thinking {
+                    if !a.body.is_empty() {
+                        content.push('\n');
+                    }
+                    content.push_str("working…");
+                }
+            }
+            let mut wrapped = wrap_text(&content, w);
+            if let Some(err) = &a.error {
+                wrapped.push(format!("⚠ {err}"));
+            }
+            if let Some(path) = &a.report_path {
+                wrapped.push(format!("✓ report: {path}  (press o to open)"));
+            }
+            let total = wrapped.len();
+            let max_up = total.saturating_sub(body_rows);
+            let up = a.scroll.min(max_up);
+            let start = max_up - up;
+            let end = (start + body_rows).min(total);
+            for line in &wrapped[start..end] {
+                out.push(Line::raw(line.clone()));
+            }
+        }
+    }
+    out
+}
+
 /// Builds the explainer popup body: a model header, the scrolled + word-wrapped
 /// streaming text (or the key-missing hint / inline error), a separator and the
 /// one-line question input (S17).
@@ -2471,6 +2797,145 @@ mod tests {
         assert_eq!(app.handle_key(ch('a')), Action::Forward(b"a".to_vec()));
         app.app_cursor = true;
         assert_eq!(app.handle_key(key(KeyCode::Up)), Action::Forward(b"\x1bOA".to_vec()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- Arch overlay (S18) ---------------------------------------------
+    use gentle_engines::arch_protocol::{ArchClientMsg as ArReq, ArchEngineMsg as ArMsg, KeyState as ArKey};
+
+    fn arch_app(name: &str) -> (PathBuf, App) {
+        let root = fixture(name);
+        let mut app = App::new(root.clone());
+        render(&mut app, 120, 40);
+        // The engine reports a key + model + KB chunks on connect.
+        app.apply_arch_msg(ArMsg::Status { key: ArKey::Set, model: "claude-sonnet".into(), kb_chunks: 42 });
+        (root, app)
+    }
+
+    fn open_arch(app: &mut App) {
+        app.handle_key(prefix());
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn arch_overlay_opens_with_two_options() {
+        let (root, mut app) = arch_app("arch-open");
+        open_arch(&mut app);
+        assert_eq!(app.overlay, Some(Overlay::Arch));
+        assert_eq!(app.arch.stage, ArchStage::Menu);
+        let t = render(&mut app, 120, 40);
+        let text = screen_text(&t);
+        assert!(text.contains("Review this repo"), "{text}");
+        assert!(text.contains("Design from a brief"));
+        assert!(text.contains("KB 42 chunks"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arch_review_sends_a_review_request() {
+        let (root, mut app) = arch_app("arch-review");
+        open_arch(&mut app);
+        let action = app.handle_key(key(KeyCode::Enter));
+        match action {
+            Action::Arch(ArReq::Review { deep, .. }) => assert!(!deep),
+            other => panic!("expected a review request, got {other:?}"),
+        }
+        assert_eq!(app.arch.stage, ArchStage::Report);
+        assert!(app.arch.in_flight);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arch_design_edits_a_brief_and_submits_on_ctrl_enter() {
+        let (root, mut app) = arch_app("arch-design");
+        open_arch(&mut app);
+        // Move to "Design from a brief" and enter the brief editor.
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.arch.stage, ArchStage::Brief);
+        for c in "banco".chars() {
+            app.handle_key(ch(c));
+        }
+        // A plain Enter inserts a newline, it does not submit.
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.arch.stage, ArchStage::Brief);
+        // Ctrl+Enter submits.
+        let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL));
+        match action {
+            Action::Arch(ArReq::Design { brief, .. }) => assert_eq!(brief, "banco"),
+            other => panic!("expected a design request, got {other:?}"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arch_brief_esc_returns_to_the_menu() {
+        let (root, mut app) = arch_app("arch-esc");
+        open_arch(&mut app);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.arch.stage, ArchStage::Brief);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.arch.stage, ArchStage::Menu);
+        assert_eq!(app.overlay, Some(Overlay::Arch));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arch_streams_and_opens_the_report() {
+        let (root, mut app) = arch_app("arch-stream");
+        open_arch(&mut app);
+        let id = match app.handle_key(key(KeyCode::Enter)) {
+            Action::Arch(ArReq::Review { id, .. }) => id,
+            other => panic!("expected review, got {other:?}"),
+        };
+        app.apply_arch_msg(ArMsg::Delta { id, text: "# Architecture Review".into() });
+        app.apply_arch_msg(ArMsg::Done { id, path: "./.gentle-arch/review-x.md".into() });
+        let t = render(&mut app, 120, 40);
+        assert!(screen_text(&t).contains("Architecture Review"));
+        assert_eq!(app.arch.report_path.as_deref(), Some("./.gentle-arch/review-x.md"));
+        // `o` opens the finished report.
+        let action = app.handle_key(ch('o'));
+        assert_eq!(action, Action::OpenReport("./.gentle-arch/review-x.md".into()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arch_without_a_key_shows_the_setup_hint_and_sends_nothing() {
+        let (root, mut app) = arch_app("arch-nokey");
+        app.apply_arch_msg(ArMsg::Status { key: ArKey::Missing, model: String::new(), kb_chunks: 0 });
+        open_arch(&mut app);
+        let action = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(action, Action::None, "no request without a key");
+        assert_eq!(app.arch.stage, ArchStage::Report);
+        let t = render(&mut app, 120, 40);
+        assert!(screen_text(&t).contains("gentle-arch key set"), "the setup hint is shown");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arch_esc_cancels_an_in_flight_request() {
+        let (root, mut app) = arch_app("arch-cancel");
+        open_arch(&mut app);
+        let id = match app.handle_key(key(KeyCode::Enter)) {
+            Action::Arch(ArReq::Review { id, .. }) => id,
+            other => panic!("expected review, got {other:?}"),
+        };
+        let action = app.handle_key(key(KeyCode::Esc));
+        assert_eq!(action, Action::Arch(ArReq::Cancel { id }));
+        assert_eq!(app.overlay, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arch_offline_marks_an_error() {
+        let (root, mut app) = arch_app("arch-offline");
+        open_arch(&mut app);
+        app.handle_key(key(KeyCode::Enter));
+        app.set_arch_offline();
+        assert!(app.arch.offline);
+        assert!(!app.arch.in_flight);
+        assert!(app.arch.error.is_some());
         fs::remove_dir_all(root).unwrap();
     }
 

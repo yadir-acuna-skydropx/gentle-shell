@@ -11,9 +11,14 @@ path = "src/lib.rs"
 name = "gentle-explain"
 path = "src/bin/gentle-explain.rs"
 
+[[bin]]
+name = "gentle-arch"
+path = "src/bin/gentle-arch.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "3", features = ["json"] }
+regex = "1"
 keyring = { version = "3", default-features = false, features = ["async-secret-service", "crypto-rust", "async-io"] }
 rpassword = "7"

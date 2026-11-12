@@ -31,6 +31,54 @@ pub fn config_path(home: &Path) -> PathBuf {
     config_dir(home).join("engines.toml")
 }
 
+/// Settings for the architecture engine, read from `[arch]`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ArchConfig {
+    /// Explicit model id override; when absent the model is resolved by line
+    /// (`"sonnet"`, or `"opus"` with `--deep`).
+    pub model: Option<String>,
+}
+
+/// Reads the architecture config from `[arch]`. A missing file yields defaults.
+/// The `GENTLE_ENGINES_ARCH_MODEL` env overrides the file model (tests).
+pub fn load_arch(home: &Path) -> ArchConfig {
+    let mut cfg = match std::fs::read_to_string(config_path(home)) {
+        Ok(t) => parse_arch(&t),
+        Err(_) => ArchConfig::default(),
+    };
+    if let Ok(m) = std::env::var("GENTLE_ENGINES_ARCH_MODEL") {
+        if !m.trim().is_empty() {
+            cfg.model = Some(m);
+        }
+    }
+    cfg
+}
+
+/// Parses the minimal `[arch]` table we support.
+pub fn parse_arch(text: &str) -> ArchConfig {
+    let mut cfg = ArchConfig::default();
+    let mut in_arch = false;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if line.starts_with('[') {
+            in_arch = line == "[arch]";
+            continue;
+        }
+        if !in_arch {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some(value) = unquote(value.trim()) else { continue };
+        if key.trim() == "model" {
+            cfg.model = Some(value);
+        }
+    }
+    cfg
+}
+
 /// Reads the explainer config. A missing file yields the defaults. The
 /// `GENTLE_ENGINES_EXPLAIN_MODEL` env overrides the file model (tests).
 pub fn load(home: &Path) -> ExplainConfig {
@@ -103,5 +151,13 @@ mod tests {
     fn ignores_other_tables() {
         let cfg = parse("[other]\nmodel = \"nope\"\n");
         assert_eq!(cfg.model, None);
+    }
+
+    #[test]
+    fn parses_arch_table_and_ignores_explain() {
+        let cfg = parse_arch("[explain]\nmodel = \"haiku-x\"\n[arch]\nmodel = \"claude-opus-4-5\"\n");
+        assert_eq!(cfg.model.as_deref(), Some("claude-opus-4-5"));
+        let none = parse_arch("[explain]\nmodel = \"haiku-x\"\n");
+        assert_eq!(none.model, None);
     }
 }

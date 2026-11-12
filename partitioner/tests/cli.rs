@@ -19,6 +19,7 @@ fn help_version_and_unknown_option_exit_codes() {
     let help_text = String::from_utf8_lossy(&help.stdout);
     assert!(help_text.contains("gentle-partitioner [OPTIONS] [-- <command> [args...]]"));
     assert!(help_text.contains("--no-explain"), "the explainer flag is documented");
+    assert!(help_text.contains("--no-arch"), "the architecture engine flag is documented");
     let version = Command::new(BIN).arg("-V").output().unwrap();
     assert_eq!(version.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&version.stdout).trim(), "gentle-partitioner 0.1.0");

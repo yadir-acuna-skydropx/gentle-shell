@@ -19,12 +19,20 @@ impl CancelFlag {
     fn new() -> Self {
         CancelFlag(Arc::new(AtomicBool::new(false)))
     }
+    /// Public constructor for reuse by other engines (e.g. `gentle-arch`).
+    pub fn new_flag() -> Self {
+        CancelFlag::new()
+    }
     /// True once the request has been cancelled.
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Relaxed)
     }
     fn cancel(&self) {
         self.0.store(true, Ordering::Relaxed);
+    }
+    /// Public cancel for reuse by other engines.
+    pub fn cancel_now(&self) {
+        self.cancel();
     }
 }
 

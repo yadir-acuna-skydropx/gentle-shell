@@ -52,6 +52,15 @@ repainted — only the changed cells of that fragment are written out.
   no selection it explains the current line ±10 lines. It uses **Claude Haiku**
   over the Anthropic API via a separate Rust process, `gentle-explain`; the API
   key lives in the system keyring. Disable it with `--no-explain`.
+- **Architecture engine (S18).** Press **`A`** (or the **Arch** tool) to open an
+  overlay that either **reviews this repo** (scans Airflow DAGs, CI and IaC,
+  redacting secrets) or **designs from a brief** you type (Ctrl+Enter or
+  Alt+Enter submits). It retrieves from a curated GCP + data knowledge base and
+  streams a structured markdown report (pillar findings, cost analysis, Mermaid
+  C4, MADR ADRs, sources) written to `./.gentle-arch/`; press **`o`** to open the
+  saved report. It uses **Claude Sonnet** (or **opus** with `--deep`) over the
+  Anthropic API via a separate Rust process, `gentle-arch`. Disable it with
+  `--no-arch`.
 
 ## Code explainer (`gentle-explain`)
 
@@ -79,8 +88,68 @@ runtime (`GET /v1/models`, newest **haiku**); override it in
 set the default output language with `lang` (default `"es"`). The Anthropic API
 version header is pinned to `2026-10-21` (a single constant in
 `engines/src/anthropic.rs`). The shared Anthropic client, keystore and NDJSON
-protocol live in the `gentle-engines` library so the T18 `gentle-arch` engine
-can reuse them.
+protocol live in the `gentle-engines` library so the `gentle-arch` engine
+reuses them.
+
+## Architecture engine (`gentle-arch`)
+
+The partitioner spawns the independent `gentle-arch` binary (found next to the
+partitioner, else on `PATH`), talks to it over NDJSON on stdio, and restarts it
+with backoff if it exits. It reuses the `gentle-engines` Anthropic client,
+keystore (same `sk-ant-…` key as `gentle-explain`, keyring service
+`gentle-engines`) and config. The default model line is **sonnet**; `--deep`
+uses **opus**; override via `~/.config/gentle-partitioner/engines.toml` under
+`[arch] model = "…"`.
+
+### Knowledge base
+
+A curated, versioned list of ~18 **official** source URLs (GCP + data first:
+Airflow best practices and the BigQuery/Dataflow operators; Cloud Composer
+overview, pricing and optimization; Cloud Scheduler; Cloud Run jobs; Workflows;
+BigQuery cost/performance best practices; Dataflow; the Architecture Framework
+pillars; and the GCP "Orchestrating your data workloads" blog) lives in
+`engines/src/kb.rs`.
+
+```
+gentle-arch kb update   # fetch + strip HTML + chunk (~800 tokens, overlap) + BM25 index
+gentle-arch kb status   # sources, chunks, age and failed fetches
+```
+
+The KB is stored under `~/.local/share/gentle-partitioner/kb/` (override with
+`GENTLE_ARCH_KB_DIR`). Fetches use `ureq`; HTML is reduced to text by a small own
+tag stripper (drops script/style/nav, keeps headings and code); chunks are
+indexed with an own BM25 (`k1=1.2`, `b=0.75`, lowercase Unicode tokenization,
+Spanish/English stopwords) serialized to JSON. Per source it records url, title,
+`fetched_at` and sha256. A failed fetch is recorded and **does not abort** the
+update.
+
+### Review and design
+
+```
+gentle-arch review [PATH] [--deep] [--out FILE] [--no-tools]
+gentle-arch design "<brief>" [--deep] [--out FILE] [--brief-file F]   # or pipe the brief on stdin
+```
+
+`review` scans `PATH` (default cwd) with bounded reads (≤ 200 files, ≤ 120 KiB,
+DAGs/CI/IaC first) and a manifest of what was included/excluded. **Secrets never
+leave the machine:** `.env*`, `*.pem`, `*.key`, `id_rsa*`, `*credentials*`,
+service-account JSON (`private_key`), `*.tfstate*`, `.git/`, `node_modules`,
+`target`, `venv` are never read; `*.tfvars` values are replaced with
+`<redacted>`; and inline secrets (AWS/GCP keys, Slack/GitHub/Anthropic tokens,
+`password|secret|token|api_key` assignments, PEM blocks) are redacted before any
+text is sent. When on `PATH` (unless `--no-tools`), `infracost` and `checkov`
+run with a 120 s timeout and only their summarized JSON enters the context;
+missing tools are noted as "not installed". The top 12 BM25 chunks go into the
+(cache-controlled) system prompt, cited as `[n]` with their URL. The model
+returns a structured report (executive summary; architecture + Mermaid C4;
+findings by Architecture Framework pillar; cost analysis; CI/CD proposals; MADR
+ADRs; sources) streamed to the terminal and written to `--out` (default
+`./.gentle-arch/<kind>-<timestamp>.md`, never overwriting). `design` runs the
+same structure from a brief, answering in the brief's language.
+
+With no args `gentle-arch` runs the stdio engine: `{"type":"review",…}`,
+`{"type":"design",…}`, `{"type":"cancel",…}` and `shutdown` →
+`delta`/`done{"path"}`/`error`/`status{key,model,kb_chunks}`.
 
 ## Apps engine (`gentle-apps`)
 
@@ -357,6 +426,7 @@ gentle-partitioner --version     # version
 gentle-partitioner --no-predict  # disable the prediction engine and server
 gentle-partitioner --no-apps     # disable the apps engine and the apps panel
 gentle-partitioner --no-explain  # disable the code-explainer engine
+gentle-partitioner --no-arch     # disable the architecture engine
 ```
 
 The child process inherits the current working directory, with
@@ -460,13 +530,19 @@ else is forwarded to the chat.
 - **`explain_client.rs`** — supervises the independent `gentle-explain` process
   (spawn, NDJSON reader thread, writer, backoff restart, kill-on-quit), mirroring
   `apps_client.rs` (S17).
+- **`arch_client.rs`** — supervises the independent `gentle-arch` process the
+  same way, feeding review/design deltas, `done{path}`, errors and status into
+  the UI channel (S18).
 - **`keys.rs`** — encodes crossterm key events as the bytes a terminal sends to
   a PTY child.
 - **`engines/`** — the `gentle-engines` workspace member: the Anthropic Messages
   client (`anthropic` — SSE streaming, model resolution, bounded retries), the
   keyring `keystore`, the NDJSON `protocol`, selection/context caps (`context`),
-  the stdio explainer `engine`/`backend` and the `key` CLI. Builds the
-  `gentle-explain` binary (S17); designed for the T18 `gentle-arch` to reuse.
+  the stdio explainer `engine`/`backend` and the `key` CLI. It also holds the
+  architecture engine: the knowledge base (`kb` — HTML strip, chunking, BM25),
+  the repo `scan` with secret redaction, the optional external `tools`, the
+  `arch` review/design core and its `arch_engine`/`arch_protocol`. Builds the
+  `gentle-explain` and `gentle-arch` binaries (S17, S18).
 - **`apps/`** — the `gentle-apps` workspace member: the shared `protocol`
   (NDJSON message types), the `Connector` trait, the threaded stdio `engine`,
   and the live Slack connector with its browser OAuth/PKCE login (`pkce`,

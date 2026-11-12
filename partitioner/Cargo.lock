@@ -895,6 +895,7 @@ name = "gentle-engines"
 version = "0.1.0"
 dependencies = [
  "keyring",
+ "regex",
  "rpassword",
  "serde",
  "serde_json",

@@ -3,6 +3,7 @@
 pub mod app;
 pub mod apps_client;
 pub mod apps_panel;
+pub mod arch_client;
 pub mod editor;
 pub mod explain_client;
 pub mod highlight;

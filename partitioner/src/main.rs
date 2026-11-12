@@ -26,6 +26,7 @@ use ratatui::Terminal;
 
 use gentle_partitioner::app::{draw, Action, App, Focus};
 use gentle_partitioner::apps_client::{AppsClient, AppsEvent};
+use gentle_partitioner::arch_client::{ArchClient, ArchEvent};
 use gentle_partitioner::explain_client::{ExplainClient, ExplainEvent};
 use gentle_partitioner::pane::PtyPane;
 use gentle_partitioner::predict::{self, Engine};
@@ -49,12 +50,14 @@ OPTIONS:
         --no-predict Disable the local n-gram prediction engine and server
         --no-apps    Disable the apps engine and the bottom-left apps panel
         --no-explain Disable the code-explainer engine (gentle-explain)
+        --no-arch    Disable the architecture engine (gentle-arch)
 
 Without a command it runs `gentle-shell` inside a partitioned terminal.
 Everything after `--` is launched instead of the default command.
 With prediction on, the child sees GENTLE_PREDICT_URL and GENTLE_PREDICT_TOKEN.
 The apps engine (gentle-apps) runs as a separate process unless --no-apps.
 The explainer engine (gentle-explain) runs as a separate process unless --no-explain.
+The architecture engine (gentle-arch) runs as a separate process unless --no-arch.
 ";
 
 type Backend = CrosstermBackend<io::Stdout>;
@@ -71,6 +74,8 @@ enum Event {
     Apps(AppsEvent),
     /// An event from the independent explainer engine (S17).
     Explain(ExplainEvent),
+    /// An event from the independent architecture engine (S18).
+    Arch(ArchEvent),
 }
 
 fn main() {
@@ -99,7 +104,7 @@ fn run() -> Result<i32> {
 
     install_panic_hook();
     let mut terminal = setup_terminal().context("entering raw mode / alternate screen")?;
-    let result = event_loop(&mut terminal, &command, opts.predict, opts.apps, opts.explain);
+    let result = event_loop(&mut terminal, &command, opts.predict, opts.apps, opts.explain, opts.arch);
     // Always restore the terminal, even when the loop failed.
     let _ = restore_terminal();
     result.map(|_| 0)
@@ -110,6 +115,7 @@ struct RunOpts {
     predict: bool,
     apps: bool,
     explain: bool,
+    arch: bool,
 }
 
 enum ParseOutcome {
@@ -123,6 +129,7 @@ fn parse_args(args: Vec<String>) -> Result<ParseOutcome> {
     let mut predict = true;
     let mut apps = true;
     let mut explain = true;
+    let mut arch = true;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -142,6 +149,9 @@ fn parse_args(args: Vec<String>) -> Result<ParseOutcome> {
             "--no-explain" => {
                 explain = false;
             }
+            "--no-arch" => {
+                arch = false;
+            }
             "--" => {
                 command.extend(iter.by_ref());
                 break;
@@ -156,7 +166,7 @@ fn parse_args(args: Vec<String>) -> Result<ParseOutcome> {
     if command.is_empty() {
         command.push(DEFAULT_COMMAND.to_string());
     }
-    Ok(ParseOutcome::Run(RunOpts { command, predict, apps, explain }))
+    Ok(ParseOutcome::Run(RunOpts { command, predict, apps, explain, arch }))
 }
 
 /// Shared handles for the prediction engine and its local server.
@@ -231,6 +241,7 @@ fn event_loop(
     predict_enabled: bool,
     apps_enabled: bool,
     explain_enabled: bool,
+    arch_enabled: bool,
 ) -> Result<()> {
     let root = std::env::current_dir().context("reading the current directory")?;
     let mut app = App::new(root.clone());
@@ -294,6 +305,26 @@ fn event_loop(
         None
     };
 
+    // The architecture engine runs as a separate process (S18), bridged onto
+    // the single UI channel so redraws happen only on events (S11).
+    let arch = if arch_enabled {
+        let (ar_tx, ar_rx) = mpsc::channel::<ArchEvent>();
+        let ui_tx = tx.clone();
+        std::thread::Builder::new()
+            .name("arch-bridge".into())
+            .spawn(move || {
+                while let Ok(ev) = ar_rx.recv() {
+                    if ui_tx.send(Event::Arch(ev)).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn arch bridge");
+        Some(ArchClient::spawn(ar_tx))
+    } else {
+        None
+    };
+
     // Coalesce PTY wake-ups: the reader thread flips the flag and only sends a
     // PtyOutput when none is pending, so the UI never floods on fast output.
     let pty_pending = Arc::new(AtomicBool::new(false));
@@ -327,6 +358,12 @@ fn event_loop(
                             e.send(msg);
                         }
                     }
+                    Action::Arch(msg) => {
+                        if let Some(a) = &arch {
+                            a.send(msg);
+                        }
+                    }
+                    Action::OpenReport(path) => open_with_system(&path),
                     Action::Quit => break,
                 }
                 // A save asks for a fresh git status off the UI thread.
@@ -352,6 +389,12 @@ fn event_loop(
                         e.send(msg);
                     }
                 }
+                Action::Arch(msg) => {
+                    if let Some(a) = &arch {
+                        a.send(msg);
+                    }
+                }
+                Action::OpenReport(path) => open_with_system(&path),
                 Action::Quit => break,
             },
             Event::Input(CtEvent::Paste(text)) => {
@@ -378,6 +421,8 @@ fn event_loop(
             Event::Apps(AppsEvent::Offline) => app.set_apps_offline(),
             Event::Explain(ExplainEvent::Msg(msg)) => app.apply_explain_msg(msg),
             Event::Explain(ExplainEvent::Offline) => app.set_explain_offline(),
+            Event::Arch(ArchEvent::Msg(msg)) => app.apply_arch_msg(msg),
+            Event::Arch(ArchEvent::Offline) => app.set_arch_offline(),
         }
 
         // The child owns the session lifetime: when it exits, so do we.
@@ -395,7 +440,21 @@ fn event_loop(
     if let Some(e) = &explain {
         e.shutdown();
     }
+    if let Some(a) = &arch {
+        a.shutdown();
+    }
     Ok(())
+}
+
+/// Opens `path` with the system handler (xdg-open), detached. Best-effort: a
+/// missing opener never disturbs the TUI.
+fn open_with_system(path: &str) {
+    let _ = std::process::Command::new("xdg-open")
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
 }
 
 fn spawn_input_thread(tx: Sender<Event>) {

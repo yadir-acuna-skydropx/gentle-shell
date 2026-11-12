@@ -316,7 +316,21 @@ impl Client {
         on_delta: &mut dyn FnMut(&str),
         cancel: &dyn Fn() -> bool,
     ) -> Result<(), AnthropicError> {
-        let body = build_body(system, messages, model);
+        self.stream_message_with(system, messages, model, DEFAULT_MAX_TOKENS, on_delta, cancel)
+    }
+
+    /// Like [`Client::stream_message`] but with an explicit `max_tokens` (the
+    /// architecture engine needs a larger budget than the explainer).
+    pub fn stream_message_with(
+        &self,
+        system: &str,
+        messages: &[Message],
+        model: &str,
+        max_tokens: u32,
+        on_delta: &mut dyn FnMut(&str),
+        cancel: &dyn Fn() -> bool,
+    ) -> Result<(), AnthropicError> {
+        let body = build_body_opts(system, messages, model, max_tokens);
         let mut attempt: u32 = 0;
         loop {
             if cancel() {
@@ -375,14 +389,23 @@ struct ModelsPage {
     last_id: Option<String>,
 }
 
+/// Default completion budget for the explainer.
+pub const DEFAULT_MAX_TOKENS: u32 = 1024;
+
 /// Builds the Messages request body with the stable system prompt marked for
-/// ephemeral prompt caching.
+/// ephemeral prompt caching (default token budget).
 pub fn build_body(system: &str, messages: &[Message], model: &str) -> String {
+    build_body_opts(system, messages, model, DEFAULT_MAX_TOKENS)
+}
+
+/// Builds the Messages request body with an explicit `max_tokens`. The stable
+/// system prompt (instructions + KB) is marked for ephemeral prompt caching.
+pub fn build_body_opts(system: &str, messages: &[Message], model: &str, max_tokens: u32) -> String {
     let msgs: Vec<serde_json::Value> =
         messages.iter().map(|m| serde_json::json!({"role": m.role, "content": m.content})).collect();
     let body = serde_json::json!({
         "model": model,
-        "max_tokens": 1024,
+        "max_tokens": max_tokens,
         "stream": true,
         "system": [{
             "type": "text",
