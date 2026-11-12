@@ -204,6 +204,10 @@ fn redactors() -> &'static Redactors {
             r"sk-[0-9A-Za-z]{20,}",
             // Generic secret assignments.
             r"(?i)(password|secret|token|api[_-]?key)\s*[:=]\s*\S+",
+            // Credentials embedded in URLs (scheme://user:pass@host): the userinfo goes.
+            r"(?i)\b[a-z][a-z0-9+.\-]*://[^\s/:@]+:[^\s/@]+@",
+            // Space-form secret assignments (Dockerfile ENV/ARG, shell-like configs).
+            r"(?im)^(\s*(?:ENV|ARG)\s+)?[A-Z0-9_]*(?:PASSWORD|PASSWD|SECRET|TOKEN|API_?KEY|PRIVATE_?KEY)[A-Z0-9_]*\s+\S+",
         ];
         Redactors { patterns: patterns.iter().map(|p| Regex::new(p).expect("valid redaction regex")).collect() }
     })
@@ -342,7 +346,8 @@ fn walk(root: &Path) -> Vec<(String, PathBuf)> {
             let Ok(ft) = entry.file_type() else { continue };
             let name = entry.file_name().to_string_lossy().to_string();
             if ft.is_dir() {
-                if EXCLUDED_DIRS.contains(&name.as_str()) || name.starts_with(".git") {
+                // Skip only the .git directory itself; .github holds CI workflows to review.
+                if EXCLUDED_DIRS.contains(&name.as_str()) || name == ".git" {
                     continue;
                 }
                 stack.push(path);
