@@ -122,6 +122,47 @@ impl ExplainBackend for AnthropicBackend {
         self.convo.push(Message::user(question.to_string()));
         self.stream_turn(&system, sink, cancel)
     }
+
+    fn suggest(
+        &mut self,
+        command_line: &str,
+        recent_output: &str,
+        question: &str,
+        sink: &mut dyn FnMut(&str),
+        cancel: &CancelFlag,
+    ) -> Result<(), String> {
+        if self.client.is_none() {
+            return Err(missing_key_msg());
+        }
+        // One-shot: start a fresh conversation so the helper never disturbs the
+        // explain thread (S24).
+        let lang = context::detect_lang(question, &self.cfg.lang);
+        let system = format!(
+            "You are a terminal command assistant inside a developer tool. The user is working in a \
+             shell. Using the recent terminal output and their question, answer concisely and \
+             recommend concrete shell commands, each with a one-line explanation. Prefer common \
+             POSIX tools and flag any destructive command. Reply in {lang}."
+        );
+        let out = tail_chars(recent_output, 4000);
+        let line = command_line.trim();
+        let user = if line.is_empty() {
+            format!("Recent terminal output:\n```\n{out}\n```\n\nQuestion: {question}")
+        } else {
+            format!("Recent terminal output:\n```\n{out}\n```\nCurrent command line: {line}\n\nQuestion: {question}")
+        };
+        self.convo = vec![Message::user(user)];
+        self.stream_turn(&system, sink, cancel)
+    }
+}
+
+/// Keeps the last `max` characters of `s` (on a char boundary), so a long
+/// terminal scrollback does not bloat the request body.
+fn tail_chars(s: &str, max: usize) -> String {
+    let count = s.chars().count();
+    if count <= max {
+        return s.to_string();
+    }
+    s.chars().skip(count - max).collect()
 }
 
 impl ExplainConfig {

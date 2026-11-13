@@ -33,6 +33,17 @@ pub enum ClientMsg {
     },
     /// A follow-up question in the same conversation as the last explain.
     Ask { id: u64, question: String },
+    /// A one-shot command-helper request (S24): answer or recommend shell
+    /// commands from the terminal's recent output and the user's question. It
+    /// never touches the explain conversation.
+    Suggest {
+        id: u64,
+        #[serde(default)]
+        command_line: String,
+        #[serde(default)]
+        recent_output: String,
+        question: String,
+    },
     /// Cancel the in-flight request with this id.
     Cancel { id: u64 },
     /// Stop the engine.
@@ -126,6 +137,12 @@ mod tests {
             context_after: "// after".into(),
         });
         rt_client(ClientMsg::Ask { id: 2, question: "¿por qué?".into() });
+        rt_client(ClientMsg::Suggest {
+            id: 4,
+            command_line: "git stat".into(),
+            recent_output: "fatal: not a git repository".into(),
+            question: "¿cómo inicio un repo?".into(),
+        });
         rt_client(ClientMsg::Cancel { id: 3 });
         rt_client(ClientMsg::Shutdown);
     }

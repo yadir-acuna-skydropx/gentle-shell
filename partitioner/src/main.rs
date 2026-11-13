@@ -27,6 +27,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 
+use gentle_engines::protocol::ClientMsg;
 use gentle_partitioner::app::{draw, Action, App, Focus};
 use gentle_partitioner::apps_client::{AppsClient, AppsEvent};
 use gentle_partitioner::arch_client::{ArchClient, ArchEvent};
@@ -402,6 +403,21 @@ fn event_loop(
                             e.send(msg);
                         }
                     }
+                    Action::Helper { id, question } => {
+                        if let Some(e) = &explain {
+                            let recent = shell
+                                .as_ref()
+                                .filter(|sh| sh.is_alive())
+                                .map(|sh| sh.with_screen(|s| s.contents()))
+                                .unwrap_or_default();
+                            e.send(ClientMsg::Suggest {
+                                id,
+                                command_line: String::new(),
+                                recent_output: recent,
+                                question,
+                            });
+                        }
+                    }
                     Action::Arch(msg) => {
                         if let Some(a) = &arch {
                             a.send(msg);
@@ -437,6 +453,16 @@ fn event_loop(
                 Action::Explain(msg) => {
                     if let Some(e) = &explain {
                         e.send(msg);
+                    }
+                }
+                Action::Helper { id, question } => {
+                    if let Some(e) = &explain {
+                        let recent = shell
+                            .as_ref()
+                            .filter(|sh| sh.is_alive())
+                            .map(|sh| sh.with_screen(|s| s.contents()))
+                            .unwrap_or_default();
+                        e.send(ClientMsg::Suggest { id, command_line: String::new(), recent_output: recent, question });
                     }
                 }
                 Action::Arch(msg) => {

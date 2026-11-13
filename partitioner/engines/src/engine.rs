@@ -56,11 +56,22 @@ pub trait ExplainBackend: Send + 'static {
     fn explain(&mut self, input: &ExplainInput, sink: &mut dyn FnMut(&str), cancel: &CancelFlag) -> Result<(), String>;
     /// Answers a follow-up in the conversation started by the last `explain`.
     fn ask(&mut self, question: &str, sink: &mut dyn FnMut(&str), cancel: &CancelFlag) -> Result<(), String>;
+    /// Answers a one-shot command-helper request (S24), independent of the
+    /// explain conversation.
+    fn suggest(
+        &mut self,
+        command_line: &str,
+        recent_output: &str,
+        question: &str,
+        sink: &mut dyn FnMut(&str),
+        cancel: &CancelFlag,
+    ) -> Result<(), String>;
 }
 
 enum Req {
     Explain(ExplainInput),
     Ask(String),
+    Suggest { command_line: String, recent_output: String, question: String },
 }
 
 enum Ev {
@@ -110,6 +121,12 @@ where
             Ev::Client(ClientMsg::Ask { id, question }) => {
                 if !shutting_down {
                     queue.push_back((id, Req::Ask(question)));
+                    start_next(&backend, &tx, &mut queue, &mut current, &mut worker);
+                }
+            }
+            Ev::Client(ClientMsg::Suggest { id, command_line, recent_output, question }) => {
+                if !shutting_down {
+                    queue.push_back((id, Req::Suggest { command_line, recent_output, question }));
                     start_next(&backend, &tx, &mut queue, &mut current, &mut worker);
                 }
             }
@@ -185,6 +202,9 @@ fn spawn_request(
             match req {
                 Req::Explain(input) => b.explain(&input, &mut sink, &flag),
                 Req::Ask(q) => b.ask(&q, &mut sink, &flag),
+                Req::Suggest { command_line, recent_output, question } => {
+                    b.suggest(&command_line, &recent_output, &question, &mut sink, &flag)
+                }
             }
         };
         if !flag.is_cancelled() {
@@ -271,6 +291,18 @@ mod tests {
             sink("answer");
             Ok(())
         }
+        fn suggest(
+            &mut self,
+            _command_line: &str,
+            _recent_output: &str,
+            _question: &str,
+            sink: &mut dyn FnMut(&str),
+            _cancel: &CancelFlag,
+        ) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            sink("suggestion");
+            Ok(())
+        }
     }
 
     fn run_collect(mock: Mock, input: &str) -> Vec<EngineMsg> {
@@ -294,6 +326,18 @@ mod tests {
     fn status_is_emitted_first() {
         let msgs = run_collect(mock(&[]), "{\"type\":\"shutdown\"}\n");
         assert!(matches!(msgs[0], EngineMsg::Status { key: KeyState::Set, .. }));
+    }
+
+    #[test]
+    fn suggest_streams_a_oneshot_answer() {
+        // S24: a command-helper request streams deltas then Done, keyed by id.
+        let input = concat!(
+            "{\"type\":\"suggest\",\"id\":5,\"recent_output\":\"fatal: not a git repo\",\"question\":\"how do I init?\"}\n",
+            "{\"type\":\"shutdown\"}\n",
+        );
+        let msgs = run_collect(mock(&["use ", "git init"]), input);
+        assert!(msgs.iter().any(|m| matches!(m, EngineMsg::Delta { id: 5, .. })));
+        assert!(msgs.iter().any(|m| matches!(m, EngineMsg::Done { id: 5 })));
     }
 
     #[test]

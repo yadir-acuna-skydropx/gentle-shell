@@ -150,6 +150,9 @@ pub enum Action {
     Apps(ClientMsg),
     /// A request for the explainer engine (explain / ask / cancel).
     Explain(ExplainReq),
+    /// A command-helper question (S24); main.rs attaches the shell context and
+    /// sends it to the engine as a one-shot Suggest.
+    Helper { id: u64, question: String },
     /// A request for the architecture engine (review / design / cancel).
     Arch(ArchReq),
     /// Open a finished report file with the system opener (xdg-open).
@@ -224,6 +227,10 @@ fn language_for(path: &Path) -> String {
 /// gentle-apps connector: the partitioner renders it from the gentle-arch
 /// status and opens the Arch overlay on it.
 const ARCH_ROW_ID: &str = "__arch__";
+
+/// Helper requests share the explainer engine but are keyed in a separate id
+/// range so their streamed messages never route to the explain popup (S24).
+const HELPER_ID_BASE: u64 = 1_000_000_000;
 
 /// Maps a focus target to the layout pane it belongs to (the apps panel lives
 /// inside the sidebar unit).
@@ -324,6 +331,9 @@ pub struct App {
     pub explain: ExplainUi,
     /// Architecture overlay state (S18).
     pub arch: ArchUi,
+    /// Command-helper state for the Agent-changes helper box (S24, T25b).
+    /// Reuses the explainer UI shape; ids are offset by [`HELPER_ID_BASE`].
+    pub helper: ExplainUi,
     /// Blink phase for the animated explainer caret (S21): toggled on each
     /// timer tick while the explain popup accepts input.
     pub blink_on: bool,
@@ -378,6 +388,7 @@ impl App {
             minimized_regions: Vec::new(),
             explain: ExplainUi::default(),
             arch: ArchUi::default(),
+            helper: ExplainUi::default(),
             blink_on: true,
             gitgraph: GitGraphData::default(),
             gitgraph_scroll: 0,
@@ -389,7 +400,8 @@ impl App {
     /// True when the explainer popup is open and showing its follow-up input,
     /// so the animated caret (S21) should blink and the UI should tick.
     pub fn explain_input_active(&self) -> bool {
-        self.overlay == Some(Overlay::Explain) && !self.explain.key_missing
+        (self.overlay == Some(Overlay::Explain) && !self.explain.key_missing)
+            || (self.focus == Focus::Helper && !self.helper.key_missing)
     }
 
     /// Advances the caret blink phase (S21). Returns true when the popup is
@@ -736,13 +748,7 @@ impl App {
             // The shell gets raw bytes; the prefix chord (Ctrl+]) is already
             // intercepted above, so it still escapes the terminal.
             Focus::Terminal => Action::ForwardShell(crate::keys::encode(key, false)),
-            // The helper input is wired in T25b; for now Esc returns to the diff.
-            Focus::Helper => {
-                if key.code == KeyCode::Esc {
-                    self.focus = Focus::Diff;
-                }
-                Action::None
-            }
+            Focus::Helper => self.helper_key(key),
         }
     }
 
@@ -763,12 +769,18 @@ impl App {
                 if id == self.explain.id {
                     self.explain.body.push_str(&text);
                     self.explain.thinking = false;
+                } else if id == self.helper.id {
+                    self.helper.body.push_str(&text);
+                    self.helper.thinking = false;
                 }
             }
             ExplainMsg::Done { id } => {
                 if id == self.explain.id {
                     self.explain.in_flight = false;
                     self.explain.thinking = false;
+                } else if id == self.helper.id {
+                    self.helper.in_flight = false;
+                    self.helper.thinking = false;
                 }
             }
             ExplainMsg::Error { id, message } => {
@@ -776,13 +788,59 @@ impl App {
                     self.explain.error = Some(message);
                     self.explain.in_flight = false;
                     self.explain.thinking = false;
+                } else if id == self.helper.id {
+                    self.helper.error = Some(message);
+                    self.helper.in_flight = false;
+                    self.helper.thinking = false;
                 }
             }
             ExplainMsg::Status { key, model } => {
-                self.explain.key_missing = key == ExplainKey::Missing;
-                self.explain.model = model;
+                let missing = key == ExplainKey::Missing;
+                self.explain.key_missing = missing;
+                self.explain.model = model.clone();
                 self.explain.offline = false;
+                // The helper shares the same engine, key and model.
+                self.helper.key_missing = missing;
+                self.helper.model = model;
+                self.helper.offline = false;
             }
+        }
+    }
+
+    /// Command-helper reducer (S24): typing edits the question, Enter sends a
+    /// one-shot Suggest (main.rs attaches the shell context), Esc leaves.
+    fn helper_key(&mut self, key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.focus = Focus::Diff;
+                Action::None
+            }
+            KeyCode::Enter => {
+                let q = self.helper.question.trim().to_string();
+                if q.is_empty() || self.helper.key_missing {
+                    return Action::None;
+                }
+                self.helper.question.clear();
+                self.helper.body.clear();
+                self.helper.error = None;
+                self.helper.scroll = 0;
+                self.helper.next_id += 1;
+                let id = HELPER_ID_BASE + self.helper.next_id;
+                self.helper.id = id;
+                self.helper.in_flight = true;
+                self.helper.thinking = true;
+                Action::Helper { id, question: q }
+            }
+            KeyCode::Backspace => {
+                self.helper.question.pop();
+                Action::None
+            }
+            KeyCode::Char(c) if !ctrl => {
+                self.helper.question.push(c);
+                Action::None
+            }
+            _ => Action::None,
         }
     }
 
@@ -2836,17 +2894,13 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
                 ),
             }
             app.term_area = Some(tinner);
-            // Bottom-right: the command helper (input/answers land here in T25b).
-            let hblock = pane_block(" Helper ".into(), focus == Focus::Helper);
+            // Bottom-right: the command helper (S24) — streamed Haiku answer +
+            // a question input line; it reads the terminal's recent output.
+            let hblock = pane_block(" Helper · type + Enter ".into(), focus == Focus::Helper);
             let hinner = hblock.inner(helper);
             frame.render_widget(hblock, helper);
-            frame.render_widget(
-                Paragraph::new(vec![
-                    Line::styled("Ask about / recommend commands", Style::default().fg(Color::DarkGray)),
-                    Line::styled("from what you run (coming soon).", Style::default().fg(Color::DarkGray)),
-                ]),
-                hinner,
-            );
+            let hlines = explain_lines(&app.helper, hinner.width as usize, hinner.height as usize, app.blink_on);
+            frame.render_widget(Paragraph::new(hlines), hinner);
             app.helper_area = Some(hinner);
         } else {
             app.term_area = None;
@@ -3032,6 +3086,7 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "Agent changes: diff (top) + $SHELL terminal + command helper (S24)".into(),
         "        ↑↓ PgUp PgDn scroll the diff · click the terminal/helper to focus".into(),
         "        terminal: run commands (touch, mkdir, background jobs) · Esc back".into(),
+        "        helper: type a question + Enter — Haiku recommends commands · Esc back".into(),
         "Apps: ↑↓ select · Enter app→items→reply · a actions (open) · Esc back".into(),
         "      +/- resize the expanded panel (40-70%) · click an app to open it".into(),
         "      header: [_] collapse · [□] expand · click “Apps” to toggle".into(),
@@ -3491,6 +3546,36 @@ mod tests {
         let helper = app.helper_area.expect("helper region captured in the draw");
         app.handle_mouse(click(helper.x, helper.y));
         assert_eq!(app.focus, Focus::Helper);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Diff);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn helper_sends_a_suggest_and_routes_the_answer() {
+        // S24/T25b: typing + Enter in the helper box emits a one-shot Helper
+        // action with an offset id; the streamed answer routes to the helper,
+        // never the explain popup.
+        let (root, mut app) = workspace("helper-engine");
+        render(&mut app, 120, 40);
+        let helper = app.helper_area.expect("helper region captured in the draw");
+        app.handle_mouse(click(helper.x, helper.y));
+        assert_eq!(app.focus, Focus::Helper);
+        app.apply_explain_msg(ExplainMsg::Status { key: ExplainKey::Set, model: "claude-haiku".into() });
+        for c in "ls?".chars() {
+            app.handle_key(ch(c));
+        }
+        let id = match app.handle_key(key(KeyCode::Enter)) {
+            Action::Helper { id, question } => {
+                assert_eq!(question, "ls?");
+                id
+            }
+            other => panic!("expected a helper request, got {other:?}"),
+        };
+        assert!(id >= HELPER_ID_BASE, "helper ids are offset to avoid explain-id collisions");
+        app.apply_explain_msg(ExplainMsg::Delta { id, text: "try `ls -la`".into() });
+        assert_eq!(app.helper.body, "try `ls -la`");
+        assert_eq!(app.explain.body, "", "the explain popup is untouched");
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.focus, Focus::Diff);
         fs::remove_dir_all(root).unwrap();
