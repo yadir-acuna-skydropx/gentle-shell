@@ -18,6 +18,7 @@ use gentle_engines::protocol::{ClientMsg as ExplainReq, EngineMsg as ExplainMsg,
 
 use crate::apps_panel::{AppsPanel, View};
 use crate::editor::{Editor, SaveOutcome};
+use crate::gitgraph::{self, GitGraphData};
 use crate::highlight::{self, Highlighter};
 use crate::icons::{self, IconMode};
 use crate::layout::{self, Layout, Mode, Pane};
@@ -60,6 +61,8 @@ pub enum Overlay {
     /// The architecture engine overlay (S18): review the repo or design from a
     /// brief, streaming a markdown report.
     Arch,
+    /// The graphical git overlay (S20): commit/branch DAG + local worktrees.
+    GitGraph,
 }
 
 /// The three stages of the architecture overlay (S18).
@@ -311,6 +314,10 @@ pub struct App {
     /// Blink phase for the animated explainer caret (S21): toggled on each
     /// timer tick while the explain popup accepts input.
     pub blink_on: bool,
+    /// Graphical git overlay data (S20), refreshed each time it opens.
+    pub gitgraph: GitGraphData,
+    /// Scroll offset (commit rows) of the git graph overlay.
+    pub gitgraph_scroll: usize,
 }
 
 impl App {
@@ -357,6 +364,8 @@ impl App {
             explain: ExplainUi::default(),
             arch: ArchUi::default(),
             blink_on: true,
+            gitgraph: GitGraphData::default(),
+            gitgraph_scroll: 0,
         };
         app.rescan();
         app
@@ -1175,6 +1184,7 @@ impl App {
             }
             KeyCode::Char('e') => self.open_explain(),
             KeyCode::Char('A') => self.open_arch(),
+            KeyCode::Char('g') => self.open_gitgraph(),
             KeyCode::Char('q') => {
                 // A dirty buffer warns once before quitting; a second q quits.
                 if self.editor.as_ref().is_some_and(|e| e.dirty) && !self.pending_quit {
@@ -1264,6 +1274,22 @@ impl App {
         if overlay == Overlay::Explain {
             return self.explain_key(key);
         }
+        // The git graph overlay scrolls the commit rows; Esc closes it.
+        if overlay == Overlay::GitGraph {
+            match key.code {
+                KeyCode::Esc => self.overlay = None,
+                KeyCode::Up | KeyCode::Char('k') => self.gitgraph_scroll = self.gitgraph_scroll.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.gitgraph_scroll = (self.gitgraph_scroll + 1).min(self.gitgraph.rows.len().saturating_sub(1))
+                }
+                KeyCode::PageUp => self.gitgraph_scroll = self.gitgraph_scroll.saturating_sub(10),
+                KeyCode::PageDown => {
+                    self.gitgraph_scroll = (self.gitgraph_scroll + 10).min(self.gitgraph.rows.len().saturating_sub(1))
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
         // The architecture overlay has its own reducer (menu / brief / report).
         if overlay == Overlay::Arch {
             return self.arch_key(key);
@@ -1275,7 +1301,7 @@ impl App {
             KeyCode::Enter => match overlay {
                 Overlay::Files => self.toggle_or_open_selected(),
                 Overlay::Changes => self.open_selected_change(),
-                Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch => {}
+                Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch | Overlay::GitGraph => {}
             },
             _ => {}
         }
@@ -1286,7 +1312,7 @@ impl App {
         match overlay {
             Overlay::Files => self.selected = clamp_index(self.selected, delta, self.entries.len()),
             Overlay::Changes => self.change_selected = clamp_index(self.change_selected, delta, self.changes().len()),
-            Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch => {}
+            Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch | Overlay::GitGraph => {}
         }
     }
 
@@ -1352,6 +1378,14 @@ impl App {
     /// Opens the architecture overlay (prefix `A` / the "Arch" tool), starting
     /// on the two-option menu. The engine's start `status` populates the key /
     /// model / KB-chunk fields.
+    /// Opens the graphical git overlay (S20), refreshing the DAG from git.
+    fn open_gitgraph(&mut self) -> Action {
+        self.gitgraph = gitgraph::collect(&self.root);
+        self.gitgraph_scroll = 0;
+        self.overlay = Some(Overlay::GitGraph);
+        Action::None
+    }
+
     fn open_arch(&mut self) -> Action {
         self.overlay = Some(Overlay::Arch);
         self.arch.stage = ArchStage::Menu;
@@ -1844,7 +1878,7 @@ impl App {
                 }
             }
             Overlay::Apps => return self.click_apps(area, (area.x + 1).max(0), row),
-            Overlay::Help | Overlay::Explain | Overlay::Arch => {}
+            Overlay::Help | Overlay::Explain | Overlay::Arch | Overlay::GitGraph => {}
         }
         Action::None
     }
@@ -2809,9 +2843,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
             let h = area.height.saturating_sub(2) as usize;
             let lines = arch_lines(&app.arch, w, h);
             frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
+        } else if overlay == Overlay::GitGraph {
+            let title = " Git graph · ↑↓ scroll · Esc close ".to_string();
+            let w = area.width.saturating_sub(2) as usize;
+            let h = area.height.saturating_sub(2) as usize;
+            let lines = gitgraph_lines(&app.gitgraph, app.gitgraph_scroll, w, h);
+            frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
         } else {
         let (title, lines) = match overlay {
-            Overlay::Explain | Overlay::Arch => unreachable!("handled above"),
+            Overlay::Explain | Overlay::Arch | Overlay::GitGraph => unreachable!("handled above"),
             Overlay::Files => {
                 let h = area.height.saturating_sub(2) as usize;
                 app.tree_offset = keep_visible(app.selected, app.tree_offset, h);
@@ -2848,7 +2888,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
     }
 
     let status = if app.prefix {
-        Line::styled(format!(" {PREFIX_LABEL} … w workspace · t files · c changes · a apps · z zoom · m min · d changes-only · Tab/1-4 focus · ? help · q quit · ] send {PREFIX_LABEL}"), Style::default().fg(Color::Black).bg(Color::Cyan))
+        Line::styled(format!(" {PREFIX_LABEL} … w workspace · t files · c changes · a apps · g graph · z zoom · m min · d changes-only · Tab/1-4 focus · ? help · q quit · ] send {PREFIX_LABEL}"), Style::default().fg(Color::Black).bg(Color::Cyan))
     } else if let Some(msg) = &app.status_msg {
         Line::styled(format!(" {msg}"), Style::default().fg(Color::Black).bg(Color::Yellow))
     } else if focus == Focus::Editor && app.editor.as_ref().is_some_and(|e| e.has_selection()) {
@@ -2890,6 +2930,7 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "  z      zoom the focused pane (maximize / restore)".into(),
         "  m      minimize the focused pane (restore with m or a click)".into(),
         "  d      changes only (focus + zoom the agent-changes pane)".into(),
+        "  g      git graph (commit/branch DAG + worktrees overlay)".into(),
         "  Tab    next pane   1-4 sidebar / editor / changes / chat".into(),
         "  q      quit (stops gentle-shell)".into(),
         format!("  ]      send a literal {PREFIX_LABEL} to the chat"),
@@ -3071,6 +3112,68 @@ fn explain_lines(e: &ExplainUi, w: usize, h: usize, blink_on: bool) -> Vec<Line<
         format!("> {}{}", e.question, caret)
     };
     out.push(Line::styled(prompt, Style::default().fg(Color::Cyan)));
+    out
+}
+
+/// Colors cycled across graph lanes so parallel branches stay distinguishable.
+const GRAPH_LANE_COLORS: [Color; 6] =
+    [Color::Cyan, Color::Green, Color::Yellow, Color::Magenta, Color::Blue, Color::Red];
+
+/// Renders the git graph overlay (S20): a lane-based commit DAG with branch/tag
+/// labels, then a worktrees section. Pure given [`GitGraphData`].
+fn gitgraph_lines(data: &GitGraphData, scroll: usize, _w: usize, h: usize) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if let Some(err) = &data.error {
+        out.push(Line::styled(err.clone(), Style::default().fg(Color::Red)));
+        return out;
+    }
+    out.push(Line::styled(
+        format!("{} commits · {} worktrees", data.rows.len(), data.worktrees.len()),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    // Reserve the bottom for the worktrees section (header + one line each).
+    let wt_block = if data.worktrees.is_empty() { 0 } else { data.worktrees.len() + 2 };
+    let body_rows = (h as usize).saturating_sub(1 + wt_block).max(1);
+    let start = scroll.min(data.rows.len().saturating_sub(1));
+    let end = (start + body_rows).min(data.rows.len());
+
+    for row in &data.rows[start..end] {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (i, occupied) in row.active.iter().enumerate() {
+            let color = GRAPH_LANE_COLORS[i % GRAPH_LANE_COLORS.len()];
+            let glyph = if i == row.col {
+                "●"
+            } else if *occupied {
+                "│"
+            } else {
+                " "
+            };
+            spans.push(Span::styled(glyph.to_string(), Style::default().fg(color)));
+        }
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(row.commit.short.clone(), Style::default().fg(Color::Yellow)));
+        if !row.commit.refs.is_empty() {
+            spans.push(Span::styled(
+                format!(" ({})", row.commit.refs.join(", ")),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ));
+        }
+        spans.push(Span::raw(format!(" {}", row.commit.subject)));
+        out.push(Line::from(spans));
+    }
+
+    if !data.worktrees.is_empty() {
+        out.push(Line::raw(""));
+        out.push(Line::styled("Worktrees", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)));
+        for wt in &data.worktrees {
+            let label = if wt.detached { "(detached)".to_string() } else { wt.branch.clone() };
+            out.push(Line::from(vec![
+                Span::styled(format!("  {} ", label), Style::default().fg(Color::Cyan)),
+                Span::styled(wt.path.clone(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
     out
 }
 
@@ -3258,6 +3361,30 @@ mod tests {
         let last_off = off.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect::<String>();
         assert!(last_lit.ends_with('▌'), "lit caret: {last_lit:?}");
         assert!(last_off.ends_with("this "), "off caret: {last_off:?}");
+    }
+
+    #[test]
+    fn git_graph_overlay_opens_and_closes() {
+        // S20: prefix g opens the git graph overlay and Esc closes it; collect()
+        // finding no repo in the fixture must not panic when drawn.
+        let root = fixture("gitgraph-overlay");
+        let mut app = App::new(root.clone());
+        render(&mut app, 120, 40);
+        prefix_key(&mut app, 'g');
+        assert_eq!(app.overlay, Some(Overlay::GitGraph));
+        render(&mut app, 120, 40);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.overlay, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gitgraph_lines_handle_empty_and_error_data() {
+        let lines = gitgraph_lines(&GitGraphData::default(), 0, 80, 20);
+        assert_eq!(lines.len(), 1, "empty data shows only the header");
+        let err = GitGraphData { error: Some("boom".into()), ..Default::default() };
+        let lines = gitgraph_lines(&err, 0, 80, 20);
+        assert_eq!(lines.len(), 1, "an error shows a single line");
     }
 
     #[test]

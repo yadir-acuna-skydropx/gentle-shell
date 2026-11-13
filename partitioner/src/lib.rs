@@ -6,6 +6,7 @@ pub mod apps_panel;
 pub mod arch_client;
 pub mod editor;
 pub mod explain_client;
+pub mod gitgraph;
 pub mod highlight;
 pub mod icons;
 pub mod keys;
