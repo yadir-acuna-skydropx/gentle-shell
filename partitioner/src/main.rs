@@ -79,6 +79,10 @@ enum Event {
     Explain(ExplainEvent),
     /// An event from the independent architecture engine (S18).
     Arch(ArchEvent),
+    /// Periodic tick that drives the animated explainer caret (S21). It only
+    /// repaints while the explain popup takes input, so the UI stays idle
+    /// otherwise (S11).
+    Tick,
 }
 
 fn main() {
@@ -287,6 +291,7 @@ fn event_loop(
 
     let (tx, rx) = mpsc::channel::<Event>();
     spawn_input_thread(tx.clone());
+    spawn_tick_thread(tx.clone());
     let git_tx = spawn_git_worker(tx.clone(), root.clone());
 
     // The apps engine runs as a separate process; its events flow through the
@@ -448,6 +453,9 @@ fn event_loop(
             Event::Explain(ExplainEvent::Offline) => app.set_explain_offline(),
             Event::Arch(ArchEvent::Msg(msg)) => app.apply_arch_msg(msg),
             Event::Arch(ArchEvent::Offline) => app.set_arch_offline(),
+            // Blink the explainer caret only while it takes input; stay idle
+            // (no repaint) otherwise so S11 holds.
+            Event::Tick => needs_redraw = app.tick_blink(),
         }
 
         // The child owns the session lifetime: when it exits, so do we.
@@ -480,6 +488,21 @@ fn open_with_system(path: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+}
+
+/// Emits a `Tick` roughly twice a second to drive the animated explainer
+/// caret (S21). The UI thread decides whether a tick repaints, so this never
+/// forces work while the popup is closed.
+fn spawn_tick_thread(tx: Sender<Event>) {
+    std::thread::Builder::new()
+        .name("tick".into())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_millis(500));
+            if tx.send(Event::Tick).is_err() {
+                break;
+            }
+        })
+        .expect("spawn tick thread");
 }
 
 fn spawn_input_thread(tx: Sender<Event>) {

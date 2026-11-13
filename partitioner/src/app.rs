@@ -308,6 +308,9 @@ pub struct App {
     pub explain: ExplainUi,
     /// Architecture overlay state (S18).
     pub arch: ArchUi,
+    /// Blink phase for the animated explainer caret (S21): toggled on each
+    /// timer tick while the explain popup accepts input.
+    pub blink_on: bool,
 }
 
 impl App {
@@ -353,9 +356,30 @@ impl App {
             minimized_regions: Vec::new(),
             explain: ExplainUi::default(),
             arch: ArchUi::default(),
+            blink_on: true,
         };
         app.rescan();
         app
+    }
+
+    /// True when the explainer popup is open and showing its follow-up input,
+    /// so the animated caret (S21) should blink and the UI should tick.
+    pub fn explain_input_active(&self) -> bool {
+        self.overlay == Some(Overlay::Explain) && !self.explain.key_missing
+    }
+
+    /// Advances the caret blink phase (S21). Returns true when the popup is
+    /// taking input, so the caller only repaints then and stays idle (S11)
+    /// otherwise.
+    pub fn tick_blink(&mut self) -> bool {
+        if self.explain_input_active() {
+            self.blink_on = !self.blink_on;
+            true
+        } else {
+            // Keep the caret solid so it reappears lit next time.
+            self.blink_on = true;
+            false
+        }
     }
 
     /// Wires the shared prediction engine (S9) for in-process ghost text.
@@ -2777,7 +2801,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
             let title = format!(" {} · Enter ask · Esc close ", app.explain.title);
             let w = area.width.saturating_sub(2) as usize;
             let h = area.height.saturating_sub(2) as usize;
-            let lines = explain_lines(&app.explain, w, h);
+            let lines = explain_lines(&app.explain, w, h, app.blink_on);
             frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
         } else if overlay == Overlay::Arch {
             let title = " Arch · architecture engine · Esc close ".to_string();
@@ -2996,7 +3020,7 @@ fn arch_lines(a: &ArchUi, w: usize, h: usize) -> Vec<Line<'static>> {
 /// Builds the explainer popup body: a model header, the scrolled + word-wrapped
 /// streaming text (or the key-missing hint / inline error), a separator and the
 /// one-line question input (S17).
-fn explain_lines(e: &ExplainUi, w: usize, h: usize) -> Vec<Line<'static>> {
+fn explain_lines(e: &ExplainUi, w: usize, h: usize, blink_on: bool) -> Vec<Line<'static>> {
     let status = if e.offline {
         "offline".to_string()
     } else if e.key_missing {
@@ -3038,7 +3062,14 @@ fn explain_lines(e: &ExplainUi, w: usize, h: usize) -> Vec<Line<'static>> {
         out.push(Line::raw(""));
     }
     out.push(Line::styled("─".repeat(w), Style::default().fg(Color::DarkGray)));
-    let prompt = if e.key_missing { String::new() } else { format!("> {}", e.question) };
+    // Animated caret (S21): a block that blinks while the user types. Static
+    // space keeps the line height stable when the caret is in its "off" phase.
+    let prompt = if e.key_missing {
+        String::new()
+    } else {
+        let caret = if blink_on { "▌" } else { " " };
+        format!("> {}{}", e.question, caret)
+    };
     out.push(Line::styled(prompt, Style::default().fg(Color::Cyan)));
     out
 }
@@ -3187,6 +3218,46 @@ mod tests {
             other => panic!("expected a design request, got {other:?}"),
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explain_caret_blinks_only_while_the_popup_takes_input() {
+        // S21: the caret toggles on each tick while the explain input is open,
+        // and the tick asks for a repaint; when the popup is closed the caret
+        // stays solid and no repaint is requested (idle, S11).
+        let root = fixture("explain-blink");
+        let mut app = App::new(root.clone());
+        render(&mut app, 120, 40);
+        // Closed popup: no blink, no repaint.
+        app.blink_on = true;
+        assert!(!app.tick_blink());
+        assert!(app.blink_on);
+        // Open popup taking input: toggles and repaints.
+        app.overlay = Some(Overlay::Explain);
+        app.explain.key_missing = false;
+        assert!(app.tick_blink());
+        assert!(!app.blink_on);
+        assert!(app.tick_blink());
+        assert!(app.blink_on);
+        // Missing API key: input is hidden, so no blink.
+        app.explain.key_missing = true;
+        assert!(!app.tick_blink());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn explain_lines_render_the_animated_caret() {
+        // S21: the follow-up prompt shows a block caret when lit and a space
+        // when off, keeping the line height stable.
+        let mut e = ExplainUi::default();
+        e.key_missing = false;
+        e.question = "what is this".into();
+        let lit = explain_lines(&e, 80, 20, true);
+        let off = explain_lines(&e, 80, 20, false);
+        let last_lit = lit.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        let last_off = off.last().unwrap().spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        assert!(last_lit.ends_with('▌'), "lit caret: {last_lit:?}");
+        assert!(last_off.ends_with("this "), "off caret: {last_off:?}");
     }
 
     #[test]
