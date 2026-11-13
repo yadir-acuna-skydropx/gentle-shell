@@ -39,17 +39,27 @@ repainted — only the changed cells of that fragment are written out.
   sidebar (and opens as an overlay in chat mode via the toolbar's **Apps** tool).
   It lists connectable apps with a coloured status dot and an item count;
   expanding an app shows its items. The expanded panel takes **40–70%** of the
-  sidebar height (default 60%, `+`/`-` to adjust; the file tree keeps ≥ 5 rows).
+  sidebar height (default 45%, `+`/`-` to adjust; the file tree keeps ≥ 5 rows).
   The connections run in a separate Rust process, `gentle-apps`, spoken to over
   JSON-lines on stdio. The apps are **Slack** (mentions + threaded replies, and
   *open in Slack Desktop*) and **GitHub** (repos, branches, trees, PRs, issues,
-  local worktrees and **Actions workflows**, with simple actions).
+  local worktrees and **Actions workflows**, with simple actions). The panel's
+  header row carries its own controls — `[_]` collapses it to the app list,
+  `[□]` expands it, and clicking the **Apps** title toggles the two — all
+  independent of the sidebar's own `[_]` minimize. A local **Arquitectura** row
+  always trails the engine apps; its status dot comes from the `gentle-arch`
+  engine (green when the key is set and the KB has chunks, yellow when the key is
+  set but the KB is empty, gray without a key, red when the engine is offline),
+  and selecting it (Enter or click) opens the architecture overlay.
   Disable the engine and panel with `--no-apps`.
 - **Code explainer (S17).** Select code in the editor (Shift+arrows/Home/End, or
-  drag the mouse; `Ctrl+C` copies the selection) and press **`e`** — or
+  drag the mouse; `Ctrl+C` copies the selection) and press **`e`**, **`Ctrl+E`**,
+  or click the **✿ ?** mascot badge that appears at the end of the selection — or
   right-click the selection — to open a popup that **streams an explanation** of
   the selection and answers follow-up questions in the same conversation. With
-  no selection it explains the current line ±10 lines. It uses **Claude Haiku**
+  no selection it explains the current line ±10 lines. The badge (ASCII fallback
+  `(?)`) stays inside the editor and never overwrites the selected text; the
+  status line hints `✿ click or Ctrl+E to ask about the selection`. It uses **Claude Haiku**
   over the Anthropic API via a separate Rust process, `gentle-explain`; the API
   key lives in the system keyring. Disable it with `--no-explain`.
 - **Architecture engine (S18).** Press **`A`** (or the **Arch** tool) to open an
@@ -480,9 +490,17 @@ else is forwarded to the chat.
 - **Apps panel:** `↑↓` select an app or item · `Enter` drills in (app → items →
   reply box) · type to edit the reply, `Enter` sends it, `a` opens the action
   menu (e.g. *open*), `Esc` steps back one level and then to the chat. **Click
-  an app row to expand the panel and open that app.** When expanded, `+`/`-`
-  resize the panel between **40% and 70%** of the sidebar (default 60%, shown in
-  the panel title); the file tree always keeps at least five rows.
+  an app row to expand the panel and open that app.** The header row has its own
+  controls: `[_]` collapses the panel to the app list, `[□]` expands it, and
+  clicking the **Apps** title toggles the two — these are independent of the
+  sidebar's `[_]` minimize (which collapses the whole sidebar). The local
+  **Arquitectura** row trails the engine apps and opens the architecture overlay
+  on `Enter`/click; its dot reflects the `gentle-arch` status. When expanded,
+  `+`/`-` resize the panel between **40% and 70%** of the sidebar (default 45%,
+  shown in the panel title); the file tree always keeps at least five rows.
+- **Code selection badge:** while text is selected the editor shows a small
+  **✿ ?** mascot badge after the selection (ASCII fallback `(?)`); click it, or
+  press `Ctrl+E`, to ask the explainer about exactly that selection.
 - **Overlays:** `↑↓` move · `Enter` open · `Esc` close.
 - **Mouse:** click selects panes and places the editor cursor, opens files and
   tools; the wheel scrolls the chat, the editor, the diff, or the sidebar

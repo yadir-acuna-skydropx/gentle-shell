@@ -60,6 +60,7 @@ const FILE: &str = "\u{f15b}"; // nf-fa-file (generic default)
 // App glyphs for the apps panel (S12).
 const SLACK: &str = "\u{f198}"; // nf-fa-slack
 const GITHUB: &str = "\u{f09b}"; // nf-fa-github
+const ARCH: &str = "\u{f0e8}"; // nf-fa-sitemap (architecture / blueprint)
 const APP: &str = "\u{f0ac}"; // nf-fa-globe (generic app)
 // GitHub item-kind glyphs for the apps panel (S15).
 const PULL_REQUEST: &str = "\u{f407}"; // nf-oct-git_pull_request
@@ -72,7 +73,7 @@ const SECTION: &str = "\u{f0ca}"; // nf-fa-list_ul
 /// Every glyph the Nerd Font set can render; used to assert each is one column.
 pub const GLYPHS: &[&str] = &[
     FOLDER, FOLDER_OPEN, PYTHON, RUST, JS, TS, REACT, JSON, MARKDOWN, CONFIG, SHELL, SQL, HTML, CSS, GO, JAVA, CLANG,
-    CPP, LOCK, TXT, GIT, DOCKER, MAKE, NPM, IMAGE, FILE, SLACK, GITHUB, APP, PULL_REQUEST, ISSUE, BRANCH, REPO,
+    CPP, LOCK, TXT, GIT, DOCKER, MAKE, NPM, IMAGE, FILE, SLACK, GITHUB, ARCH, APP, PULL_REQUEST, ISSUE, BRANCH, REPO,
     WORKTREE, SECTION,
 ];
 
@@ -80,10 +81,18 @@ pub const GLYPHS: &[&str] = &[
 /// icons are `Nerd`, and an ASCII marker otherwise.
 pub fn app_icon(id: &str, mode: IconMode) -> &'static str {
     match mode {
-        IconMode::Ascii => "#",
+        // The local "Arquitectura" entry uses "A" in the ASCII fallback (S18, L48).
+        IconMode::Ascii => {
+            if id == "__arch__" {
+                "A"
+            } else {
+                "#"
+            }
+        }
         IconMode::Nerd => match id {
             "slack" => SLACK,
             "github" => GITHUB,
+            "__arch__" => ARCH,
             _ => APP,
         },
     }

@@ -148,6 +148,21 @@ pub enum Action {
     Quit,
 }
 
+/// Clickable controls on the apps-panel header row (its top border): the `[_]`
+/// collapse button, the `[□]` expand button, and the "Apps" title text that
+/// toggles between the two. Captured during draw (L48 minimize fix). All three
+/// are independent of the sidebar minimize button.
+#[derive(Debug, Clone, Copy)]
+pub struct AppsHeaderButtons {
+    pub row: u16,
+    /// `[start, end)` columns of the `[_]` collapse button.
+    pub collapse: (u16, u16),
+    /// `[start, end)` columns of the `[□]` expand button.
+    pub expand: (u16, u16),
+    /// `[start, end)` columns of the clickable "Apps" title text.
+    pub header: (u16, u16),
+}
+
 /// A clickable minimize / zoom button on a pane's top border (S14). Captured
 /// during draw so a click runs the action even when the pane is not focused.
 #[derive(Debug, Clone, Copy)]
@@ -195,6 +210,11 @@ fn language_for(path: &Path) -> String {
     };
     lang.to_string()
 }
+
+/// Id of the local "Arquitectura" row in the apps list (S18, L48). It is not a
+/// gentle-apps connector: the partitioner renders it from the gentle-arch
+/// status and opens the Arch overlay on it.
+const ARCH_ROW_ID: &str = "__arch__";
 
 /// Maps a focus target to the layout pane it belongs to (the apps panel lives
 /// inside the sidebar unit).
@@ -259,7 +279,7 @@ pub struct App {
     /// Bottom-left apps panel state (S12).
     pub apps: AppsPanel,
     /// Expanded apps-panel height as a share of the sidebar, in percent; the
-    /// user adjusts it with `+`/`-` within [40, 70] (S16).
+    /// user adjusts it with `+`/`-` within [40, 70]; the default is 45% (S16, L48).
     pub apps_panel_pct: u16,
     /// Incrementing id for apps-engine requests.
     apps_req_id: u64,
@@ -267,6 +287,12 @@ pub struct App {
     pub tree_area: Option<Rect>,
     /// Apps-panel region of the sidebar, captured in the last draw.
     pub apps_area: Option<Rect>,
+    /// Apps-panel header controls captured in the last draw (L48 minimize fix).
+    pub apps_header: Option<AppsHeaderButtons>,
+    /// Screen rect of the mascot "ask about the selection" badge, captured in
+    /// the last draw; a click on it opens the explain popup (S17, L48). `None`
+    /// when there is no selection or it is scrolled fully out of view.
+    pub selection_badge: Option<Rect>,
     /// Zoomed pane (S14); `None` for the normal split.
     pub zoom: Option<Pane>,
     /// Per-pane minimized flags (S14).
@@ -316,6 +342,8 @@ impl App {
             apps_req_id: 0,
             tree_area: None,
             apps_area: None,
+            apps_header: None,
+            selection_badge: None,
             zoom: None,
             min_sidebar: false,
             min_editor: false,
@@ -779,6 +807,25 @@ impl App {
         Action::None
     }
 
+    /// Number of selectable rows in the collapsed apps list: the engine apps
+    /// plus the local "Arquitectura" row that always trails them (S18, L48).
+    fn apps_list_count(&self) -> usize {
+        self.apps.apps.len() + 1
+    }
+
+    /// Whether `idx` addresses the trailing "Arquitectura" row.
+    fn is_arch_row(&self, idx: usize) -> bool {
+        idx == self.apps.apps.len()
+    }
+
+    /// Content rows the collapsed apps panel must show: the selectable rows plus
+    /// the non-selectable engine-state note (offline / connecting), so the note
+    /// is never clipped out of a short collapsed panel (S18, L48).
+    fn apps_display_rows(&self) -> usize {
+        let note = usize::from(self.apps.offline || self.apps.apps.is_empty());
+        self.apps_list_count() + note
+    }
+
     fn next_apps_id(&mut self) -> u64 {
         self.apps_req_id += 1;
         self.apps_req_id
@@ -810,6 +857,27 @@ impl App {
             return Action::Apps(ClientMsg::Refresh { id: rid, app: id });
         }
         Action::None
+    }
+
+    /// Collapses the apps panel to its collapsed app list (the `[_]` header
+    /// control, L48). Independent of the sidebar minimize state.
+    fn collapse_apps_panel(&mut self) {
+        self.focus = Focus::Apps;
+        self.apps.view = View::Apps;
+        self.apps.reset_nav();
+    }
+
+    /// Clicking the "Apps" header text toggles collapsed/expanded (L48). When
+    /// collapsed it enters the selected app (returning its refresh request).
+    fn toggle_apps_collapsed(&mut self) -> Action {
+        self.focus = Focus::Apps;
+        if self.apps.view == View::Apps {
+            self.enter_selected_app()
+        } else {
+            self.apps.view = View::Apps;
+            self.apps.reset_nav();
+            Action::None
+        }
     }
 
     /// Prefix `a`: in workspace, toggle the panel expanded/collapsed and focus
@@ -870,11 +938,15 @@ impl App {
             View::Reply => self.apps_reply_key(key),
             View::Items => self.apps_items_key(key),
             View::Apps => {
-                let len = self.apps.apps.len();
+                // The list includes the trailing "Arquitectura" row (S18, L48).
+                let len = self.apps_list_count();
                 match key.code {
                     KeyCode::Up | KeyCode::Char('k') => self.apps.app_sel = clamp_index(self.apps.app_sel, -1, len),
                     KeyCode::Down | KeyCode::Char('j') => self.apps.app_sel = clamp_index(self.apps.app_sel, 1, len),
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                        if self.is_arch_row(self.apps.app_sel) {
+                            return self.open_arch();
+                        }
                         return self.enter_selected_app();
                     }
                     KeyCode::Esc => self.leave_apps(),
@@ -1477,6 +1549,14 @@ impl App {
                 self.ghost = None;
                 return Action::None;
             }
+            // Ctrl+E asks about the current selection (S17, L48). Ctrl+E is not
+            // otherwise bound in the editor; it is a no-op without a selection.
+            KeyCode::Char('e') | KeyCode::Char('E') if ctrl => {
+                if self.editor.as_ref().is_some_and(|e| e.has_selection()) {
+                    return self.open_explain();
+                }
+                return Action::None;
+            }
             _ => {}
         }
         // A shown ghost is accepted by Tab or Right; otherwise those keys keep
@@ -1668,7 +1748,32 @@ impl App {
         }
         if let Some(ap) = self.apps_area {
             if rect_contains(ap, col, row) {
+                // Header-row controls: [_] collapse, [□] expand, title toggles
+                // (L48 minimize fix). The sidebar [_] is a separate button.
+                if let Some(h) = self.apps_header {
+                    if row == h.row {
+                        if in_col_range(col, h.collapse) {
+                            self.collapse_apps_panel();
+                            return Action::None;
+                        }
+                        if in_col_range(col, h.expand) {
+                            self.focus = Focus::Apps;
+                            return self.enter_selected_app();
+                        }
+                        if in_col_range(col, h.header) {
+                            return self.toggle_apps_collapsed();
+                        }
+                    }
+                }
                 return self.click_apps(ap, col, row);
+            }
+        }
+        // A click on the mascot badge asks about the current selection (S17,
+        // L48). Checked before the editor click so the selection is preserved.
+        if let Some(badge) = self.selection_badge {
+            if rect_contains(badge, col, row) {
+                self.focus = Focus::Editor;
+                return self.open_explain();
             }
         }
         if let Some(ed) = l.editor {
@@ -1732,8 +1837,12 @@ impl App {
         let rel = (row - area.y - 1) as usize;
         match self.apps.view {
             View::Apps => {
-                if rel < self.apps.apps.len() {
+                if rel < self.apps_list_count() {
                     self.apps.app_sel = rel;
+                    // The trailing "Arquitectura" row opens the Arch overlay (S18, L48).
+                    if self.is_arch_row(rel) {
+                        return self.open_arch();
+                    }
                     return self.enter_selected_app();
                 }
             }
@@ -1783,7 +1892,7 @@ impl App {
                     let sel = self.apps.visible_sel();
                     self.apps.set_visible_sel(clamp_index(sel, dir, len));
                 } else {
-                    self.apps.app_sel = clamp_index(self.apps.app_sel, dir, self.apps.apps.len());
+                    self.apps.app_sel = clamp_index(self.apps.app_sel, dir, self.apps_list_count());
                 }
                 return Action::None;
             }
@@ -1823,6 +1932,40 @@ fn clamp_index(index: usize, delta: isize, len: usize) -> usize {
 
 fn rect_contains(r: Rect, col: u16, row: u16) -> bool {
     r.contains(Position::new(col, row))
+}
+
+/// Whether `col` falls in the half-open `[start, end)` range.
+fn in_col_range(col: u16, range: (u16, u16)) -> bool {
+    col >= range.0 && col < range.1
+}
+
+/// The mascot badge drawn after a code selection (S17, L48): Gentle Shell's
+/// flower ✿ with a question mark, or the ASCII fallback `(?)`. Both are three
+/// columns wide so the placement math is identical.
+fn mascot_badge(icons: IconMode) -> &'static str {
+    if icons == IconMode::Ascii {
+        "(?)"
+    } else {
+        "✿ ?"
+    }
+}
+
+/// Status-line hint shown while a code selection exists (S17, L48).
+fn mascot_hint(icons: IconMode) -> &'static str {
+    if icons == IconMode::Ascii {
+        "(?) click or Ctrl+E to ask about the selection"
+    } else {
+        "✿ click or Ctrl+E to ask about the selection"
+    }
+}
+
+/// The apps-panel block title (carries the height share while expanded, S16).
+fn apps_panel_title(expanded: bool, pct: u16) -> String {
+    if expanded {
+        format!(" Apps · {pct}% ")
+    } else {
+        " Apps ".to_string()
+    }
 }
 
 /// Keys that mutate the buffer (used to explain a read-only buffer).
@@ -1905,6 +2048,47 @@ fn draw_title_buttons(frame: &mut Frame, pane: Pane, rect: Rect, icons: IconMode
     Some(TitleButton { pane, row, min_range: (start, start + min_w), zoom_range: (start + min_w, start + total) })
 }
 
+/// Draws the apps-panel header controls on its top border and returns their
+/// click ranges (L48 minimize fix): `[_]` collapses the panel to its collapsed
+/// view and `[□]` expands it, both on the right; the "Apps" title on the left
+/// is a clickable collapse/expand toggle. When the box is too narrow the two
+/// buttons are dropped (the title stays clickable). `title_cols` is the width of
+/// the already-rendered block title (" Apps " / " Apps · NN% ").
+fn draw_apps_header_buttons(
+    frame: &mut Frame,
+    area: Rect,
+    title_cols: u16,
+    icons: IconMode,
+    focused: bool,
+) -> Option<AppsHeaderButtons> {
+    if area.height == 0 || area.width < 2 {
+        return None;
+    }
+    let row = area.y;
+    let (collapse_s, expand_s) = button_labels(icons);
+    let cw = collapse_s.chars().count() as u16;
+    let ew = expand_s.chars().count() as u16;
+    let total = cw + ew;
+    // The title text is rendered by the block starting one cell after the corner.
+    let header_start = area.x + 1;
+    let mut header_end = header_start + title_cols;
+    let style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
+    // Buttons need room for the title plus both corners; drop them when tight.
+    let (collapse, expand) = if area.width >= title_cols + total + 2 {
+        let start = area.x + area.width - 1 - total;
+        let buf = frame.buffer_mut();
+        buf.set_string(start, row, collapse_s, style);
+        buf.set_string(start + cw, row, expand_s, style);
+        header_end = header_end.min(start);
+        ((start, start + cw), (start + cw, start + total))
+    } else {
+        // No buttons: keep the header text within the box.
+        header_end = header_end.min(area.x + area.width.saturating_sub(1));
+        ((0, 0), (0, 0))
+    };
+    Some(AppsHeaderButtons { row, collapse, expand, header: (header_start, header_end) })
+}
+
 /// Draws a minimized horizontal pane (editor/diff/chat) as a one-row title bar
 /// (S14 item 2). The whole bar is clickable to restore it.
 fn draw_min_bar(frame: &mut Frame, title: &str, rect: Rect, focused: bool, icons: IconMode) {
@@ -1946,21 +2130,64 @@ fn draw_min_strip(frame: &mut Frame, rect: Rect, focused: bool, icons: IconMode)
 /// Builds the apps-panel content lines for a pane (or overlay) `w` columns wide.
 fn apps_content_lines(app: &mut App, w: usize, _h: usize, focused: bool) -> Vec<Line<'static>> {
     let w = w.max(1);
-    if app.apps.offline {
-        return vec![Line::styled("apps engine offline", Style::default().fg(Color::DarkGray))];
-    }
-    if app.apps.apps.is_empty() {
-        return vec![Line::styled("connecting\u{2026}", Style::default().fg(Color::DarkGray))];
-    }
     match app.apps.view {
+        // The collapsed list always ends with the local "Arquitectura" row, so
+        // it renders even while the apps engine is offline or connecting (S18).
         View::Apps => apps_list_lines(app, w, focused),
-        View::Items | View::Reply => apps_items_lines(app, w, focused),
+        View::Items | View::Reply => {
+            if app.apps.offline {
+                return vec![Line::styled("apps engine offline", Style::default().fg(Color::DarkGray))];
+            }
+            if app.apps.apps.is_empty() {
+                return vec![Line::styled("connecting\u{2026}", Style::default().fg(Color::DarkGray))];
+            }
+            apps_items_lines(app, w, focused)
+        }
     }
 }
 
-/// Collapsed view: one row per app with a status dot and item count.
+/// Colour state and optional detail for the local "Arquitectura" row, derived
+/// from the gentle-arch status (S18, L48): green when the key is set and the KB
+/// has chunks, yellow when the key is set but the KB is empty, gray without a
+/// key, red when the architecture engine is offline.
+fn arch_app_state(arch: &ArchUi) -> (AppState, Option<&'static str>) {
+    if arch.offline {
+        (AppState::Error, Some("architecture engine offline"))
+    } else if arch.key_missing {
+        (AppState::Disconnected, None)
+    } else if arch.kb_chunks == 0 {
+        (AppState::Connecting, Some("run `gentle-arch kb update`"))
+    } else {
+        (AppState::Connected, None)
+    }
+}
+
+/// The local "Arquitectura" row (S18, L48), rendered by the partitioner from the
+/// gentle-arch status rather than a gentle-apps connector. Its index in the list
+/// is always `apps.len()` (it trails the engine apps).
+fn arch_row_line(app: &App, w: usize, focused: bool) -> Line<'static> {
+    let selected = focused && app.apps.app_sel == app.apps.apps.len();
+    let (state, detail) = arch_app_state(&app.arch);
+    let glyph = icons::app_icon(ARCH_ROW_ID, app.icons);
+    let mut label_style = Style::default();
+    if selected {
+        label_style = label_style.add_modifier(Modifier::REVERSED);
+    }
+    let text = match detail {
+        Some(d) => format!("{glyph} Arquitectura — {d}"),
+        None => format!("{glyph} Arquitectura"),
+    };
+    let label = fit(&text, w.saturating_sub(2));
+    Line::from(vec![Span::styled("\u{25cf} ", app_dot_style(state)), Span::styled(label, label_style)])
+}
+
+/// Collapsed view: one row per app with a status dot and item count, then the
+/// local "Arquitectura" row (S18, L48). When the apps engine is offline or
+/// still connecting, a trailing non-selectable note is appended after the
+/// Arquitectura row so the row indices (0..=apps.len()) stay stable.
 fn apps_list_lines(app: &App, w: usize, focused: bool) -> Vec<Line<'static>> {
-    app.apps
+    let mut lines: Vec<Line<'static>> = app
+        .apps
         .apps
         .iter()
         .enumerate()
@@ -1978,7 +2205,15 @@ fn apps_list_lines(app: &App, w: usize, focused: bool) -> Vec<Line<'static>> {
                 Span::styled(label, label_style),
             ])
         })
-        .collect()
+        .collect();
+    // The local "Arquitectura" entry trails the engine apps (index apps.len()).
+    lines.push(arch_row_line(app, w, focused));
+    if app.apps.offline {
+        lines.push(Line::styled("apps engine offline", Style::default().fg(Color::DarkGray)));
+    } else if app.apps.apps.is_empty() {
+        lines.push(Line::styled("connecting\u{2026}", Style::default().fg(Color::DarkGray)));
+    }
+    lines
 }
 
 /// Expanded view: the selected app's items. A flat app (Slack) keeps the
@@ -2086,15 +2321,17 @@ fn draw_apps_panel(frame: &mut Frame, app: &mut App, area: Rect, focused: bool) 
     }
     // While expanded, the title carries the current height share so adjusting
     // it with `+`/`-` is visible (S16).
-    let title = if app.apps.is_expanded() {
-        format!(" Apps · {}% ", app.apps_panel_pct)
-    } else {
-        " Apps ".to_string()
-    };
+    let expanded = app.apps.is_expanded();
+    let title = apps_panel_title(expanded, app.apps_panel_pct);
+    let title_cols = title.chars().count() as u16;
     let block = pane_block(title, focused);
     let inner = block.inner(area);
     let lines = apps_content_lines(app, inner.width as usize, inner.height as usize, focused);
     frame.render_widget(Paragraph::new(lines).block(block), area);
+    // Paint the header controls on the top border: [_] collapse and [□] expand
+    // on the right, with the "Apps" title as a clickable toggle (L48 fix). The
+    // buttons drop first when the panel is too narrow; the title stays clickable.
+    app.apps_header = draw_apps_header_buttons(frame, area, title_cols, app.icons, focused);
     // Place the caret in the reply box so typing is visible.
     if focused && app.apps.view == View::Reply {
         let box_w = inner.width.saturating_sub(2) as usize;
@@ -2234,6 +2471,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
     let l = app.compute_layout(area);
     app.layout = Some(l);
     let focus = app.effective_focus();
+    // Cleared each frame; set only when the editor draws its selection badge.
+    app.selection_badge = None;
 
     if let Some(bar) = l.toolbar {
         let mut lines = vec![Line::styled(" TOOLS", Style::default().add_modifier(Modifier::BOLD)), Line::raw("")];
@@ -2246,6 +2485,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
 
     app.tree_area = None;
     app.apps_area = None;
+    app.apps_header = None;
     if let Some(side) = l.sidebar {
         if l.is_minimized(Pane::Sidebar) {
             // Collapsed to a vertical icon strip (S14); the tree/apps click
@@ -2254,7 +2494,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
         } else {
         // The sidebar is split into the file tree (top) and the apps panel (bottom, S12).
         let (tree_area, apps_area) =
-            layout::split_sidebar(side, app.apps.apps.len() as u16, app.apps.is_expanded(), app.apps_panel_pct);
+            layout::split_sidebar(side, app.apps_display_rows() as u16, app.apps.is_expanded(), app.apps_panel_pct);
         app.tree_area = Some(tree_area);
         app.apps_area = Some(apps_area);
         let block = pane_block(format!(" Files · {} ", app.root.file_name().map_or(String::new(), |n| n.to_string_lossy().into_owned())), focus == Focus::Sidebar);
@@ -2278,6 +2518,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
         // Left pane: the editable buffer. Take the highlighter out so it can be
         // borrowed mutably alongside the editor; it is restored below.
         let ghost = if focus == Focus::Editor { app.ghost.clone() } else { None };
+        let icons = app.icons;
+        // Screen rect of the mascot badge, set while drawing the selection.
+        let mut editor_badge: Option<Rect> = None;
         let mut highlighter = app.highlighter.take();
         match &mut app.editor {
             Some(e) => {
@@ -2368,6 +2611,52 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
                                 }
                             }
                         }
+                        // Mascot badge: Gentle Shell's flower ✿ + "?" placed
+                        // right after the selection end on its last line so the
+                        // user can click it to ask about exactly that selection
+                        // (S17, L48). It never overwrites selected text and is
+                        // clamped inside the editor's inner area and width.
+                        let badge = mascot_badge(icons);
+                        let bw = badge.chars().count() as u16;
+                        let badge_style = Style::default()
+                            .fg(Color::Magenta)
+                            .bg(Color::Rgb(40, 28, 52))
+                            .add_modifier(Modifier::BOLD);
+                        let right = inner.x + inner.width;
+                        let bottom = inner.y + inner.height;
+                        let mut placed: Option<Rect> = None;
+                        // Primary placement: just after the selection end.
+                        if el >= scroll_row && el < last && ev >= scroll_col {
+                            let x = inner.x + gutter as u16 + (ev - scroll_col) as u16;
+                            let y = inner.y + (el - scroll_row) as u16;
+                            if x + bw <= right && y < bottom {
+                                placed = Some(Rect::new(x, y, bw, 1));
+                            }
+                        }
+                        // Fallback: the end of a visible selection line (or just
+                        // above the first line), when the end is scrolled out or
+                        // the badge would exceed the width.
+                        if placed.is_none() && inner.width >= bw {
+                            let line = if el >= scroll_row && el < last {
+                                Some(el)
+                            } else if sl >= scroll_row && sl < last {
+                                Some(sl)
+                            } else {
+                                None
+                            };
+                            let y = match line {
+                                Some(ln) => inner.y + (ln - scroll_row) as u16,
+                                None if sl > scroll_row => inner.y + (sl - 1 - scroll_row) as u16,
+                                None => inner.y,
+                            };
+                            if y < bottom {
+                                placed = Some(Rect::new(right - bw, y, bw, 1));
+                            }
+                        }
+                        if let Some(r) = placed {
+                            frame.buffer_mut().set_string(r.x, r.y, badge, badge_style);
+                            editor_badge = Some(r);
+                        }
                     }
                 }
                 if focus == Focus::Editor && app.overlay.is_none() {
@@ -2384,6 +2673,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
             }
         }
         app.highlighter = highlighter;
+        app.selection_badge = editor_badge;
         }
     }
 
@@ -2537,6 +2827,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
         Line::styled(format!(" {PREFIX_LABEL} … w workspace · t files · c changes · a apps · z zoom · m min · d changes-only · Tab/1-4 focus · ? help · q quit · ] send {PREFIX_LABEL}"), Style::default().fg(Color::Black).bg(Color::Cyan))
     } else if let Some(msg) = &app.status_msg {
         Line::styled(format!(" {msg}"), Style::default().fg(Color::Black).bg(Color::Yellow))
+    } else if focus == Focus::Editor && app.editor.as_ref().is_some_and(|e| e.has_selection()) {
+        // While a selection exists, point to the mascot badge (S17, L48).
+        Line::styled(format!(" {}", mascot_hint(app.icons)), Style::default().fg(Color::Magenta))
     } else {
         let mode = match l.mode {
             Mode::Chat => "chat",
@@ -2582,9 +2875,12 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "        PageUp/PageDown · Ctrl+Home/End · Ctrl+S save · Ctrl+R reload".into(),
         "        Shift+arrows select · drag selects · Ctrl+C copy · ● unsaved · Esc back".into(),
         format!("  e      explain the selection / current line (also right-click)"),
+        "        with a selection: Ctrl+E or click the ✿ ? mascot badge to ask".into(),
         "Agent changes: ↑↓ PgUp PgDn scroll · Esc back / restore zoom".into(),
         "Apps: ↑↓ select · Enter app→items→reply · a actions (open) · Esc back".into(),
         "      +/- resize the expanded panel (40-70%) · click an app to open it".into(),
+        "      header: [_] collapse · [□] expand · click “Apps” to toggle".into(),
+        "      Arquitectura row opens the architecture engine (Arch overlay)".into(),
         "Panes: [_] minimize · [□] zoom on each title bar; click a minimized".into(),
         "       title bar or strip to restore it.".into(),
         "Mouse: click selects panes and places the cursor; wheel scrolls.".into(),
@@ -3049,6 +3345,100 @@ mod tests {
         };
         assert!(matches!(app.handle_mouse(ev), Action::Explain(ExReq::Explain { .. })));
         assert_eq!(app.overlay, Some(Overlay::Explain));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- Mascot badge on a selection (S17, L48) -------------------------
+
+    fn shift_right(app: &mut App, n: usize) {
+        for _ in 0..n {
+            app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT));
+        }
+    }
+
+    #[test]
+    fn mascot_badge_appears_after_a_shift_selection_and_click_opens_explain() {
+        let (root, mut app) = app_with_editor("mascot-shift");
+        app.apply_explain_msg(ExMsg::Status { key: ExKey::Set, model: "m".into() });
+        shift_right(&mut app, 4); // select "fn m"
+        assert_eq!(app.editor.as_ref().unwrap().selected_text().as_deref(), Some("fn m"));
+        assert!(!app.editor.as_ref().unwrap().dirty, "a selection never edits the buffer");
+        let t = render(&mut app, 120, 40);
+        let badge = app.selection_badge.expect("badge present with a selection");
+        // The flower glyph sits in the first badge cell.
+        assert_eq!(t.backend().buffer()[(badge.x, badge.y)].symbol(), "\u{273f}");
+        let ed = app.layout.unwrap().editor.unwrap();
+        assert_eq!(badge.y, ed.y + 1, "badge on the selection line (first visible row)");
+        assert_eq!(badge.width, 3, "the badge is three columns wide");
+        // Clicking the badge opens the explain popup for exactly that selection.
+        match app.handle_mouse(click(badge.x, badge.y)) {
+            Action::Explain(ExReq::Explain { selection, .. }) => assert_eq!(selection, "fn m"),
+            other => panic!("expected explain, got {other:?}"),
+        }
+        assert_eq!(app.overlay, Some(Overlay::Explain));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mascot_badge_toggles_with_the_selection_and_ctrl_e_asks() {
+        let (root, mut app) = app_with_editor("mascot-ctrle");
+        app.apply_explain_msg(ExMsg::Status { key: ExKey::Set, model: "m".into() });
+        render(&mut app, 120, 40);
+        assert_eq!(app.selection_badge, None, "no badge without a selection");
+        let ctrl_e = KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL);
+        assert_eq!(app.handle_key(ctrl_e), Action::None, "Ctrl+E is a no-op without a selection");
+        // Select: the badge appears and Ctrl+E asks about it.
+        shift_right(&mut app, 4);
+        render(&mut app, 120, 40);
+        assert!(app.selection_badge.is_some(), "badge present with a selection");
+        match app.handle_key(ctrl_e) {
+            Action::Explain(ExReq::Explain { selection, .. }) => assert_eq!(selection, "fn m"),
+            other => panic!("expected explain, got {other:?}"),
+        }
+        // Close the popup, clear the selection: the badge is gone.
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Left));
+        render(&mut app, 120, 40);
+        assert_eq!(app.selection_badge, None, "the badge disappears when the selection clears");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mascot_badge_appears_after_a_mouse_drag() {
+        let (root, mut app) = app_with_editor("mascot-drag");
+        app.apply_explain_msg(ExMsg::Status { key: ExKey::Set, model: "m".into() });
+        render(&mut app, 120, 40);
+        let ed = app.layout.unwrap().editor.unwrap();
+        // Drag across a few characters on the first line.
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: ed.x + 10,
+            row: ed.y + 1,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(drag);
+        render(&mut app, 120, 40);
+        assert!(app.editor.as_ref().unwrap().has_selection(), "the drag made a selection");
+        let badge = app.selection_badge.expect("badge after a drag");
+        match app.handle_mouse(click(badge.x, badge.y)) {
+            Action::Explain(ExReq::Explain { .. }) => {}
+            other => panic!("expected explain, got {other:?}"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn mascot_badge_stays_within_a_narrow_editor() {
+        let (root, mut app) = app_with_editor("mascot-narrow");
+        app.apply_explain_msg(ExMsg::Status { key: ExKey::Set, model: "m".into() });
+        shift_right(&mut app, 4);
+        render(&mut app, 80, 20); // the minimum workspace size
+        if let Some(b) = app.selection_badge {
+            let ed = app.layout.unwrap().editor.unwrap();
+            let inner = Block::default().borders(Borders::ALL).inner(ed);
+            assert!(b.x >= inner.x && b.x + b.width <= inner.x + inner.width, "badge within width: {b:?} in {inner:?}");
+            assert!(b.y >= inner.y && b.y < inner.y + inner.height, "badge within height: {b:?} in {inner:?}");
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3530,13 +3920,15 @@ mod tests {
         app.focus = Focus::Apps;
         app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Connected)] });
         render(&mut app, 120, 40);
-        assert_eq!(app.apps_panel_pct, layout::APPS_PANEL_DEFAULT_PCT, "default is 60%");
+        assert_eq!(app.apps_panel_pct, layout::APPS_PANEL_DEFAULT_PCT, "default is 45%");
+        assert_eq!(app.apps_panel_pct, 45, "the expanded default is 45% (L48)");
         // `+` grows in 5% steps and clamps at 70%.
         app.handle_key(ch('+'));
-        assert_eq!(app.apps_panel_pct, 65);
-        assert_eq!(app.status_msg.as_deref(), Some("apps panel 65%"));
-        app.handle_key(ch('+'));
-        app.handle_key(ch('+'));
+        assert_eq!(app.apps_panel_pct, 50);
+        assert_eq!(app.status_msg.as_deref(), Some("apps panel 50%"));
+        for _ in 0..10 {
+            app.handle_key(ch('+'));
+        }
         assert_eq!(app.apps_panel_pct, layout::APPS_PANEL_MAX_PCT, "clamped at 70%");
         // `-` shrinks in 5% steps and clamps at 40%.
         for _ in 0..10 {
@@ -3561,6 +3953,65 @@ mod tests {
         assert_eq!(app.focus, Focus::Apps, "the click focuses the panel");
         assert_eq!(app.apps.view, View::Items, "the click expands into the app");
         assert!(matches!(act, Action::Apps(ClientMsg::Refresh { app, .. }) if app == "slack"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apps_panel_header_buttons_collapse_and_expand_independently_of_sidebar_minimize() {
+        // L48 minimize bug: the apps panel gets its own [_] collapse and [□]
+        // expand controls; the sidebar [_] still minimizes the whole sidebar.
+        for (w, h) in [(160u16, 50u16), (120u16, 40u16)] {
+            let root = fixture("apps-hdr-buttons");
+            let mut app = App::new(root.clone());
+            app.mode = Mode::Workspace;
+            app.focus = Focus::Apps;
+            app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Connected)] });
+            app.apply_apps_msg(EngineMsg::Items { app: "slack".into(), items: vec![app_item("a", "#one")] });
+            render(&mut app, w, h);
+            let hdr = app.apps_header.expect("apps header buttons captured");
+            // The panel starts collapsed; the [□] expand control enters the app.
+            let act = app.handle_mouse(click(hdr.expand.0, hdr.row));
+            assert_eq!(app.apps.view, View::Items, "[□] expands the panel ({w}x{h})");
+            assert!(matches!(act, Action::Apps(ClientMsg::Refresh { app, .. }) if app == "slack"));
+            assert!(!app.min_sidebar, "expanding the apps panel never minimizes the sidebar");
+            // The [_] collapse control returns it to the collapsed view.
+            render(&mut app, w, h);
+            let hdr = app.apps_header.expect("apps header buttons captured");
+            app.handle_mouse(click(hdr.collapse.0, hdr.row));
+            assert_eq!(app.apps.view, View::Apps, "[_] collapses the apps panel ({w}x{h})");
+            assert!(!app.min_sidebar, "collapsing the apps panel never minimizes the sidebar");
+            // The SIDEBAR [_] minimizes the whole sidebar, leaving the apps view
+            // state untouched (the two are independent, T14 stays green).
+            render(&mut app, w, h);
+            let before = app.apps.view;
+            let side = app.title_buttons.iter().find(|b| b.pane == Pane::Sidebar).copied().expect("sidebar button");
+            app.handle_mouse(click(side.min_range.0, side.row));
+            assert!(app.min_sidebar, "the sidebar [_] minimizes the whole sidebar ({w}x{h})");
+            assert_eq!(app.apps.view, before, "the sidebar minimize leaves the apps view unchanged");
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    #[test]
+    fn clicking_the_apps_header_text_toggles_collapsed() {
+        let root = fixture("apps-hdr-toggle");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Connected)] });
+        app.apply_apps_msg(EngineMsg::Items { app: "slack".into(), items: vec![app_item("a", "#one")] });
+        render(&mut app, 120, 40);
+        let hdr = app.apps_header.expect("apps header");
+        assert_eq!(app.apps.view, View::Apps, "starts collapsed");
+        // Clicking the "Apps" title expands it.
+        let act = app.handle_mouse(click(hdr.header.0, hdr.row));
+        assert_eq!(app.apps.view, View::Items, "header click expands");
+        assert!(matches!(act, Action::Apps(ClientMsg::Refresh { .. })));
+        // Clicking it again collapses it.
+        render(&mut app, 120, 40);
+        let hdr = app.apps_header.expect("apps header");
+        app.handle_mouse(click(hdr.header.0, hdr.row));
+        assert_eq!(app.apps.view, View::Apps, "header click collapses");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -3732,6 +4183,122 @@ mod tests {
         app.set_apps_offline();
         let t = render(&mut app, 120, 40);
         assert!(screen_text(&t).contains("apps engine offline"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- Arquitectura apps-list entry (S18, L48) ------------------------
+
+    #[test]
+    fn arch_app_state_maps_each_gentle_arch_status() {
+        let root = fixture("arch-row-state");
+        let mut app = App::new(root.clone());
+        // Offline wins: red.
+        app.arch.offline = true;
+        assert_eq!(arch_app_state(&app.arch).0, AppStatusKind::Error);
+        // No key: gray.
+        app.arch.offline = false;
+        app.arch.key_missing = true;
+        assert_eq!(arch_app_state(&app.arch).0, AppStatusKind::Disconnected);
+        // Key set but KB empty: yellow with the update hint.
+        app.arch.key_missing = false;
+        app.arch.kb_chunks = 0;
+        let (state, detail) = arch_app_state(&app.arch);
+        assert_eq!(state, AppStatusKind::Connecting);
+        assert_eq!(detail, Some("run `gentle-arch kb update`"));
+        // Key set and KB populated: green, no detail.
+        app.arch.kb_chunks = 12;
+        assert_eq!(arch_app_state(&app.arch), (AppStatusKind::Connected, None));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arquitectura_row_renders_below_the_engine_apps() {
+        let root = fixture("arch-row-render");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Connected)] });
+        app.apply_arch_msg(ArMsg::Status { key: ArKey::Set, model: "claude-sonnet".into(), kb_chunks: 7 });
+        let t = render(&mut app, 120, 40);
+        let text = screen_text(&t);
+        assert!(text.contains("Slack"), "the engine app still renders: {text}");
+        assert!(text.contains("Arquitectura"), "the local Arquitectura row renders: {text}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn enter_on_the_arquitectura_row_opens_the_arch_overlay() {
+        let root = fixture("arch-row-enter");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Connected)] });
+        render(&mut app, 120, 40);
+        // Move down from Slack (index 0) to the Arquitectura row (index 1).
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.apps.app_sel, 1, "selection reaches the Arquitectura row");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.overlay, Some(Overlay::Arch), "Enter opens the Arch overlay");
+        assert_eq!(app.apps.view, View::Apps, "the apps panel did not expand into an engine app");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clicking_the_arquitectura_row_opens_the_arch_overlay() {
+        let root = fixture("arch-row-click");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Connected)] });
+        render(&mut app, 120, 40);
+        let ap = app.apps_area.expect("apps panel region");
+        // Row 0 (below the border) is Slack; row 1 is Arquitectura.
+        app.handle_mouse(click(ap.x + 2, ap.y + 2));
+        assert_eq!(app.overlay, Some(Overlay::Arch), "clicking Arquitectura opens the Arch overlay");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arquitectura_row_does_not_break_slack_github_navigation() {
+        let root = fixture("arch-row-nav");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps {
+            apps: vec![
+                app_status("slack", "Slack", AppStatusKind::Connected),
+                app_status("github", "GitHub", AppStatusKind::Connected),
+            ],
+        });
+        app.apply_apps_msg(EngineMsg::Items { app: "slack".into(), items: vec![app_item("a", "#one")] });
+        render(&mut app, 120, 40);
+        // Down twice: Slack(0) → GitHub(1) → Arquitectura(2); it does not overshoot.
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.apps.app_sel, 2, "Arquitectura is the third row after two engine apps");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.apps.app_sel, 2, "selection clamps at the Arquitectura row");
+        // Clicking the first engine row still enters Slack, not Arch.
+        let ap = app.apps_area.expect("apps panel region");
+        let act = app.handle_mouse(click(ap.x + 2, ap.y + 1));
+        assert_eq!(app.overlay, None, "clicking Slack does not open the Arch overlay");
+        assert_eq!(app.apps.view, View::Items, "clicking Slack enters the app");
+        assert!(matches!(act, Action::Apps(ClientMsg::Refresh { app, .. }) if app == "slack"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn arquitectura_row_appears_in_the_chat_apps_overlay() {
+        let root = fixture("arch-row-overlay");
+        let mut app = App::new(root.clone()); // chat mode
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Connected)] });
+        render(&mut app, 120, 40);
+        // Prefix `a` opens the apps overlay in chat mode.
+        app.handle_key(prefix());
+        app.handle_key(ch('a'));
+        assert_eq!(app.overlay, Some(Overlay::Apps));
+        let t = render(&mut app, 120, 40);
+        assert!(screen_text(&t).contains("Arquitectura"), "the overlay lists Arquitectura");
         fs::remove_dir_all(root).unwrap();
     }
 

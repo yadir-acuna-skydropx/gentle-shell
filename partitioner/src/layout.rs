@@ -100,7 +100,8 @@ pub const APPS_TREE_MIN: u16 = 5;
 /// [`APPS_PANEL_MIN_PCT`]..=[`APPS_PANEL_MAX_PCT`] (S16).
 pub const APPS_PANEL_MIN_PCT: u16 = 40;
 pub const APPS_PANEL_MAX_PCT: u16 = 70;
-pub const APPS_PANEL_DEFAULT_PCT: u16 = 60;
+/// Default expanded share: 45% of the sidebar (L48 lowered it from 60%).
+pub const APPS_PANEL_DEFAULT_PCT: u16 = 45;
 pub const APPS_PANEL_STEP: u16 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
