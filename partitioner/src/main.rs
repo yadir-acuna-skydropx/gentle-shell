@@ -16,9 +16,12 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event as CtEvent,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use portable_pty::CommandBuilder;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -213,15 +216,37 @@ fn resolve_program(program: &str) -> Option<PathBuf> {
     })
 }
 
+/// Tracks whether we pushed keyboard-enhancement flags so `restore_terminal`
+/// pops them exactly once. Enabling the flags lets terminals that speak the
+/// Kitty keyboard protocol report Enter+modifier chords (Alt+Enter / Ctrl+Enter)
+/// that the Arch brief uses to submit (S23); without them the modifier is lost
+/// and Enter only inserts a newline. Release events stay ignored in
+/// `App::handle_key`, so turning this on never double-processes keys.
+static KBD_ENHANCED: AtomicBool = AtomicBool::new(false);
+
 fn setup_terminal() -> Result<Terminal<Backend>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    // Opt into key-chord disambiguation when the terminal supports it; fall back
+    // silently otherwise so legacy terminals behave exactly as before.
+    if supports_keyboard_enhancement().unwrap_or(false)
+        && execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok()
+    {
+        KBD_ENHANCED.store(true, Ordering::SeqCst);
+    }
     Ok(Terminal::new(CrosstermBackend::new(stdout))?)
 }
 
 fn restore_terminal() -> Result<()> {
     let mut stdout = io::stdout();
+    if KBD_ENHANCED.swap(false, Ordering::SeqCst) {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
     execute!(stdout, DisableBracketedPaste, DisableMouseCapture, LeaveAlternateScreen)?;
     disable_raw_mode()?;
     Ok(())

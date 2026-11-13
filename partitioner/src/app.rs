@@ -3165,6 +3165,31 @@ mod tests {
     }
 
     #[test]
+    fn arch_design_submits_on_alt_enter() {
+        // S23: Alt+Enter must submit the brief, just like Ctrl+Enter. The chord
+        // only reaches here when the terminal reports the modifier, which the
+        // keyboard-enhancement flags in `setup_terminal` enable.
+        let (root, mut app) = arch_app("arch-alt-enter");
+        open_arch(&mut app);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.arch.stage, ArchStage::Brief);
+        for c in "banco".chars() {
+            app.handle_key(ch(c));
+        }
+        // A plain Enter inserts a newline, it does not submit.
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.arch.stage, ArchStage::Brief);
+        // Alt+Enter submits.
+        let action = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        match action {
+            Action::Arch(ArReq::Design { brief, .. }) => assert_eq!(brief, "banco"),
+            other => panic!("expected a design request, got {other:?}"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn arch_brief_esc_returns_to_the_menu() {
         let (root, mut app) = arch_app("arch-esc");
         open_arch(&mut app);
