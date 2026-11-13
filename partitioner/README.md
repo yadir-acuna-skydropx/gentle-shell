@@ -11,6 +11,24 @@ Each partition is a render of its own terminal, composed into a single visual
 component (S3): when one pane needs to update, the whole terminal is not
 repainted — only the changed cells of that fragment are written out.
 
+## Open it with `gentle-shell` (optional, T26)
+
+By default you launch the partitioner with `gentle-partitioner`. To make the
+plain `gentle-shell` command open the partitioner instead (S2), enable the
+launcher once per machine:
+
+```sh
+partitioner/scripts/install-gentle-shell-launcher.sh      # appends to ~/.bashrc or ~/.zshrc
+source ~/.bashrc                                           # or ~/.zshrc, or open a new shell
+```
+
+It installs a shell function that runs `gentle-partitioner` for interactive
+`gentle-shell`, while the partitioner still spawns the **real** engine as its
+child — it resolves the child through `PATH` (not shell functions) and exports
+`GENTLE_PARTITIONER=1`, so the function detects that and avoids any recursion.
+Run `command gentle-shell` any time you want the raw engine without the
+partitioner.
+
 ## What it does
 
 - **Chat mode (default).** Shows the `gentle-shell` chat exactly as it is today,
