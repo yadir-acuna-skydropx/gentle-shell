@@ -47,6 +47,10 @@ pub enum Focus {
     Apps,
     Editor,
     Diff,
+    /// The interactive $SHELL terminal in the Agent-changes pane (S24).
+    Terminal,
+    /// The command-helper box in the Agent-changes pane (S24, T25b).
+    Helper,
     Chat,
 }
 
@@ -138,6 +142,8 @@ pub enum Action {
     None,
     /// Bytes for the chat PTY.
     Forward(Vec<u8>),
+    /// Bytes for the Agent-changes interactive shell PTY (S24).
+    ForwardShell(Vec<u8>),
     /// Scroll the chat scrollback (positive = older output).
     ScrollChat(isize),
     /// A request for the apps engine (reply / refresh).
@@ -225,7 +231,8 @@ fn focus_pane(focus: Focus) -> Pane {
     match focus {
         Focus::Sidebar | Focus::Apps => Pane::Sidebar,
         Focus::Editor => Pane::Editor,
-        Focus::Diff => Pane::Diff,
+        // The terminal and helper live inside the Agent-changes (diff) pane.
+        Focus::Diff | Focus::Terminal | Focus::Helper => Pane::Diff,
         Focus::Chat => Pane::Chat,
     }
 }
@@ -290,6 +297,12 @@ pub struct App {
     pub tree_area: Option<Rect>,
     /// Apps-panel region of the sidebar, captured in the last draw.
     pub apps_area: Option<Rect>,
+    /// Interactive-terminal region inside the Agent-changes pane (S24),
+    /// captured in the last draw for click-to-focus.
+    pub term_area: Option<Rect>,
+    /// Command-helper region inside the Agent-changes pane (S24), captured in
+    /// the last draw for click-to-focus.
+    pub helper_area: Option<Rect>,
     /// Apps-panel header controls captured in the last draw (L48 minimize fix).
     pub apps_header: Option<AppsHeaderButtons>,
     /// Screen rect of the mascot "ask about the selection" badge, captured in
@@ -352,6 +365,8 @@ impl App {
             apps_req_id: 0,
             tree_area: None,
             apps_area: None,
+            term_area: None,
+            helper_area: None,
             apps_header: None,
             selection_badge: None,
             zoom: None,
@@ -718,6 +733,16 @@ impl App {
             Focus::Apps => self.apps_key(key),
             Focus::Editor => self.editor_key(key),
             Focus::Diff => self.diff_key(key),
+            // The shell gets raw bytes; the prefix chord (Ctrl+]) is already
+            // intercepted above, so it still escapes the terminal.
+            Focus::Terminal => Action::ForwardShell(crate::keys::encode(key, false)),
+            // The helper input is wired in T25b; for now Esc returns to the diff.
+            Focus::Helper => {
+                if key.code == KeyCode::Esc {
+                    self.focus = Focus::Diff;
+                }
+                Action::None
+            }
         }
     }
 
@@ -1845,6 +1870,20 @@ impl App {
                 return Action::None;
             }
         }
+        // The terminal and helper sub-regions of the Agent-changes pane focus
+        // on click (S24); checked before the diff so their rects win.
+        if let Some(term) = self.term_area {
+            if rect_contains(term, col, row) {
+                self.focus = Focus::Terminal;
+                return Action::None;
+            }
+        }
+        if let Some(helper) = self.helper_area {
+            if rect_contains(helper, col, row) {
+                self.focus = Focus::Helper;
+                return Action::None;
+            }
+        }
         if let Some(df) = l.diff {
             if rect_contains(df, col, row) {
                 self.focus = Focus::Diff;
@@ -2524,7 +2563,7 @@ pub fn centered(area: Rect, pct_w: u16, pct_h: u16) -> Rect {
 
 /// Draws every partition. Each pane writes only into its own rectangle and
 /// ratatui flushes only the cells that changed since the previous frame (S3).
-pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
+pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Option<&PtyPane>) {
     let area = frame.area();
     let l = app.compute_layout(area);
     app.layout = Some(l);
@@ -2738,15 +2777,22 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
     if let Some(df) = l.diff {
         if l.is_minimized(Pane::Diff) {
             draw_min_bar(frame, "Agent changes", df, focus == Focus::Diff, app.icons);
+            app.term_area = None;
+            app.helper_area = None;
         } else {
-        // Right pane: the agent's changes (read-only).
+        // The Agent-changes pane always splits into the diff (top), an
+        // interactive $SHELL terminal (bottom-left) and the command helper
+        // (bottom-right) (S24). A short pane keeps the diff whole.
+        let (top, term, helper) = layout::split_agent_changes(df);
+        // Top: the agent's changes (read-only).
+        let diff_block = pane_block(" Agent changes ".into(), focus == Focus::Diff);
         match &app.viewer {
             Some(v) => {
                 let lines: Vec<Line> = v
                     .diff
                     .iter()
                     .skip(v.diff_scroll)
-                    .take(df.height as usize)
+                    .take(top.height as usize)
                     .map(|d| {
                         let style = match d.kind {
                             DiffKind::Added => Style::default().fg(Color::Green),
@@ -2758,11 +2804,53 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>) {
                         Line::styled(d.text.clone(), style)
                     })
                     .collect();
-                frame.render_widget(Paragraph::new(lines).block(pane_block(" Agent changes ".into(), focus == Focus::Diff)), df);
+                frame.render_widget(Paragraph::new(lines).block(diff_block), top);
             }
             None => {
-                frame.render_widget(Paragraph::new("").block(pane_block(" Agent changes ".into(), focus == Focus::Diff)), df);
+                frame.render_widget(Paragraph::new("").block(diff_block), top);
             }
+        }
+        if term.width > 0 && term.height > 0 {
+            // Bottom-left: the interactive shell PTY.
+            let tblock = pane_block(" Terminal · $SHELL ".into(), focus == Focus::Terminal);
+            let tinner = tblock.inner(term);
+            frame.render_widget(tblock, term);
+            match shell {
+                Some(sh) if sh.is_alive() => sh.with_screen(|screen| {
+                    pane::render_screen(screen, tinner, frame.buffer_mut());
+                    let (srow, scol) = screen.cursor_position();
+                    if focus == Focus::Terminal && app.overlay.is_none() && !screen.hide_cursor() {
+                        frame.set_cursor_position(Position::new(
+                            tinner.x + scol.min(tinner.width.saturating_sub(1)),
+                            tinner.y + srow.min(tinner.height.saturating_sub(1)),
+                        ));
+                    }
+                }),
+                Some(_) => frame.render_widget(
+                    Paragraph::new("shell exited").style(Style::default().fg(Color::DarkGray)),
+                    tinner,
+                ),
+                None => frame.render_widget(
+                    Paragraph::new("shell unavailable").style(Style::default().fg(Color::DarkGray)),
+                    tinner,
+                ),
+            }
+            app.term_area = Some(tinner);
+            // Bottom-right: the command helper (input/answers land here in T25b).
+            let hblock = pane_block(" Helper ".into(), focus == Focus::Helper);
+            let hinner = hblock.inner(helper);
+            frame.render_widget(hblock, helper);
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled("Ask about / recommend commands", Style::default().fg(Color::DarkGray)),
+                    Line::styled("from what you run (coming soon).", Style::default().fg(Color::DarkGray)),
+                ]),
+                hinner,
+            );
+            app.helper_area = Some(hinner);
+        } else {
+            app.term_area = None;
+            app.helper_area = None;
         }
         }
     }
@@ -2941,7 +3029,9 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "        Shift+arrows select · drag selects · Ctrl+C copy · ● unsaved · Esc back".into(),
         format!("  e      explain the selection / current line (also right-click)"),
         "        with a selection: Ctrl+E or click the ✿ ? mascot badge to ask".into(),
-        "Agent changes: ↑↓ PgUp PgDn scroll · Esc back / restore zoom".into(),
+        "Agent changes: diff (top) + $SHELL terminal + command helper (S24)".into(),
+        "        ↑↓ PgUp PgDn scroll the diff · click the terminal/helper to focus".into(),
+        "        terminal: run commands (touch, mkdir, background jobs) · Esc back".into(),
         "Apps: ↑↓ select · Enter app→items→reply · a actions (open) · Esc back".into(),
         "      +/- resize the expanded panel (40-70%) · click an app to open it".into(),
         "      header: [_] collapse · [□] expand · click “Apps” to toggle".into(),
@@ -3207,7 +3297,7 @@ mod tests {
     /// Renders once so the app knows its layout, as the event loop does.
     fn render(app: &mut App, w: u16, h: u16) -> Terminal<TestBackend> {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
-        t.draw(|f| draw(f, app, None)).unwrap();
+        t.draw(|f| draw(f, app, None, None)).unwrap();
         t
     }
 
@@ -3385,6 +3475,25 @@ mod tests {
         let err = GitGraphData { error: Some("boom".into()), ..Default::default() };
         let lines = gitgraph_lines(&err, 0, 80, 20);
         assert_eq!(lines.len(), 1, "an error shows a single line");
+    }
+
+    #[test]
+    fn agent_changes_splits_into_terminal_and_helper() {
+        // S24: the Agent-changes pane splits into diff + terminal + helper. A
+        // click in the terminal box focuses it and keys reach the shell; the
+        // helper focuses on click and Esc returns to the diff.
+        let (root, mut app) = workspace("agent-terminal");
+        render(&mut app, 120, 40);
+        let term = app.term_area.expect("terminal region captured in the draw");
+        app.handle_mouse(click(term.x, term.y));
+        assert_eq!(app.focus, Focus::Terminal);
+        assert_eq!(app.handle_key(ch('a')), Action::ForwardShell(b"a".to_vec()));
+        let helper = app.helper_area.expect("helper region captured in the draw");
+        app.handle_mouse(click(helper.x, helper.y));
+        assert_eq!(app.focus, Focus::Helper);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.focus, Focus::Diff);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

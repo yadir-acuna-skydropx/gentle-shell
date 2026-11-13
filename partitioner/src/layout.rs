@@ -130,6 +130,29 @@ impl Layout {
     }
 }
 
+/// Splits the Agent-changes pane into the diff (top), an interactive terminal
+/// (bottom-left) and the command helper (bottom-right) (S24). The diff keeps
+/// the top ~55% of the height; the remaining row splits evenly left/right. The
+/// three rects never overlap and cover the whole pane. When the pane is too
+/// short to split usefully it all goes to the diff and the other two are empty.
+pub fn split_agent_changes(diff: Rect) -> (Rect, Rect, Rect) {
+    if diff.height < AGENT_SPLIT_MIN_HEIGHT || diff.width < 2 {
+        let empty = Rect::new(diff.x, diff.y + diff.height, 0, 0);
+        return (diff, empty, empty);
+    }
+    let top_h = (diff.height * 55 / 100).max(3);
+    let bottom_h = diff.height - top_h;
+    let top = Rect::new(diff.x, diff.y, diff.width, top_h);
+    let by = diff.y + top_h;
+    let left_w = diff.width / 2;
+    let term = Rect::new(diff.x, by, left_w, bottom_h);
+    let helper = Rect::new(diff.x + left_w, by, diff.width - left_w, bottom_h);
+    (top, term, helper)
+}
+
+/// Minimum Agent-changes height before it splits into diff + terminal + helper.
+pub const AGENT_SPLIT_MIN_HEIGHT: u16 = 10;
+
 /// Base layout with no zoom or minimize (kept for the existing call sites and
 /// tests; delegates to [`compute_panes`]).
 pub fn compute(area: Rect, requested: Mode) -> Layout {
@@ -296,6 +319,35 @@ mod tests {
 
     fn cells(r: Option<Rect>) -> u32 {
         r.map_or(0, |r| r.width as u32 * r.height as u32)
+    }
+
+    #[test]
+    fn split_agent_changes_covers_the_pane_without_overlap() {
+        let diff = Rect::new(60, 2, 40, 20);
+        let (top, term, helper) = split_agent_changes(diff);
+        // Diff keeps the top; terminal and helper sit on the bottom row.
+        assert_eq!(top.x, 60);
+        assert_eq!(top.y, 2);
+        assert_eq!(top.width, 40);
+        assert_eq!(term.y, top.y + top.height);
+        assert_eq!(helper.y, term.y);
+        assert_eq!(term.x, 60);
+        assert_eq!(helper.x, term.x + term.width);
+        // No overlap and full coverage of area.
+        let covered = top.width as u32 * top.height as u32
+            + term.width as u32 * term.height as u32
+            + helper.width as u32 * helper.height as u32;
+        assert_eq!(covered, diff.width as u32 * diff.height as u32);
+        assert_eq!(top.height + term.height, diff.height);
+    }
+
+    #[test]
+    fn split_agent_changes_keeps_a_short_pane_whole() {
+        let diff = Rect::new(0, 0, 40, 6);
+        let (top, term, helper) = split_agent_changes(diff);
+        assert_eq!(top, diff);
+        assert_eq!((term.width, term.height), (0, 0));
+        assert_eq!((helper.width, helper.height), (0, 0));
     }
 
     #[test]

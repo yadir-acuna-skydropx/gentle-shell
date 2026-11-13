@@ -83,6 +83,8 @@ enum Event {
     /// repaints while the explain popup takes input, so the UI stays idle
     /// otherwise (S11).
     Tick,
+    /// The Agent-changes interactive shell produced output (coalesced, S24).
+    ShellOutput,
 }
 
 fn main() {
@@ -360,10 +362,16 @@ fn event_loop(
     let pty_pending = Arc::new(AtomicBool::new(false));
     let mut pty = spawn_pty(terminal, &mut app, command, &root, tx.clone(), pty_pending.clone(), predict.as_ref())?;
 
+    // The Agent-changes interactive shell (S24) runs in its own PTY, coalesced
+    // like the main one. It is best-effort: a spawn failure leaves the terminal
+    // box empty but never stops gentle-shell.
+    let shell_pending = Arc::new(AtomicBool::new(false));
+    let mut shell = spawn_shell(&root, tx.clone(), shell_pending.clone()).ok();
+
     // Prime the first git refresh and paint the initial frame.
     let _ = git_tx.send(());
     let mut last_git_refresh = Instant::now() - GIT_REFRESH_INTERVAL;
-    redraw(terminal, &mut app, &mut pty)?;
+    redraw(terminal, &mut app, &mut pty, shell.as_mut())?;
 
     while let Ok(ev) = rx.recv() {
         let mut needs_redraw = true;
@@ -376,6 +384,12 @@ fn event_loop(
                     Action::Forward(bytes) => {
                         pty.write(&bytes);
                         pty.reset_scroll();
+                    }
+                    Action::ForwardShell(bytes) => {
+                        if let Some(sh) = &mut shell {
+                            sh.write(&bytes);
+                            sh.reset_scroll();
+                        }
                     }
                     Action::ScrollChat(delta) => pty.scroll_chat(delta),
                     Action::Apps(msg) => {
@@ -408,6 +422,12 @@ fn event_loop(
                     pty.write(&bytes);
                     pty.reset_scroll();
                 }
+                Action::ForwardShell(bytes) => {
+                    if let Some(sh) = &mut shell {
+                        sh.write(&bytes);
+                        sh.reset_scroll();
+                    }
+                }
                 Action::ScrollChat(delta) => pty.scroll_chat(delta),
                 Action::Apps(msg) => {
                     if let Some(a) = &apps {
@@ -428,12 +448,20 @@ fn event_loop(
                 Action::Quit => break,
             },
             Event::Input(CtEvent::Paste(text)) => {
-                if app.effective_focus() == Focus::Chat && app.overlay.is_none() {
+                if app.overlay.is_none() {
+                    let focus = app.effective_focus();
                     let mut bytes = b"\x1b[200~".to_vec();
                     bytes.extend_from_slice(text.as_bytes());
                     bytes.extend_from_slice(b"\x1b[201~");
-                    pty.write(&bytes);
-                    pty.reset_scroll();
+                    if focus == Focus::Chat {
+                        pty.write(&bytes);
+                        pty.reset_scroll();
+                    } else if focus == Focus::Terminal {
+                        if let Some(sh) = &mut shell {
+                            sh.write(&bytes);
+                            sh.reset_scroll();
+                        }
+                    }
                 }
             }
             Event::Input(CtEvent::Resize(_, _)) => {}
@@ -456,14 +484,16 @@ fn event_loop(
             // Blink the explainer caret only while it takes input; stay idle
             // (no repaint) otherwise so S11 holds.
             Event::Tick => needs_redraw = app.tick_blink(),
+            Event::ShellOutput => shell_pending.store(false, Ordering::Release),
         }
 
-        // The child owns the session lifetime: when it exits, so do we.
+        // The child owns the session lifetime: when it exits, so do we. The
+        // Agent-changes shell is independent: its exit leaves the box empty.
         if !pty.is_alive() {
             break;
         }
         if needs_redraw {
-            redraw(terminal, &mut app, &mut pty)?;
+            redraw(terminal, &mut app, &mut pty, shell.as_mut())?;
         }
     }
     // Kill the apps and explainer engines on quit so no child is left behind.
@@ -579,13 +609,38 @@ fn spawn_pty(
 
 /// Resizes the PTY to the chat area and repaints. ratatui diffs the buffer so
 /// only changed cells reach the real terminal (S3).
-fn redraw(terminal: &mut Terminal<Backend>, app: &mut App, pty: &mut PtyPane) -> Result<()> {
+fn redraw(terminal: &mut Terminal<Backend>, app: &mut App, pty: &mut PtyPane, shell: Option<&mut PtyPane>) -> Result<()> {
     let size = terminal.size()?;
     // When the chat is minimized or hidden by a zoomed pane, keep the PTY at its
     // last real size so gentle-shell does not reflow (S4, S14).
     if let Some(inner) = app.chat_inner(Rect::new(0, 0, size.width, size.height)) {
         pty.resize(inner.height, inner.width);
     }
-    terminal.draw(|f| draw(f, app, Some(&*pty)))?;
+    // Resize the shell to the terminal box captured on the previous frame (S24).
+    let shell_ref = shell.map(|s| {
+        if let Some(area) = app.term_area {
+            s.resize(area.height.max(1), area.width.max(1));
+        }
+        &*s
+    });
+    terminal.draw(|f| draw(f, app, Some(&*pty), shell_ref))?;
     Ok(())
+}
+
+/// Spawns the user's $SHELL in its own PTY for the Agent-changes terminal (S24).
+/// Reuses the generic [`PtyPane`] infrastructure; background jobs run normally
+/// under the PTY's process group.
+fn spawn_shell(root: &Path, tx: Sender<Event>, pending: Arc<AtomicBool>) -> Result<PtyPane> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let mut cmd = CommandBuilder::new(&shell);
+    cmd.cwd(root);
+    cmd.env("TERM", "xterm-256color");
+    cmd.env("GENTLE_PARTITIONER", "1");
+    let notify = move || {
+        if !pending.swap(true, Ordering::AcqRel) {
+            let _ = tx.send(Event::ShellOutput);
+        }
+    };
+    // A placeholder size; the first redraw resizes it to the real terminal box.
+    PtyPane::spawn(cmd, 10, 40, notify).context("spawning the agent-changes shell")
 }
