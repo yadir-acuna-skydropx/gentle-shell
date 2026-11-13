@@ -62,6 +62,7 @@ const SLACK: &str = "\u{f198}"; // nf-fa-slack
 const GITHUB: &str = "\u{f09b}"; // nf-fa-github
 const ARCH: &str = "\u{f0e8}"; // nf-fa-sitemap (architecture / blueprint)
 const APP: &str = "\u{f0ac}"; // nf-fa-globe (generic app)
+const CONVERSATIONS: &str = "\u{f086}"; // nf-fa-comments (conversations, S22)
 // GitHub item-kind glyphs for the apps panel (S15).
 const PULL_REQUEST: &str = "\u{f407}"; // nf-oct-git_pull_request
 const ISSUE: &str = "\u{f41b}"; // nf-oct-issue_opened
@@ -82,17 +83,16 @@ pub const GLYPHS: &[&str] = &[
 pub fn app_icon(id: &str, mode: IconMode) -> &'static str {
     match mode {
         // The local "Arquitectura" entry uses "A" in the ASCII fallback (S18, L48).
-        IconMode::Ascii => {
-            if id == "__arch__" {
-                "A"
-            } else {
-                "#"
-            }
-        }
+        IconMode::Ascii => match id {
+            "__arch__" => "A",
+            "__conversations__" => "C",
+            _ => "#",
+        },
         IconMode::Nerd => match id {
             "slack" => SLACK,
             "github" => GITHUB,
             "__arch__" => ARCH,
+            "__conversations__" => CONVERSATIONS,
             _ => APP,
         },
     }

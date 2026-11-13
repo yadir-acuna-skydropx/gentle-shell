@@ -67,6 +67,9 @@ pub enum Overlay {
     Arch,
     /// The graphical git overlay (S20): commit/branch DAG + local worktrees.
     GitGraph,
+    /// The conversations manager (S22): list, switch, create and close
+    /// simultaneous gentle-shell conversations.
+    Conversations,
 }
 
 /// The three stages of the architecture overlay (S18).
@@ -153,6 +156,10 @@ pub enum Action {
     /// A command-helper question (S24); main.rs attaches the shell context and
     /// sends it to the engine as a one-shot Suggest.
     Helper { id: u64, question: String },
+    /// Start a new conversation: main.rs spawns another gentle-shell (S22).
+    NewConversation,
+    /// Close conversation `index`: main.rs kills and drops its child (S22).
+    CloseConversation(usize),
     /// A request for the architecture engine (review / design / cancel).
     Arch(ArchReq),
     /// Open a finished report file with the system opener (xdg-open).
@@ -228,9 +235,25 @@ fn language_for(path: &Path) -> String {
 /// status and opens the Arch overlay on it.
 const ARCH_ROW_ID: &str = "__arch__";
 
+/// Id of the local "Conversaciones" row in the apps list (S22). It opens the
+/// conversations manager overlay rather than a gentle-apps connector.
+const CONVERSATIONS_ROW_ID: &str = "__conversations__";
+
 /// Helper requests share the explainer engine but are keyed in a separate id
 /// range so their streamed messages never route to the explain popup (S24).
 const HELPER_ID_BASE: u64 = 1_000_000_000;
+
+/// One open conversation = its own gentle-shell child (Option A, S22). The
+/// partitioner keeps a parallel `PtyPane` per entry in main.rs; this struct is
+/// only the UI-visible metadata and the source of truth for the active index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Conversation {
+    /// Short label shown in the manager and the chat title bar.
+    pub title: String,
+}
+
+/// Maximum simultaneous conversations; each is a full gentle-shell process.
+pub const MAX_CONVERSATIONS: usize = 6;
 
 /// Maps a focus target to the layout pane it belongs to (the apps panel lives
 /// inside the sidebar unit).
@@ -334,6 +357,15 @@ pub struct App {
     /// Command-helper state for the Agent-changes helper box (S24, T25b).
     /// Reuses the explainer UI shape; ids are offset by [`HELPER_ID_BASE`].
     pub helper: ExplainUi,
+    /// Open conversations (S22); always at least one. Index 0 is the first
+    /// gentle-shell spawned at startup.
+    pub conversations: Vec<Conversation>,
+    /// Index of the active conversation (the one the chat pane renders).
+    pub active_conversation: usize,
+    /// Selected row in the conversations manager overlay.
+    pub conv_sel: usize,
+    /// Monotonic source for conversation titles.
+    next_conversation: usize,
     /// Blink phase for the animated explainer caret (S21): toggled on each
     /// timer tick while the explain popup accepts input.
     pub blink_on: bool,
@@ -389,6 +421,10 @@ impl App {
             explain: ExplainUi::default(),
             arch: ArchUi::default(),
             helper: ExplainUi::default(),
+            conversations: vec![Conversation { title: "1".into() }],
+            active_conversation: 0,
+            conv_sel: 0,
+            next_conversation: 1,
             blink_on: true,
             gitgraph: GitGraphData::default(),
             gitgraph_scroll: 0,
@@ -924,14 +960,20 @@ impl App {
     }
 
     /// Number of selectable rows in the collapsed apps list: the engine apps
-    /// plus the local "Arquitectura" row that always trails them (S18, L48).
+    /// plus the local "Arquitectura" (S18, L48) and "Conversaciones" (S22) rows
+    /// that always trail them.
     fn apps_list_count(&self) -> usize {
-        self.apps.apps.len() + 1
+        self.apps.apps.len() + 2
     }
 
     /// Whether `idx` addresses the trailing "Arquitectura" row.
     fn is_arch_row(&self, idx: usize) -> bool {
         idx == self.apps.apps.len()
+    }
+
+    /// Whether `idx` addresses the trailing "Conversaciones" row (S22).
+    fn is_conversations_row(&self, idx: usize) -> bool {
+        idx == self.apps.apps.len() + 1
     }
 
     /// Content rows the collapsed apps panel must show: the selectable rows plus
@@ -1062,6 +1104,9 @@ impl App {
                     KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
                         if self.is_arch_row(self.apps.app_sel) {
                             return self.open_arch();
+                        }
+                        if self.is_conversations_row(self.apps.app_sel) {
+                            return self.open_conversations();
                         }
                         return self.enter_selected_app();
                     }
@@ -1268,6 +1313,7 @@ impl App {
             KeyCode::Char('e') => self.open_explain(),
             KeyCode::Char('A') => self.open_arch(),
             KeyCode::Char('g') => self.open_gitgraph(),
+            KeyCode::Char('n') => self.open_conversations(),
             KeyCode::Char('q') => {
                 // A dirty buffer warns once before quitting; a second q quits.
                 if self.editor.as_ref().is_some_and(|e| e.dirty) && !self.pending_quit {
@@ -1357,6 +1403,10 @@ impl App {
         if overlay == Overlay::Explain {
             return self.explain_key(key);
         }
+        // The conversations manager has its own reducer (S22).
+        if overlay == Overlay::Conversations {
+            return self.conversations_key(key);
+        }
         // The git graph overlay scrolls the commit rows; Esc closes it.
         if overlay == Overlay::GitGraph {
             match key.code {
@@ -1384,7 +1434,8 @@ impl App {
             KeyCode::Enter => match overlay {
                 Overlay::Files => self.toggle_or_open_selected(),
                 Overlay::Changes => self.open_selected_change(),
-                Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch | Overlay::GitGraph => {}
+                Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch | Overlay::GitGraph
+                | Overlay::Conversations => {}
             },
             _ => {}
         }
@@ -1395,7 +1446,8 @@ impl App {
         match overlay {
             Overlay::Files => self.selected = clamp_index(self.selected, delta, self.entries.len()),
             Overlay::Changes => self.change_selected = clamp_index(self.change_selected, delta, self.changes().len()),
-            Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch | Overlay::GitGraph => {}
+            Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch | Overlay::GitGraph
+            | Overlay::Conversations => {}
         }
     }
 
@@ -1461,6 +1513,86 @@ impl App {
     /// Opens the architecture overlay (prefix `A` / the "Arch" tool), starting
     /// on the two-option menu. The engine's start `status` populates the key /
     /// model / KB-chunk fields.
+    /// Opens the conversations manager overlay (S22).
+    fn open_conversations(&mut self) -> Action {
+        self.conv_sel = self.active_conversation;
+        self.overlay = Some(Overlay::Conversations);
+        Action::None
+    }
+
+    /// Starts a new conversation (a fresh gentle-shell child), made active
+    /// (S22, Option A). Capped at [`MAX_CONVERSATIONS`].
+    pub fn new_conversation(&mut self) -> Action {
+        if self.conversations.len() >= MAX_CONVERSATIONS {
+            self.status_msg = Some(format!("conversation limit reached ({MAX_CONVERSATIONS})"));
+            return Action::None;
+        }
+        self.next_conversation += 1;
+        self.conversations.push(Conversation { title: self.next_conversation.to_string() });
+        self.active_conversation = self.conversations.len() - 1;
+        self.conv_sel = self.active_conversation;
+        Action::NewConversation
+    }
+
+    /// Switches the active conversation (S22).
+    pub fn switch_conversation(&mut self, i: usize) {
+        if i < self.conversations.len() {
+            self.active_conversation = i;
+        }
+    }
+
+    /// Closes conversation `i`, killing its child in main.rs (S22). Closing the
+    /// last remaining conversation ends the session. Returns the action main.rs
+    /// must apply to keep its parallel PTY vector aligned.
+    pub fn close_conversation(&mut self, i: usize) -> Action {
+        if i >= self.conversations.len() {
+            return Action::None;
+        }
+        self.conversations.remove(i);
+        if self.conversations.is_empty() {
+            return Action::Quit;
+        }
+        // Keep the active index pointing at the same conversation when possible.
+        if self.active_conversation > i || self.active_conversation >= self.conversations.len() {
+            self.active_conversation = self.active_conversation.saturating_sub(1);
+        }
+        self.conv_sel = self.conv_sel.min(self.conversations.len() - 1);
+        Action::CloseConversation(i)
+    }
+
+    /// "n/total" label for the chat title bar (S22).
+    pub fn conversation_label(&self) -> String {
+        format!("{}/{}", self.active_conversation + 1, self.conversations.len())
+    }
+
+    /// Conversations manager reducer (S22): navigate, Enter switches, `n`
+    /// creates, `x` closes, Esc leaves.
+    fn conversations_key(&mut self, key: KeyEvent) -> Action {
+        let len = self.conversations.len();
+        match key.code {
+            KeyCode::Esc => {
+                self.overlay = None;
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.conv_sel = self.conv_sel.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.conv_sel = (self.conv_sel + 1).min(len.saturating_sub(1));
+                Action::None
+            }
+            KeyCode::Char('n') => self.new_conversation(),
+            KeyCode::Char('x') => self.close_conversation(self.conv_sel),
+            KeyCode::Enter => {
+                self.switch_conversation(self.conv_sel);
+                self.overlay = None;
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
     /// Opens the graphical git overlay (S20), refreshing the DAG from git.
     fn open_gitgraph(&mut self) -> Action {
         self.gitgraph = gitgraph::collect(&self.root);
@@ -1975,6 +2107,17 @@ impl App {
                 }
             }
             Overlay::Apps => return self.click_apps(area, (area.x + 1).max(0), row),
+            Overlay::Conversations => {
+                // The first line is the hint; rows below are conversations.
+                if rel >= 1 {
+                    let i = rel - 1;
+                    if i < self.conversations.len() {
+                        self.conv_sel = i;
+                        self.switch_conversation(i);
+                        self.overlay = None;
+                    }
+                }
+            }
             Overlay::Help | Overlay::Explain | Overlay::Arch | Overlay::GitGraph => {}
         }
         Action::None
@@ -1997,6 +2140,9 @@ impl App {
                     // The trailing "Arquitectura" row opens the Arch overlay (S18, L48).
                     if self.is_arch_row(rel) {
                         return self.open_arch();
+                    }
+                    if self.is_conversations_row(rel) {
+                        return self.open_conversations();
                     }
                     return self.enter_selected_app();
                 }
@@ -2336,6 +2482,20 @@ fn arch_row_line(app: &App, w: usize, focused: bool) -> Line<'static> {
     Line::from(vec![Span::styled("\u{25cf} ", app_dot_style(state)), Span::styled(label, label_style)])
 }
 
+/// The local "Conversaciones" row (S22): opens the conversations manager. Its
+/// index in the list is always `apps.len()+1` (it trails Arquitectura).
+fn conversations_row_line(app: &App, w: usize, focused: bool) -> Line<'static> {
+    let selected = focused && app.apps.app_sel == app.apps.apps.len() + 1;
+    let glyph = icons::app_icon(CONVERSATIONS_ROW_ID, app.icons);
+    let mut label_style = Style::default();
+    if selected {
+        label_style = label_style.add_modifier(Modifier::REVERSED);
+    }
+    let text = format!("{glyph} Conversaciones ({})", app.conversations.len());
+    let label = fit(&text, w.saturating_sub(2));
+    Line::from(vec![Span::styled("● ", app_dot_style(AppState::Connected)), Span::styled(label, label_style)])
+}
+
 /// Collapsed view: one row per app with a status dot and item count, then the
 /// local "Arquitectura" row (S18, L48). When the apps engine is offline or
 /// still connecting, a trailing non-selectable note is appended after the
@@ -2363,6 +2523,8 @@ fn apps_list_lines(app: &App, w: usize, focused: bool) -> Vec<Line<'static>> {
         .collect();
     // The local "Arquitectura" entry trails the engine apps (index apps.len()).
     lines.push(arch_row_line(app, w, focused));
+    // The "Conversaciones" entry trails Arquitectura (index apps.len()+1, S22).
+    lines.push(conversations_row_line(app, w, focused));
     if app.apps.offline {
         lines.push(Line::styled("apps engine offline", Style::default().fg(Color::DarkGray)));
     } else if app.apps.apps.is_empty() {
@@ -2918,7 +3080,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
                 draw_min_bar(frame, "Chat", l.chat, focus == Focus::Chat, app.icons);
                 None
             } else if l.show_chat {
-                let block = pane_block(" Chat · gentle-shell ".into(), focus == Focus::Chat);
+                let ctitle = if app.conversations.len() > 1 {
+                    format!(" Chat · gentle-shell [{}] ", app.conversation_label())
+                } else {
+                    " Chat · gentle-shell ".to_string()
+                };
+                let block = pane_block(ctitle, focus == Focus::Chat);
                 let inner = block.inner(l.chat);
                 frame.render_widget(block, l.chat);
                 Some(inner)
@@ -2991,9 +3158,15 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
             let h = area.height.saturating_sub(2) as usize;
             let lines = gitgraph_lines(&app.gitgraph, app.gitgraph_scroll, w, h);
             frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
+        } else if overlay == Overlay::Conversations {
+            let title = " Conversations · Enter switch · n new · x close · Esc ".to_string();
+            let lines = conversations_lines(app);
+            frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
         } else {
         let (title, lines) = match overlay {
-            Overlay::Explain | Overlay::Arch | Overlay::GitGraph => unreachable!("handled above"),
+            Overlay::Explain | Overlay::Arch | Overlay::GitGraph | Overlay::Conversations => {
+                unreachable!("handled above")
+            }
             Overlay::Files => {
                 let h = area.height.saturating_sub(2) as usize;
                 app.tree_offset = keep_visible(app.selected, app.tree_offset, h);
@@ -3030,7 +3203,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
     }
 
     let status = if app.prefix {
-        Line::styled(format!(" {PREFIX_LABEL} … w workspace · t files · c changes · a apps · g graph · z zoom · m min · d changes-only · Tab/1-4 focus · ? help · q quit · ] send {PREFIX_LABEL}"), Style::default().fg(Color::Black).bg(Color::Cyan))
+        Line::styled(format!(" {PREFIX_LABEL} … w workspace · t files · c changes · a apps · g graph · n convs · z zoom · m min · d changes-only · Tab/1-4 focus · ? help · q quit · ] send {PREFIX_LABEL}"), Style::default().fg(Color::Black).bg(Color::Cyan))
     } else if let Some(msg) = &app.status_msg {
         Line::styled(format!(" {msg}"), Style::default().fg(Color::Black).bg(Color::Yellow))
     } else if focus == Focus::Editor && app.editor.as_ref().is_some_and(|e| e.has_selection()) {
@@ -3073,6 +3246,7 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "  m      minimize the focused pane (restore with m or a click)".into(),
         "  d      changes only (focus + zoom the agent-changes pane)".into(),
         "  g      git graph (commit/branch DAG + worktrees overlay)".into(),
+        "  n      conversations (manage: new / switch / close gentle-shells)".into(),
         "  Tab    next pane   1-4 sidebar / editor / changes / chat".into(),
         "  q      quit (stops gentle-shell)".into(),
         format!("  ]      send a literal {PREFIX_LABEL} to the chat"),
@@ -3257,6 +3431,29 @@ fn explain_lines(e: &ExplainUi, w: usize, h: usize, blink_on: bool) -> Vec<Line<
         format!("> {}{}", e.question, caret)
     };
     out.push(Line::styled(prompt, Style::default().fg(Color::Cyan)));
+    out
+}
+
+/// Renders the conversations manager (S22): a hint line, then one row per
+/// conversation with the active one marked and the selected one highlighted.
+fn conversations_lines(app: &App) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    out.push(Line::styled(
+        "↑↓ select · Enter switch · n new · x close · Esc back",
+        Style::default().fg(Color::DarkGray),
+    ));
+    for (i, c) in app.conversations.iter().enumerate() {
+        let active = i == app.active_conversation;
+        let marker = if active { "● " } else { "  " };
+        let mut style = Style::default();
+        if active {
+            style = style.fg(Color::Cyan);
+        }
+        if i == app.conv_sel {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        out.push(Line::styled(format!("{marker}{}. gentle-shell [{}]", i + 1, c.title), style));
+    }
     out
 }
 
@@ -3548,6 +3745,60 @@ mod tests {
         assert_eq!(app.focus, Focus::Helper);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.focus, Focus::Diff);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn conversations_create_switch_and_close() {
+        // S22: new makes a fresh active conversation; closing a non-active one
+        // keeps the active pointer; closing the active one re-targets a
+        // neighbour; closing the last ends the session.
+        let (root, mut app) = workspace("conversations-state");
+        assert_eq!(app.conversations.len(), 1);
+        assert_eq!(app.active_conversation, 0);
+        assert_eq!(app.new_conversation(), Action::NewConversation);
+        assert_eq!((app.conversations.len(), app.active_conversation), (2, 1));
+        app.new_conversation();
+        assert_eq!(app.conversations.len(), 3);
+        // Switch to the first, then close the last (non-active): active unchanged.
+        app.switch_conversation(0);
+        assert_eq!(app.active_conversation, 0);
+        assert_eq!(app.close_conversation(2), Action::CloseConversation(2));
+        assert_eq!((app.conversations.len(), app.active_conversation), (2, 0));
+        // Closing a lower-indexed conversation shifts the active index down.
+        app.switch_conversation(1);
+        app.close_conversation(0);
+        assert_eq!((app.conversations.len(), app.active_conversation), (1, 0));
+        // Closing the final conversation quits.
+        assert_eq!(app.close_conversation(0), Action::Quit);
+        assert!(app.conversations.is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn conversations_are_capped() {
+        let (root, mut app) = workspace("conversations-cap");
+        for _ in 0..MAX_CONVERSATIONS * 2 {
+            app.new_conversation();
+        }
+        assert_eq!(app.conversations.len(), MAX_CONVERSATIONS);
+        assert_eq!(app.new_conversation(), Action::None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn conversations_manager_opens_and_drives_from_keys() {
+        // S22: prefix n opens the manager; inside, n creates, Enter switches and
+        // closes the overlay, Esc leaves.
+        let (root, mut app) = workspace("conversations-manager");
+        prefix_key(&mut app, 'n');
+        assert_eq!(app.overlay, Some(Overlay::Conversations));
+        app.handle_key(ch('n'));
+        assert_eq!(app.conversations.len(), 2);
+        app.conv_sel = 0;
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.active_conversation, 0);
+        assert_eq!(app.overlay, None);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -4689,12 +4940,14 @@ mod tests {
         });
         app.apply_apps_msg(EngineMsg::Items { app: "slack".into(), items: vec![app_item("a", "#one")] });
         render(&mut app, 120, 40);
-        // Down twice: Slack(0) → GitHub(1) → Arquitectura(2); it does not overshoot.
+        // Down: Slack(0) → GitHub(1) → Arquitectura(2) → Conversaciones(3), no overshoot.
         app.handle_key(key(KeyCode::Down));
         app.handle_key(key(KeyCode::Down));
         assert_eq!(app.apps.app_sel, 2, "Arquitectura is the third row after two engine apps");
         app.handle_key(key(KeyCode::Down));
-        assert_eq!(app.apps.app_sel, 2, "selection clamps at the Arquitectura row");
+        assert_eq!(app.apps.app_sel, 3, "Conversaciones is the fourth row (S22)");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.apps.app_sel, 3, "selection clamps at the last local row");
         // Clicking the first engine row still enters Slack, not Arch.
         let ap = app.apps_area.expect("apps panel region");
         let act = app.handle_mouse(click(ap.x + 2, ap.y + 1));

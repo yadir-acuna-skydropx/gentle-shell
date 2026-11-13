@@ -360,8 +360,12 @@ fn event_loop(
 
     // Coalesce PTY wake-ups: the reader thread flips the flag and only sends a
     // PtyOutput when none is pending, so the UI never floods on fast output.
+    // Each conversation is its own gentle-shell child in its own PTY (S22,
+    // Option A). The vector stays index-aligned with `app.conversations`; the
+    // active one is `app.active_conversation`.
     let pty_pending = Arc::new(AtomicBool::new(false));
-    let mut pty = spawn_pty(terminal, &mut app, command, &root, tx.clone(), pty_pending.clone(), predict.as_ref())?;
+    let mut ptys: Vec<PtyPane> =
+        vec![spawn_pty(terminal, &app, command, &root, tx.clone(), pty_pending.clone(), predict.as_ref())?];
 
     // The Agent-changes interactive shell (S24) runs in its own PTY, coalesced
     // like the main one. It is best-effort: a spawn failure leaves the terminal
@@ -372,19 +376,23 @@ fn event_loop(
     // Prime the first git refresh and paint the initial frame.
     let _ = git_tx.send(());
     let mut last_git_refresh = Instant::now() - GIT_REFRESH_INTERVAL;
-    redraw(terminal, &mut app, &mut pty, shell.as_mut())?;
+    {
+        let active = app.active_conversation;
+        redraw(terminal, &mut app, &mut ptys[active], shell.as_mut())?;
+    }
 
     while let Ok(ev) = rx.recv() {
         let mut needs_redraw = true;
         match ev {
             Event::Input(CtEvent::Key(key)) => {
-                // The child's DECCKM state decides how arrows are encoded.
-                pty.with_screen(|s| app.app_cursor = s.application_cursor());
+                // The active child's DECCKM state decides how arrows are encoded.
+                ptys[app.active_conversation].with_screen(|s| app.app_cursor = s.application_cursor());
                 match app.handle_key(key) {
                     Action::None => {}
                     Action::Forward(bytes) => {
-                        pty.write(&bytes);
-                        pty.reset_scroll();
+                        let a = app.active_conversation;
+                        ptys[a].write(&bytes);
+                        ptys[a].reset_scroll();
                     }
                     Action::ForwardShell(bytes) => {
                         if let Some(sh) = &mut shell {
@@ -392,7 +400,19 @@ fn event_loop(
                             sh.reset_scroll();
                         }
                     }
-                    Action::ScrollChat(delta) => pty.scroll_chat(delta),
+                    Action::NewConversation => {
+                        if let Ok(p) =
+                            spawn_pty(terminal, &app, command, &root, tx.clone(), pty_pending.clone(), predict.as_ref())
+                        {
+                            ptys.push(p);
+                        }
+                    }
+                    Action::CloseConversation(i) => {
+                        if i < ptys.len() {
+                            ptys.remove(i);
+                        }
+                    }
+                    Action::ScrollChat(delta) => ptys[app.active_conversation].scroll_chat(delta),
                     Action::Apps(msg) => {
                         if let Some(a) = &apps {
                             a.send(msg);
@@ -435,8 +455,9 @@ fn event_loop(
             Event::Input(CtEvent::Mouse(mouse)) => match app.handle_mouse(mouse) {
                 Action::None => {}
                 Action::Forward(bytes) => {
-                    pty.write(&bytes);
-                    pty.reset_scroll();
+                    let a = app.active_conversation;
+                    ptys[a].write(&bytes);
+                    ptys[a].reset_scroll();
                 }
                 Action::ForwardShell(bytes) => {
                     if let Some(sh) = &mut shell {
@@ -444,7 +465,19 @@ fn event_loop(
                         sh.reset_scroll();
                     }
                 }
-                Action::ScrollChat(delta) => pty.scroll_chat(delta),
+                Action::NewConversation => {
+                    if let Ok(p) =
+                        spawn_pty(terminal, &app, command, &root, tx.clone(), pty_pending.clone(), predict.as_ref())
+                    {
+                        ptys.push(p);
+                    }
+                }
+                Action::CloseConversation(i) => {
+                    if i < ptys.len() {
+                        ptys.remove(i);
+                    }
+                }
+                Action::ScrollChat(delta) => ptys[app.active_conversation].scroll_chat(delta),
                 Action::Apps(msg) => {
                     if let Some(a) = &apps {
                         a.send(msg);
@@ -480,8 +513,9 @@ fn event_loop(
                     bytes.extend_from_slice(text.as_bytes());
                     bytes.extend_from_slice(b"\x1b[201~");
                     if focus == Focus::Chat {
-                        pty.write(&bytes);
-                        pty.reset_scroll();
+                        let a = app.active_conversation;
+                        ptys[a].write(&bytes);
+                        ptys[a].reset_scroll();
                     } else if focus == Focus::Terminal {
                         if let Some(sh) = &mut shell {
                             sh.write(&bytes);
@@ -513,13 +547,25 @@ fn event_loop(
             Event::ShellOutput => shell_pending.store(false, Ordering::Release),
         }
 
-        // The child owns the session lifetime: when it exits, so do we. The
-        // Agent-changes shell is independent: its exit leaves the box empty.
-        if !pty.is_alive() {
+        // A conversation's child owning the session: when the ACTIVE child
+        // exits, close that conversation (like the user would); quitting only
+        // when no conversations remain (S22). The Agent-changes shell is
+        // independent: its exit leaves the box empty.
+        let active = app.active_conversation;
+        if ptys.get(active).map(|p| !p.is_alive()).unwrap_or(true) {
+            if active < ptys.len() {
+                ptys.remove(active);
+            }
+            if let Action::Quit = app.close_conversation(active) {
+                break;
+            }
+        }
+        if ptys.is_empty() {
             break;
         }
         if needs_redraw {
-            redraw(terminal, &mut app, &mut pty, shell.as_mut())?;
+            let active = app.active_conversation;
+            redraw(terminal, &mut app, &mut ptys[active], shell.as_mut())?;
         }
     }
     // Kill the apps and explainer engines on quit so no child is left behind.
