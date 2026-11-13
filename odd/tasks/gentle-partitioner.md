@@ -55,7 +55,8 @@ Architecture (research, L2-L3): reuse the proven agent-multiplexer stack (ratatu
 - T19 [x] S16, S17, S18 — UI fixes from L48: apps panel default 45% when expanded; the minimize bug (minimize expands the apps area instead); a mascot badge (✿, Gentle Shell's flower) on a code selection that opens the explain popup; "Arquitectura" as an entry in the apps list that opens the Arch overlay. Route: worker. Commit: `2553fdb2b`
 
 - T20 [x] S19 — research-only: local Slack alternatives (headless browser with the user session, desktop client token reuse, unofficial web API), ToS/account-suspension risk, prior art; deliver a report, build nothing. Route: research.
-- T21 [ ] S20 — git graphical overlay: new dedicated full overlay rendering the commit/branch DAG (branches, PRs, worktrees) in Rust. Route: research (overlay pattern) then worker.
+- T21a [ ] S20 — git graph overlay core: new Overlay::GitGraph rendering the commit/branch DAG + local worktrees from in-process git (git log --all --parents, refs, worktree list), colored lanes, branch-head labels, open/close key + draw + reducer + tests. Route: worker.
+- T21b [ ] S20 — git graph PR markers: annotate graph branches that have an open PR, reusing the gentle-apps GitHub data. Route: worker.
 - T22 [x] S21 — explainer popup: animated cursor while typing (replace the static one). Route: worker.
 - T23 [ ] S22 — conversations panel (DECIDED L52 Option A): each conversation = its own gentle-shell child + PTY (Vec<Conversation>+active), lazy spawn, cap 3-5, sleep/resume via --session, list in the apps-list area; loop closes a tab instead of quitting. Route: worker.
 - T24 [x] S23 — fix Alt+Enter to send in the architecture research module (root cause: setup_terminal does not push keyboard-enhancement flags; enable them with graceful fallback). Route: worker. Risk: item 3 (shared key-input surface).
