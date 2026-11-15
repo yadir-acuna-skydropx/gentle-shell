@@ -800,6 +800,53 @@ fn open_action_calls_the_opener_with_the_exact_url() {
 }
 
 #[test]
+fn view_action_fetches_issue_detail_and_comments_off_the_ui_thread() {
+    // S27: the `view` action returns the reader content built from the issue
+    // JSON + its comments.
+    let server = FakeServer::start(|rec| {
+        if rec.path == "/repos/octo/repo/issues/7" {
+            FakeResp::json(
+                r#"{"title":"Crash on save","state":"open","user":{"login":"ann"},"html_url":"https://github.com/octo/repo/issues/7","body":"It crashes.","labels":[{"name":"bug"}]}"#,
+            )
+        } else if rec.path == "/repos/octo/repo/issues/7/comments" {
+            FakeResp::json(r#"[{"user":{"login":"bob"},"body":"Reproduced."}]"#)
+        } else {
+            FakeResp::json("{}")
+        }
+    });
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, tempdir("view"));
+    let (title, body) = c.view("issue:octo/repo#7").unwrap();
+    assert_eq!(title, "octo/repo#7 \u{b7} Crash on save");
+    assert!(body.contains("octo/repo#7 \u{b7} issue \u{b7} open \u{b7} @ann \u{b7} bug"), "{body}");
+    assert!(body.contains("https://github.com/octo/repo/issues/7"));
+    assert!(body.contains("It crashes."));
+    assert!(body.contains("@bob:\nReproduced."));
+}
+
+#[test]
+fn view_action_uses_the_pulls_endpoint_for_a_pr() {
+    let server = FakeServer::start(|rec| {
+        if rec.path == "/repos/octo/repo/pulls/9" {
+            FakeResp::json(
+                r#"{"title":"A PR","state":"open","user":{"login":"dan"},"html_url":"https://github.com/octo/repo/pull/9","body":"work"}"#,
+            )
+        } else if rec.path == "/repos/octo/repo/issues/9/comments" {
+            FakeResp::json("[]")
+        } else {
+            FakeResp::json("{}")
+        }
+    });
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, tempdir("view-pr"));
+    let (title, body) = c.view("pr:octo/repo#9").unwrap();
+    assert_eq!(title, "octo/repo#9 \u{b7} A PR");
+    assert!(body.contains("octo/repo#9 \u{b7} PR \u{b7} open \u{b7} @dan"), "{body}");
+    // The pulls endpoint was hit (not issues/9).
+    assert!(server.requests().iter().any(|r| r.path == "/repos/octo/repo/pulls/9"));
+}
+
+#[test]
 fn an_unknown_action_is_an_error() {
     let server = FakeServer::start(poll_handler);
     let (token, _) = FixedToken::single("tok");

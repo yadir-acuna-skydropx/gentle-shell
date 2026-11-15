@@ -217,6 +217,9 @@ impl AppsPanel {
                     });
                 }
             }
+            // The in-terminal reader detail (S27) is handled in `app.rs` before
+            // it reaches the panel, so the panel ignores it here.
+            EngineMsg::Detail { .. } => {}
         }
     }
 

@@ -330,8 +330,28 @@ sections, each titled with its count and expandable:
 5. **Worktrees (local)** — `git worktree list --porcelain` in the engine's cwd: one child per worktree with its path, branch (or *detached*) and *dirty*/*clean* state. Outside a git repo it shows *no local repository*.
 6. **Workflows** — the latest GitHub Actions runs of the **local** repo (the `origin` of the engine's cwd), `GET /repos/{o}/{r}/actions/runs?per_page=20` (one request per poll). Each run shows `<workflow name> · <branch> · <glyph> · <relative time>` with `✓` success, `✗` failure, `●` in-progress/queued, `⊘` cancelled, `–` other; expand a run → its jobs with their conclusion. Outside a local GitHub repo it shows *no local GitHub repository*.
 
+### In-terminal issue/PR reader (S27)
+
+Instead of opening the browser, a GitHub **issue or PR opens inside the
+partitioner**. In the apps panel, **`Enter`** (or a mouse click) on an issue/PR
+leaf sends a read-only **`view`** request — fetched off the UI thread by
+`gentle-apps` (the same `gh`-token HTTP client; the token is never logged) — and
+opens a full **Reader overlay** with the title, `owner/name#N · issue|PR · state
+· @author · labels`, the URL, the body and each comment (author + body),
+**word-wrapped to the width** and scrollable. Body + comments are bounded
+(~200 KB total, at most 50 comments). **`a`** still opens the action menu, where
+**View in terminal** is offered first and **Open in browser** second.
+
+Reader keys: `↑↓`/`j`/`k`/`PageUp`/`PageDown` and the **mouse wheel** scroll;
+**`y`** copies the whole issue text (title + URL + body, capped ~100 KB) to the
+system clipboard via the **OSC 52** escape sequence (works over SSH in terminals
+that support it) and shows *copied*; **`o`** opens it in the browser as a
+fallback; **`Esc`** closes. The overlay shows *loading…* until the detail
+arrives and an inline error if the fetch fails.
+
 ### Actions (with confirmation in the panel)
 
+- **view** — on an issue or PR: returns the reader content as an `EngineMsg::Detail` (plain markdown text) instead of running a side effect; opened first by `Enter`. No confirmation.
 - **open** — on a PR, issue, repo, branch or file: opens the github.com URL with `xdg-open` (no shell). No confirmation.
 - **worktree_add** — on a branch, only when the local repo's `origin` matches that GitHub repo (https/ssh URLs are normalized). Runs `git fetch origin <branch>`, then `git worktree add <repo-parent>/<repo-name>-<sanitized-branch> <branch>` (or `-b <branch> origin/<branch>` when there is no local branch). Refuses if the target dir exists; returns the created path. **Confirmation required.**
 - **checkout** — on a branch, only for the local matching repo and only if `git status --porcelain` is empty, else it refuses with *working tree has changes — commit or stash first*. Never uses `--force` and never stashes or discards. **Confirmation required.**
@@ -534,7 +554,9 @@ sub-box instead of the pane (S26, see “Agent changes” below).
 - **Zoom & minimize (S14):** every pane's top border carries two small buttons at its right end — `[_]` minimize and `[□]` zoom (`[_]`/`[^]` with `GENTLE_PARTITIONER_ICONS=ascii`). A click runs that pane's action even when it is not focused. A **zoomed** pane fills the whole body and hides the others; `z` again, or `Esc` outside an editing context, restores it. A **minimized** pane collapses to a one-row title bar (the sidebar to a 3-column icon strip) while the rest grow; several panes may be minimized but never all four. Click a minimized title bar or strip to restore it. The status line shows the zoomed pane and the minimized ones. While the chat is minimized its PTY keeps its last size, so gentle-shell does not reflow.
 - **Apps panel:** `↑↓` select an app or item · `Enter` drills in (app → items →
   reply box) · type to edit the reply, `Enter` sends it, `a` opens the action
-  menu (e.g. *open*), `Esc` steps back one level and then to the chat. **Click
+  menu (e.g. *open*), `Esc` steps back one level and then to the chat. On a
+  **GitHub issue/PR**, `Enter` opens the **in-terminal reader** overlay (wrapped,
+  scrollable; `y` copies via OSC 52, `o` opens in the browser, `Esc` closes). **Click
   an app row to expand the panel and open that app.** The header row has its own
   controls: `[_]` collapses the panel to the app list, `[□]` expands it, and
   clicking the **Apps** title toggles the two — these are independent of the

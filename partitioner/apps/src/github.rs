@@ -283,6 +283,120 @@ fn open_action() -> ItemAction {
     ItemAction { id: "open".into(), label: "Open in browser".into(), confirm: false }
 }
 
+/// The in-terminal reader action offered first on issue/PR items (S27). The
+/// engine turns a `view` action into a `Detail` message rather than running a
+/// side effect, so it never needs confirmation.
+fn view_action() -> ItemAction {
+    ItemAction { id: "view".into(), label: "View in terminal".into(), confirm: false }
+}
+
+/// Cap on the rendered reader body (~200 KB); longer content is truncated with
+/// a marker so the overlay stays bounded and a huge issue never floods the
+/// protocol (S27).
+pub const MAX_DETAIL_BYTES: usize = 200 * 1024;
+/// At most this many comments are rendered; the rest are summarised (S27).
+pub const MAX_DETAIL_COMMENTS: usize = 50;
+
+/// `issue:owner/name#number` or `pr:owner/name#number` → `(is_pr, owner, name,
+/// number)`. Returns `None` for any other id.
+fn parse_issue_or_pr_id(id: &str) -> Option<(bool, String, String, u64)> {
+    let (is_pr, rest) = if let Some(r) = id.strip_prefix("issue:") {
+        (false, r)
+    } else if let Some(r) = id.strip_prefix("pr:") {
+        (true, r)
+    } else {
+        return None;
+    };
+    let (repo, num) = rest.split_once('#')?;
+    let (owner, name) = repo.split_once('/')?;
+    if owner.is_empty() || name.is_empty() {
+        return None;
+    }
+    let number: u64 = num.parse().ok()?;
+    Some((is_pr, owner.to_string(), name.to_string(), number))
+}
+
+/// Truncates `s` to at most `max` bytes on a char boundary (no panic on
+/// multi-byte text).
+fn truncate_on_char_boundary(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
+/// Builds the in-terminal reader content for an issue or PR from its API JSON
+/// and its comments (S27). Pure: no network, so it is unit-tested with fixtures.
+/// Returns `(window_title, body)` where `body` is plain markdown text (header
+/// line, title, URL, description, then each comment's author + body), bounded
+/// to [`MAX_DETAIL_BYTES`] and [`MAX_DETAIL_COMMENTS`].
+pub fn build_detail(
+    repo: &str,
+    number: u64,
+    is_pr: bool,
+    obj: &serde_json::Value,
+    comments: &[serde_json::Value],
+) -> (String, String) {
+    let kind = if is_pr { "PR" } else { "issue" };
+    let title = obj.get("title").and_then(|v| v.as_str()).unwrap_or("(no title)");
+    let state = obj.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    let author = obj.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("");
+    let url = obj.get("html_url").and_then(|v| v.as_str()).unwrap_or("");
+    let body = obj.get("body").and_then(|v| v.as_str()).unwrap_or("");
+    let labels: Vec<String> = obj
+        .get("labels")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|l| {
+                    l.get("name").and_then(|n| n.as_str()).map(String::from).or_else(|| l.as_str().map(String::from))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let window_title = format!("{repo}#{number} \u{b7} {title}");
+
+    let mut out = String::new();
+    let mut header = format!("{repo}#{number} \u{b7} {kind} \u{b7} {state} \u{b7} @{author}");
+    if !labels.is_empty() {
+        header.push_str(&format!(" \u{b7} {}", labels.join(", ")));
+    }
+    out.push_str(&header);
+    out.push_str("\n\n");
+    out.push_str(title);
+    out.push_str("\n\n");
+    out.push_str(url);
+    out.push_str("\n\n");
+    if body.trim().is_empty() {
+        out.push_str("(no description)");
+    } else {
+        out.push_str(body);
+    }
+
+    out.push_str(&format!("\n\n\u{2500}\u{2500} Comments ({}) \u{2500}\u{2500}", comments.len()));
+    let shown = comments.len().min(MAX_DETAIL_COMMENTS);
+    for c in comments.iter().take(MAX_DETAIL_COMMENTS) {
+        let ca = c.pointer("/user/login").and_then(|v| v.as_str()).unwrap_or("");
+        let cb = c.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        out.push_str(&format!("\n\n@{ca}:\n{cb}"));
+    }
+    if comments.len() > shown {
+        out.push_str(&format!("\n\n\u{2026} {} more comments", comments.len() - shown));
+    }
+
+    if out.len() > MAX_DETAIL_BYTES {
+        truncate_on_char_boundary(&mut out, MAX_DETAIL_BYTES);
+        out.push_str("\n\n\u{2026} (truncated)");
+    }
+
+    (window_title, out)
+}
+
 fn branch_actions() -> Vec<ItemAction> {
     vec![
         open_action(),
@@ -835,7 +949,7 @@ impl GithubConnector {
             link: html_url,
             kind: Some("pr".into()),
             expandable: false,
-            actions: vec![open_action()],
+            actions: vec![view_action(), open_action()],
         };
         Some(self.record(item))
     }
@@ -859,7 +973,7 @@ impl GithubConnector {
             link: url,
             kind: Some("pr".into()),
             expandable: false,
-            actions: vec![open_action()],
+            actions: vec![view_action(), open_action()],
         };
         Some(self.record(item))
     }
@@ -878,9 +992,31 @@ impl GithubConnector {
             link: html_url,
             kind: Some("issue".into()),
             expandable: false,
-            actions: vec![open_action()],
+            actions: vec![view_action(), open_action()],
         };
         Some(self.record(item))
+    }
+
+    /// Fetches an issue/PR and its comments off the UI thread and renders the
+    /// in-terminal reader content (S27). Comments use the issues endpoint,
+    /// which serves both issues and PRs. The token is never logged.
+    fn view_item(&mut self, item_id: &str) -> std::result::Result<(String, String), String> {
+        let (is_pr, owner, name, number) =
+            parse_issue_or_pr_id(item_id).ok_or_else(|| format!("not a viewable item: {item_id}"))?;
+        let repo = format!("{owner}/{name}");
+        let path = if is_pr {
+            format!("/repos/{owner}/{name}/pulls/{number}")
+        } else {
+            format!("/repos/{owner}/{name}/issues/{number}")
+        };
+        let obj = self.api_get(&path)?.body;
+        let comments = self
+            .api_get(&format!("/repos/{owner}/{name}/issues/{number}/comments?per_page=100"))?
+            .body
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        Ok(build_detail(&repo, number, is_pr, &obj, &comments))
     }
 
     /// Runs an action. Returns a success detail (e.g. the created worktree path).
@@ -1199,6 +1335,10 @@ impl Connector for GithubConnector {
     fn action(&mut self, item_id: &str, action_id: &str) -> Result<String> {
         self.run_action(item_id, action_id)
     }
+
+    fn view(&mut self, item_id: &str) -> Result<(String, String)> {
+        self.view_item(item_id)
+    }
 }
 
 #[cfg(test)]
@@ -1292,5 +1432,86 @@ mod tests {
     fn parse_run_id_extracts_owner_name_run() {
         assert_eq!(parse_run_id("run|octo|repo|42"), Some(("octo".into(), "repo".into(), "42".into())));
         assert_eq!(parse_run_id("branch|octo|repo|s|x"), None);
+    }
+
+    #[test]
+    fn parse_issue_or_pr_id_reads_issues_and_prs() {
+        assert_eq!(parse_issue_or_pr_id("issue:octo/repo#7"), Some((false, "octo".into(), "repo".into(), 7)));
+        assert_eq!(parse_issue_or_pr_id("pr:octo/repo#42"), Some((true, "octo".into(), "repo".into(), 42)));
+        assert_eq!(parse_issue_or_pr_id("branch|octo|repo|s|x"), None);
+        assert_eq!(parse_issue_or_pr_id("issue:octo/repo"), None);
+        assert_eq!(parse_issue_or_pr_id("issue:/repo#1"), None);
+        assert_eq!(parse_issue_or_pr_id("issue:octo/repo#x"), None);
+    }
+
+    #[test]
+    fn build_detail_renders_header_title_url_body_and_comments() {
+        // S27: pure render from fixture JSON (no network).
+        let obj = serde_json::json!({
+            "title": "Crash on save",
+            "state": "open",
+            "user": {"login": "ann"},
+            "html_url": "https://github.com/octo/repo/issues/7",
+            "body": "It crashes.",
+            "labels": [{"name": "bug"}, {"name": "p1"}]
+        });
+        let comments = vec![
+            serde_json::json!({"user": {"login": "bob"}, "body": "Reproduced."}),
+            serde_json::json!({"user": {"login": "cat"}, "body": "Fixing."}),
+        ];
+        let (title, body) = build_detail("octo/repo", 7, false, &obj, &comments);
+        assert_eq!(title, "octo/repo#7 \u{b7} Crash on save");
+        assert!(body.starts_with("octo/repo#7 \u{b7} issue \u{b7} open \u{b7} @ann \u{b7} bug, p1"), "{body}");
+        assert!(body.contains("Crash on save"));
+        assert!(body.contains("https://github.com/octo/repo/issues/7"));
+        assert!(body.contains("It crashes."));
+        assert!(body.contains("Comments (2)"));
+        assert!(body.contains("@bob:\nReproduced."));
+        assert!(body.contains("@cat:\nFixing."));
+    }
+
+    #[test]
+    fn build_detail_handles_a_missing_body_and_no_labels_for_a_pr() {
+        let obj = serde_json::json!({
+            "title": "A PR",
+            "state": "closed",
+            "user": {"login": "dan"},
+            "html_url": "https://github.com/octo/repo/pull/9",
+            "body": null
+        });
+        let (title, body) = build_detail("octo/repo", 9, true, &obj, &[]);
+        assert_eq!(title, "octo/repo#9 \u{b7} A PR");
+        assert!(body.starts_with("octo/repo#9 \u{b7} PR \u{b7} closed \u{b7} @dan"), "{body}");
+        // No labels segment when there are none.
+        assert!(!body.lines().next().unwrap().contains(" \u{b7} bug"));
+        assert!(body.contains("(no description)"));
+        assert!(body.contains("Comments (0)"));
+    }
+
+    #[test]
+    fn build_detail_bounds_oversized_bodies_and_comment_counts() {
+        // A body well over the cap is truncated with a marker.
+        let big = "x".repeat(MAX_DETAIL_BYTES + 10_000);
+        let obj = serde_json::json!({
+            "title": "big",
+            "state": "open",
+            "user": {"login": "ann"},
+            "html_url": "u",
+            "body": big
+        });
+        let (_t, body) = build_detail("o/r", 1, false, &obj, &[]);
+        assert!(body.len() <= MAX_DETAIL_BYTES + 32, "len {}", body.len());
+        assert!(body.ends_with("\u{2026} (truncated)"));
+
+        // More than 50 comments: only 50 are rendered and the rest summarised.
+        let comments: Vec<serde_json::Value> = (0..60)
+            .map(|i| serde_json::json!({"user": {"login": format!("u{i}")}, "body": "c"}))
+            .collect();
+        let small = serde_json::json!({"title": "t", "state": "open", "user": {"login": "a"}, "html_url": "u", "body": "b"});
+        let (_t2, body2) = build_detail("o/r", 2, false, &small, &comments);
+        assert!(body2.contains("Comments (60)"));
+        assert!(body2.contains("@u49:"), "the 50th comment is shown");
+        assert!(!body2.contains("@u50:"), "the 51st comment is not shown");
+        assert!(body2.contains("\u{2026} 10 more comments"));
     }
 }

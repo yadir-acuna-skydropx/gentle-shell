@@ -225,14 +225,25 @@ fn connector_loop(mut c: Box<dyn Connector>, cmd_rx: Receiver<Cmd>, tx: Sender<E
                 report_status(&mut c, &id, &tx, &mut last_status);
             }
             Ok(Cmd::Action { id: rid, item, action }) => {
-                let msg = match c.action(&item, &action) {
-                    Ok(detail) => EngineMsg::ActionResult {
-                        id: rid,
-                        ok: true,
-                        message: Some(detail),
-                        error: None,
-                    },
-                    Err(e) => EngineMsg::ActionResult { id: rid, ok: false, message: None, error: Some(e) },
+                // The `view` action returns reader content as a Detail message
+                // (S27) rather than a plain action result.
+                let msg = if action == "view" {
+                    match c.view(&item) {
+                        Ok((title, body)) => {
+                            EngineMsg::Detail { id: rid, app: id.clone(), item, title, body }
+                        }
+                        Err(e) => EngineMsg::Result { id: rid, ok: false, error: Some(e) },
+                    }
+                } else {
+                    match c.action(&item, &action) {
+                        Ok(detail) => EngineMsg::ActionResult {
+                            id: rid,
+                            ok: true,
+                            message: Some(detail),
+                            error: None,
+                        },
+                        Err(e) => EngineMsg::ActionResult { id: rid, ok: false, message: None, error: Some(e) },
+                    }
                 };
                 let _ = tx.send(Ev::Emit(msg));
                 report_status(&mut c, &id, &tx, &mut last_status);
@@ -335,6 +346,12 @@ mod tests {
             }
             Ok(format!("did {action_id} on {item_id}"))
         }
+        fn view(&mut self, item_id: &str) -> crate::connector::Result<(String, String)> {
+            if item_id == "missing" {
+                return Err("no detail".into());
+            }
+            Ok((format!("title {item_id}"), format!("body {item_id}")))
+        }
     }
 
     fn item(id: &str) -> Item {
@@ -435,6 +452,31 @@ mod tests {
         let input = "{\"type\":\"action\",\"id\":24,\"app\":\"mock\",\"item\":\"i\",\"action\":\"boom\"}\n";
         let msgs = run_collect(vec![Box::new(mock)], input);
         assert!(msgs.iter().any(|m| matches!(m, EngineMsg::ActionResult { id: 24, ok: false, error: Some(e), .. } if e == "action failed")));
+    }
+
+    #[test]
+    fn a_view_action_returns_a_detail_message_with_title_and_body() {
+        // S27: the `view` action yields a Detail (not an ActionResult).
+        let mock = Mock { id: "mock".into(), items: vec![], replies: Arc::default(), fail_reply: false };
+        let input = concat!(
+            "{\"type\":\"action\",\"id\":30,\"app\":\"mock\",\"item\":\"issue:o/r#1\",\"action\":\"view\"}\n",
+            "{\"type\":\"shutdown\"}\n"
+        );
+        let msgs = run_collect(vec![Box::new(mock)], input);
+        assert!(msgs.iter().any(|m| matches!(
+            m,
+            EngineMsg::Detail { id: 30, app, item, title, body }
+                if app == "mock" && item == "issue:o/r#1"
+                    && title == "title issue:o/r#1" && body == "body issue:o/r#1"
+        )));
+    }
+
+    #[test]
+    fn a_failing_view_action_is_reported_as_an_error_result() {
+        let mock = Mock { id: "mock".into(), items: vec![], replies: Arc::default(), fail_reply: false };
+        let input = "{\"type\":\"action\",\"id\":31,\"app\":\"mock\",\"item\":\"missing\",\"action\":\"view\"}\n";
+        let msgs = run_collect(vec![Box::new(mock)], input);
+        assert!(msgs.iter().any(|m| matches!(m, EngineMsg::Result { id: 31, ok: false, error: Some(e) } if e == "no detail")));
     }
 
     #[test]

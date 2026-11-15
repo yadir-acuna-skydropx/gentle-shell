@@ -42,4 +42,11 @@ pub trait Connector: Send {
     fn action(&mut self, _item_id: &str, _action_id: &str) -> Result<String> {
         Err("not supported".to_string())
     }
+    /// Returns a read-only detail view of an item as `(title, body)` plain
+    /// markdown text for the in-terminal reader (S27). Called off the UI thread
+    /// when the `view` action runs. The default refuses, so a connector that
+    /// offers no `view` action needs no change.
+    fn view(&mut self, _item_id: &str) -> Result<(String, String)> {
+        Err("not supported".to_string())
+    }
 }

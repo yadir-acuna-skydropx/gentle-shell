@@ -93,6 +93,17 @@ pub enum EngineMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// Correlated full detail of a `view` action on an item (S27): the
+    /// in-terminal reader content. `title` is the window title and `body` is
+    /// the full content as plain markdown text. Emitted instead of an
+    /// `ActionResult` when the action id is `"view"`.
+    Detail {
+        id: u64,
+        app: String,
+        item: String,
+        title: String,
+        body: String,
+    },
 }
 
 /// Partitioner → engine messages.
@@ -239,6 +250,24 @@ mod tests {
             error: None,
         });
         round_trip_engine(EngineMsg::ActionResult { id: 11, ok: false, message: None, error: Some("boom".into()) });
+    }
+
+    #[test]
+    fn detail_round_trips_and_carries_the_reader_text() {
+        // S27: the `view` action returns a Detail with the full reader body.
+        let msg = EngineMsg::Detail {
+            id: 12,
+            app: "github".into(),
+            item: "issue:octo/repo#7".into(),
+            title: "octo/repo#7 · A bug".into(),
+            body: "octo/repo#7 · issue · open · @ann\n\nA bug\n\nhttps://x\n\nbody".into(),
+        };
+        let line = msg.to_line();
+        assert!(!line.contains('\n'), "a message is a single line");
+        let back: EngineMsg = serde_json::from_str(&line).unwrap();
+        assert_eq!(back, msg);
+        // The wire tag is `detail`.
+        assert!(line.contains("\"type\":\"detail\""), "{line}");
     }
 
     #[test]

@@ -70,6 +70,9 @@ pub enum Overlay {
     /// The conversations manager (S22): list, switch, create and close
     /// simultaneous gentle-shell conversations.
     Conversations,
+    /// The in-terminal GitHub issue/PR reader (S27): wrapped, scrollable
+    /// detail with a copy (`y`) and open-in-browser (`o`) action.
+    Reader,
 }
 
 /// The three stages of the architecture overlay (S18).
@@ -108,6 +111,29 @@ pub struct ArchUi {
     pub offline: bool,
     /// The written report path, set on `done` (enables `o` to open it).
     pub report_path: Option<String>,
+}
+
+/// State of the in-terminal GitHub issue/PR reader (S27). Filled by an
+/// `EngineMsg::Detail` correlated by [`ReaderUi::id`]; the content is plain
+/// markdown text word-wrapped and scrolled by the overlay renderer.
+#[derive(Debug, Clone, Default)]
+pub struct ReaderUi {
+    /// Request id of the in-flight `view` action.
+    pub id: u64,
+    /// The app that owns the item (for the `o` open fallback).
+    pub app: String,
+    /// The item id being read (for the `o` open fallback).
+    pub item: String,
+    /// Window title: "owner/name#N · <title>".
+    pub title: String,
+    /// Full reader content as plain markdown text.
+    pub body: String,
+    /// True until the detail arrives.
+    pub loading: bool,
+    /// An inline error when the fetch failed.
+    pub error: Option<String>,
+    /// Lines scrolled up from the top of the wrapped body.
+    pub scroll: usize,
 }
 
 /// State of the explainer popup (S17). Lives beside [`Overlay::Explain`]; the
@@ -164,6 +190,9 @@ pub enum Action {
     Arch(ArchReq),
     /// Open a finished report file with the system opener (xdg-open).
     OpenReport(String),
+    /// Copy text to the system clipboard via the OSC 52 escape sequence (S27);
+    /// main.rs base64-encodes it and writes it to the real terminal.
+    Copy(String),
     Quit,
 }
 
@@ -255,6 +284,9 @@ const CONVERSATIONS_ROW_ID: &str = "__conversations__";
 /// Helper requests share the explainer engine but are keyed in a separate id
 /// range so their streamed messages never route to the explain popup (S24).
 const HELPER_ID_BASE: u64 = 1_000_000_000;
+
+/// Cap on the OSC 52 clipboard payload copied from the reader (~100 KB, S27).
+const MAX_COPY_BYTES: usize = 100 * 1024;
 
 /// One open conversation = its own gentle-shell child (Option A, S22). The
 /// partitioner keeps a parallel `PtyPane` per entry in main.rs; this struct is
@@ -389,6 +421,8 @@ pub struct App {
     /// Command-helper state for the Agent-changes helper box (S24, T25b).
     /// Reuses the explainer UI shape; ids are offset by [`HELPER_ID_BASE`].
     pub helper: ExplainUi,
+    /// In-terminal GitHub issue/PR reader state (S27).
+    pub reader: ReaderUi,
     /// Open conversations (S22); always at least one. Index 0 is the first
     /// gentle-shell spawned at startup.
     pub conversations: Vec<Conversation>,
@@ -462,6 +496,7 @@ impl App {
             explain: ExplainUi::default(),
             arch: ArchUi::default(),
             helper: ExplainUi::default(),
+            reader: ReaderUi::default(),
             conversations: vec![Conversation { title: "1".into() }],
             active_conversation: 0,
             conv_sel: 0,
@@ -940,7 +975,43 @@ impl App {
 
     /// Applies a decoded engine message to the panel (called by the event loop).
     pub fn apply_apps_msg(&mut self, msg: EngineMsg) {
+        // A `view` action's detail fills the in-terminal reader (S27) rather
+        // than the panel; a failed view arrives as a Result with the reader id.
+        match &msg {
+            EngineMsg::Detail { id, title, body, .. } if self.reader.id == *id => {
+                self.reader.title = title.clone();
+                self.reader.body = body.clone();
+                self.reader.loading = false;
+                self.reader.error = None;
+                return;
+            }
+            EngineMsg::Detail { .. } => return, // stale / unknown reader id
+            EngineMsg::Result { id, ok: false, error } if self.reader.id == *id => {
+                self.reader.loading = false;
+                self.reader.error = Some(error.clone().unwrap_or_else(|| "view failed".to_string()));
+                return;
+            }
+            _ => {}
+        }
         self.apps.apply(msg);
+    }
+
+    /// Opens the in-terminal reader for an issue/PR and sends the `view`
+    /// request (S27). The overlay shows "loading…" until the detail arrives.
+    fn open_reader(&mut self, app: String, item: String) -> Action {
+        let rid = self.next_apps_id();
+        self.reader = ReaderUi {
+            id: rid,
+            app: app.clone(),
+            item: item.clone(),
+            title: "Loading…".to_string(),
+            body: String::new(),
+            loading: true,
+            error: None,
+            scroll: 0,
+        };
+        self.overlay = Some(Overlay::Reader);
+        Action::Apps(ClientMsg::Action { id: rid, app, item, action: "view".to_string() })
     }
 
     /// Marks the apps engine offline (missing or exited).
@@ -1317,6 +1388,10 @@ impl App {
                         let rid = self.next_apps_id();
                         self.apps.push_nav(&it, rid);
                         return Action::Apps(ClientMsg::Expand { id: rid, app, item: it.id });
+                    } else if matches!(it.kind.as_deref(), Some("issue") | Some("pr")) {
+                        // A GitHub issue/PR leaf: Enter opens the in-terminal
+                        // reader directly (S27); `a` still opens the action menu.
+                        return self.open_reader(app, it.id);
                     } else if it.kind.is_none() && self.apps.nav.is_empty() {
                         // A flat item (Slack): Enter opens the reply editor as
                         // before; its actions (e.g. open) are reached with `a`.
@@ -1363,6 +1438,10 @@ impl App {
                 let app = self.apps.selected_app_id().unwrap_or_default();
                 if let Some(m) = self.apps.menu.take() {
                     if let Some(action) = m.actions.get(m.sel).cloned() {
+                        if action.id == "view" {
+                            // The reader action opens the overlay (S27).
+                            return self.open_reader(app, m.item_id);
+                        }
                         if action.confirm {
                             self.apps.confirm = Some(crate::apps_panel::Confirm {
                                 item_id: m.item_id,
@@ -1604,6 +1683,10 @@ impl App {
         if overlay == Overlay::Arch {
             return self.arch_key(key);
         }
+        // The in-terminal issue/PR reader scrolls, copies (y) and opens (o).
+        if overlay == Overlay::Reader {
+            return self.reader_key(key);
+        }
         match key.code {
             KeyCode::Esc => self.overlay = None,
             KeyCode::Up | KeyCode::Char('k') => self.overlay_move(overlay, -1),
@@ -1612,11 +1695,67 @@ impl App {
                 Overlay::Files => self.toggle_or_open_selected(),
                 Overlay::Changes => self.open_selected_change(),
                 Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch | Overlay::GitGraph
-                | Overlay::Conversations => {}
+                | Overlay::Conversations | Overlay::Reader => {}
             },
             _ => {}
         }
         Action::None
+    }
+
+    /// Reader overlay reducer (S27): arrows/j/k/PageUp/PageDown scroll the
+    /// wrapped body, `y` copies the whole issue text to the clipboard, `o`
+    /// opens it in the browser (the existing open action), Esc closes.
+    fn reader_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Esc => {
+                self.overlay = None;
+                Action::None
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.reader.scroll = self.reader.scroll.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.reader.scroll = self.reader.scroll.saturating_add(1);
+                Action::None
+            }
+            KeyCode::PageUp => {
+                self.reader.scroll = self.reader.scroll.saturating_sub(10);
+                Action::None
+            }
+            KeyCode::PageDown => {
+                self.reader.scroll = self.reader.scroll.saturating_add(10);
+                Action::None
+            }
+            KeyCode::Char('y') => {
+                if self.reader.body.is_empty() {
+                    return Action::None;
+                }
+                let mut text = self.reader.body.clone();
+                if text.len() > MAX_COPY_BYTES {
+                    let mut end = MAX_COPY_BYTES;
+                    while end > 0 && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    text.truncate(end);
+                }
+                self.status_msg = Some("copied".to_string());
+                Action::Copy(text)
+            }
+            KeyCode::Char('o') => {
+                if self.reader.app.is_empty() || self.reader.item.is_empty() {
+                    return Action::None;
+                }
+                let rid = self.next_apps_id();
+                Action::Apps(ClientMsg::Action {
+                    id: rid,
+                    app: self.reader.app.clone(),
+                    item: self.reader.item.clone(),
+                    action: "open".to_string(),
+                })
+            }
+            _ => Action::None,
+        }
     }
 
     fn overlay_move(&mut self, overlay: Overlay, delta: isize) {
@@ -1624,7 +1763,7 @@ impl App {
             Overlay::Files => self.selected = clamp_index(self.selected, delta, self.entries.len()),
             Overlay::Changes => self.change_selected = clamp_index(self.change_selected, delta, self.changes().len()),
             Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch | Overlay::GitGraph
-            | Overlay::Conversations => {}
+            | Overlay::Conversations | Overlay::Reader => {}
         }
     }
 
@@ -2369,7 +2508,7 @@ impl App {
                     }
                 }
             }
-            Overlay::Help | Overlay::Explain | Overlay::Arch | Overlay::GitGraph => {}
+            Overlay::Help | Overlay::Explain | Overlay::Arch | Overlay::GitGraph | Overlay::Reader => {}
         }
         Action::None
     }
@@ -2444,6 +2583,12 @@ impl App {
         // `scroll` counts lines up from the bottom, so wheel-up (dir < 0) adds.
         if self.overlay == Some(Overlay::Explain) {
             self.explain.scroll = (self.explain.scroll as isize - dir * 3).max(0) as usize;
+            return Action::None;
+        }
+        // The reader is modal: the wheel scrolls its wrapped body (S27).
+        // `scroll` counts lines down from the top, so wheel-down (dir > 0) adds.
+        if self.overlay == Some(Overlay::Reader) {
+            self.reader.scroll = (self.reader.scroll as isize + dir * 3).max(0) as usize;
             return Action::None;
         }
         // The Agent-changes helper box sits inside the diff rect: check it first.
@@ -3510,9 +3655,27 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
             let title = " Conversations · Enter switch · n new · x close · Esc ".to_string();
             let lines = conversations_lines(app);
             frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
+        } else if overlay == Overlay::Reader {
+            // In-terminal GitHub issue/PR reader (S27): wrapped, scrollable body.
+            let title = format!(" {} · ↑↓ scroll · y copy · o open · Esc ", app.reader.title);
+            let w = area.width.saturating_sub(2) as usize;
+            let h = area.height.saturating_sub(2).max(1) as usize;
+            // Clamp the scroll to the wrapped length so it cannot run off the end.
+            let total = if app.reader.loading || app.reader.error.is_some() {
+                0
+            } else {
+                wrap_text(&app.reader.body, w).len()
+            };
+            let max_down = total.saturating_sub(h);
+            if app.reader.scroll > max_down {
+                app.reader.scroll = max_down;
+            }
+            let lines = reader_lines(&app.reader, w, h);
+            frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
         } else {
         let (title, lines) = match overlay {
-            Overlay::Explain | Overlay::Arch | Overlay::GitGraph | Overlay::Conversations => {
+            Overlay::Explain | Overlay::Arch | Overlay::GitGraph | Overlay::Conversations
+            | Overlay::Reader => {
                 unreachable!("handled above")
             }
             Overlay::Files => {
@@ -3613,6 +3776,8 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "        minimize it to a title bar; each box has [_]/[□] buttons, click a".into(),
         "        minimized box to restore it (S26).".into(),
         "Apps: ↑↓ select · Enter app→items→reply · a actions (open) · Esc back".into(),
+        "      GitHub issue/PR: Enter opens the in-terminal reader (S27)".into(),
+        "      reader: ↑↓/j k/PgUp/PgDn + wheel scroll · y copy · o open · Esc close".into(),
         "      +/- resize the expanded panel (40-70%) · click an app to open it".into(),
         "      header: [_] collapse · [□] expand · click “Apps” to toggle".into(),
         "      Arquitectura row opens the architecture engine (Arch overlay)".into(),
@@ -3623,6 +3788,24 @@ pub fn help_lines() -> Vec<Line<'static>> {
     .into_iter()
     .map(Line::raw)
     .collect()
+}
+
+/// Renders the in-terminal GitHub reader body (S27): a loading/error line, or
+/// the word-wrapped content scrolled `scroll` lines down from the top.
+fn reader_lines(r: &ReaderUi, w: usize, h: usize) -> Vec<Line<'static>> {
+    if r.loading {
+        return vec![Line::styled("loading…", Style::default().fg(Color::DarkGray))];
+    }
+    if let Some(err) = &r.error {
+        return vec![Line::styled(format!("⚠ {err}"), Style::default().fg(Color::Red))];
+    }
+    let body_rows = h.max(1);
+    let wrapped = wrap_text(&r.body, w);
+    let total = wrapped.len();
+    let max_down = total.saturating_sub(body_rows);
+    let start = r.scroll.min(max_down);
+    let end = (start + body_rows).min(total);
+    wrapped[start..end].iter().map(|l| Line::raw(l.clone())).collect()
 }
 
 /// Wraps `s` to width `w` on word boundaries, preserving blank lines.
@@ -5179,6 +5362,22 @@ mod tests {
             ..Default::default()
         }
     }
+    // A GitHub issue/PR leaf: the `view` action is offered first, then `open`
+    // (mirrors the connector, S27).
+    fn issue_item(id: &str, title: &str) -> AppItem {
+        use gentle_apps::protocol::ItemAction;
+        AppItem {
+            id: id.into(),
+            title: title.into(),
+            kind: Some("issue".into()),
+            expandable: false,
+            actions: vec![
+                ItemAction { id: "view".into(), label: "View in terminal".into(), confirm: false },
+                ItemAction { id: "open".into(), label: "Open in browser".into(), confirm: false },
+            ],
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn github_panel_expands_with_a_breadcrumb_and_esc_steps_up() {
@@ -5332,6 +5531,130 @@ mod tests {
         assert_eq!(app.handle_key(ch('n')), Action::None);
         assert!(app.apps.confirm.is_none());
         assert_eq!(app.apps.action_status.as_deref(), Some("cancelled"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- In-terminal GitHub issue/PR reader (S27) -----------------------
+
+    #[test]
+    fn enter_on_an_issue_opens_the_reader_and_the_detail_fills_it() {
+        let root = fixture("reader-open");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("github", "GitHub", AppStatusKind::Connected)] });
+        app.apply_apps_msg(EngineMsg::Items {
+            app: "github".into(),
+            items: vec![issue_item("issue:o/r#7", "r#7 · bug")],
+        });
+        render(&mut app, 120, 40);
+        app.handle_key(key(KeyCode::Enter)); // enter the app (View::Items)
+
+        // Enter on the issue leaf sends a `view` request and opens the reader.
+        let act = app.handle_key(key(KeyCode::Enter));
+        let id = match act {
+            Action::Apps(ClientMsg::Action { id, app: a, item, action }) => {
+                assert_eq!((a.as_str(), item.as_str(), action.as_str()), ("github", "issue:o/r#7", "view"));
+                id
+            }
+            other => panic!("expected a view action, got {other:?}"),
+        };
+        assert_eq!(app.overlay, Some(Overlay::Reader));
+        assert!(app.reader.loading, "the reader shows loading until the detail arrives");
+        let t = render(&mut app, 120, 40);
+        assert!(screen_text(&t).contains("loading"), "loading hint shown");
+
+        // The correlated Detail fills the reader and renders word-wrapped.
+        app.apply_apps_msg(EngineMsg::Detail {
+            id,
+            app: "github".into(),
+            item: "issue:o/r#7".into(),
+            title: "o/r#7 · bug".into(),
+            body: "o/r#7 · issue · open · @ann\n\nbug\n\nhttps://x\n\nthe description body".into(),
+        });
+        assert!(!app.reader.loading);
+        assert_eq!(app.reader.title, "o/r#7 · bug");
+        assert!(app.reader.body.contains("the description body"));
+        let t = render(&mut app, 120, 40);
+        assert!(screen_text(&t).contains("the description body"), "body rendered");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reader_scrolls_copies_opens_and_closes() {
+        let root = fixture("reader-scroll");
+        let mut app = App::new(root.clone());
+        app.overlay = Some(Overlay::Reader);
+        app.reader.id = 5;
+        app.reader.loading = false;
+        app.reader.app = "github".into();
+        app.reader.item = "issue:o/r#7".into();
+        app.reader.title = "o/r#7 · bug".into();
+        app.reader.body = (0..200).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        render(&mut app, 100, 30);
+        // Scroll down with j/PageDown, then up with k.
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::PageDown));
+        assert_eq!(app.reader.scroll, 11);
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.reader.scroll, 10);
+        // The wheel scrolls too (down adds).
+        let down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 50, row: 15, modifiers: KeyModifiers::NONE };
+        app.handle_mouse(down);
+        assert_eq!(app.reader.scroll, 13);
+        // `y` copies the whole issue text and reports "copied".
+        let act = app.handle_key(ch('y'));
+        match act {
+            Action::Copy(text) => {
+                assert!(text.contains("line 0") && text.contains("line 199"), "copies the whole body");
+            }
+            other => panic!("expected a copy action, got {other:?}"),
+        }
+        assert_eq!(app.status_msg.as_deref(), Some("copied"));
+        // `o` opens in the browser via the existing open action (fallback).
+        let act = app.handle_key(ch('o'));
+        assert!(matches!(act, Action::Apps(ClientMsg::Action { action, item, .. }) if action == "open" && item == "issue:o/r#7"));
+        // Esc closes the reader.
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.overlay, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pressing_a_on_an_issue_opens_the_action_menu_then_view_opens_the_reader() {
+        // PRESERVE: `a` still opens the action menu; selecting "view" from it
+        // opens the reader (S27).
+        let root = fixture("reader-amenu");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("github", "GitHub", AppStatusKind::Connected)] });
+        app.apply_apps_msg(EngineMsg::Items { app: "github".into(), items: vec![issue_item("issue:o/r#7", "r#7")] });
+        render(&mut app, 120, 40);
+        app.handle_key(key(KeyCode::Enter)); // into the app
+        app.handle_key(ch('a'));
+        assert!(app.apps.menu.is_some(), "a opens the action menu");
+        assert_eq!(app.overlay, None, "a does not open the reader");
+        // The first action is "view"; Enter on it opens the reader.
+        let act = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.overlay, Some(Overlay::Reader));
+        assert!(matches!(act, Action::Apps(ClientMsg::Action { action, .. }) if action == "view"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_failed_view_shows_an_inline_error_in_the_reader() {
+        let root = fixture("reader-err");
+        let mut app = App::new(root.clone());
+        app.overlay = Some(Overlay::Reader);
+        app.reader.id = 9;
+        app.reader.loading = true;
+        // A failed `view` arrives as a Result correlated by the reader id.
+        app.apply_apps_msg(EngineMsg::Result { id: 9, ok: false, error: Some("not found".into()) });
+        assert!(!app.reader.loading);
+        assert_eq!(app.reader.error.as_deref(), Some("not found"));
+        let t = render(&mut app, 100, 30);
+        assert!(screen_text(&t).contains("not found"));
         fs::remove_dir_all(root).unwrap();
     }
 

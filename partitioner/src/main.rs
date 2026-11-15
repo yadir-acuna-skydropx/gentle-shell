@@ -444,6 +444,7 @@ fn event_loop(
                         }
                     }
                     Action::OpenReport(path) => open_with_system(&path),
+                    Action::Copy(text) => copy_to_clipboard(&text),
                     Action::Quit => break,
                 }
                 // A save asks for a fresh git status off the UI thread.
@@ -504,6 +505,7 @@ fn event_loop(
                     }
                 }
                 Action::OpenReport(path) => open_with_system(&path),
+                Action::Copy(text) => copy_to_clipboard(&text),
                 Action::Quit => break,
             },
             Event::Input(CtEvent::Paste(text)) => {
@@ -590,6 +592,35 @@ fn open_with_system(path: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+}
+
+/// Standard base64 alphabet (RFC 4648). Tiny local encoder so the reader's
+/// OSC 52 copy needs no new dependency (S27 constraint).
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(n >> 18 & 0x3f) as usize] as char);
+        out.push(ALPHABET[(n >> 12 & 0x3f) as usize] as char);
+        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6 & 0x3f) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { ALPHABET[(n & 0x3f) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Copies `text` to the system clipboard with the OSC 52 escape sequence,
+/// written directly to the real terminal (S27). Works over SSH in terminals
+/// that support OSC 52; a terminal that does not simply ignores it.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    let seq = format!("\x1b]52;c;{}\x07", base64_encode(text.as_bytes()));
+    let mut out = io::stdout();
+    let _ = out.write_all(seq.as_bytes());
+    let _ = out.flush();
 }
 
 /// Emits a `Tick` roughly twice a second to drive the animated explainer
@@ -715,4 +746,21 @@ fn spawn_shell(root: &Path, tx: Sender<Event>, pending: Arc<AtomicBool>) -> Resu
     };
     // A placeholder size; the first redraw resizes it to the real terminal box.
     PtyPane::spawn(cmd, 10, 40, notify).context("spawning the agent-changes shell")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::base64_encode;
+
+    #[test]
+    fn base64_matches_the_rfc4648_test_vectors() {
+        // S27: the OSC 52 copy relies on a correct standard base64 encoding.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
 }
