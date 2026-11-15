@@ -175,6 +175,8 @@ pub enum Action {
     ForwardShell(Vec<u8>),
     /// Scroll the chat scrollback (positive = older output).
     ScrollChat(isize),
+    /// Scroll the Agent-changes shell PTY scrollback (positive = older), S28.
+    ScrollShell(isize),
     /// A request for the apps engine (reply / refresh).
     Apps(ClientMsg),
     /// A request for the explainer engine (explain / ask / cancel).
@@ -1068,9 +1070,15 @@ impl App {
     /// one-shot Suggest (main.rs attaches the shell context), Esc leaves.
     fn helper_key(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc => {
                 self.focus = Focus::Diff;
+                Action::None
+            }
+            // Shift+Enter inserts a newline instead of sending (S28).
+            KeyCode::Enter if shift => {
+                self.helper.question.push('\n');
                 Action::None
             }
             KeyCode::Enter => {
@@ -1498,6 +1506,9 @@ impl App {
                 self.apps.reply.clear();
                 self.apps.reply_status = None;
             }
+            // Shift+Enter inserts a newline into the reply instead of sending (S28);
+            // Slack messages may span lines.
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => self.apps.reply.insert('\n'),
             KeyCode::Enter => {
                 let text = self.apps.reply.text.clone();
                 if text.trim().is_empty() {
@@ -1772,6 +1783,7 @@ impl App {
     /// arrows/PageUp/PageDown scroll the streamed text.
     fn explain_key(&mut self, key: KeyEvent) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         match key.code {
             KeyCode::Esc => {
                 self.overlay = None;
@@ -1780,6 +1792,11 @@ impl App {
                     self.explain.thinking = false;
                     return Action::Explain(ExplainReq::Cancel { id: self.explain.id });
                 }
+                Action::None
+            }
+            // Shift+Enter inserts a newline into the follow-up instead of sending (S28).
+            KeyCode::Enter if shift => {
+                self.explain.question.push('\n');
                 Action::None
             }
             KeyCode::Enter => {
@@ -1902,6 +1919,8 @@ impl App {
                     buf.pop();
                 }
                 KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => buf.push(c),
+                // A title is single-line: Shift+Enter is ignored, never applied (S28).
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {}
                 KeyCode::Enter => {
                     let (target, title) = (*target, buf.clone());
                     self.conv_edit = None;
@@ -2579,23 +2598,50 @@ impl App {
     }
 
     fn mouse_wheel(&mut self, col: u16, row: u16, dir: isize) -> Action {
+        // Wheel scrolling is smooth: one line per event. Terminals emit several
+        // events per notch, so a per-event step of 1 feels fluid without
+        // jumping (S28). Each event returns promptly so the loop redraws it.
         // The explain popup is modal: the wheel scrolls its text (L67).
         // `scroll` counts lines up from the bottom, so wheel-up (dir < 0) adds.
         if self.overlay == Some(Overlay::Explain) {
-            self.explain.scroll = (self.explain.scroll as isize - dir * 3).max(0) as usize;
+            self.explain.scroll = (self.explain.scroll as isize - dir).max(0) as usize;
             return Action::None;
         }
         // The reader is modal: the wheel scrolls its wrapped body (S27).
         // `scroll` counts lines down from the top, so wheel-down (dir > 0) adds.
         if self.overlay == Some(Overlay::Reader) {
-            self.reader.scroll = (self.reader.scroll as isize + dir * 3).max(0) as usize;
+            self.reader.scroll = (self.reader.scroll as isize + dir).max(0) as usize;
+            return Action::None;
+        }
+        // The git graph overlay scrolls its rows with the wheel (S28, S20).
+        if self.overlay == Some(Overlay::GitGraph) {
+            let max = self.gitgraph.rows.len().saturating_sub(1) as isize;
+            self.gitgraph_scroll = (self.gitgraph_scroll as isize + dir).clamp(0, max) as usize;
+            return Action::None;
+        }
+        // The architecture report scrolls with the wheel too (S28).
+        if self.overlay == Some(Overlay::Arch) && self.arch.stage == ArchStage::Report {
+            self.arch.scroll = (self.arch.scroll as isize - dir).max(0) as usize;
+            return Action::None;
+        }
+        // Any other open overlay swallows the wheel so it never scrolls the
+        // panes behind it (L67).
+        if self.overlay.is_some() {
             return Action::None;
         }
         // The Agent-changes helper box sits inside the diff rect: check it first.
         if let Some(h) = self.helper_area {
-            if self.overlay.is_none() && rect_contains(h, col, row) {
-                self.helper.scroll = (self.helper.scroll as isize - dir * 3).max(0) as usize;
+            if rect_contains(h, col, row) {
+                self.helper.scroll = (self.helper.scroll as isize - dir).max(0) as usize;
                 return Action::None;
+            }
+        }
+        // The Agent-changes interactive shell scrolls its own PTY scrollback,
+        // mirroring how the chat PTY scrolls (S28, S24).
+        if let Some(term) = self.term_area {
+            if rect_contains(term, col, row) {
+                // Positive = scroll back to older output, like the chat.
+                return Action::ScrollShell(-dir);
             }
         }
         let Some(l) = self.layout else { return Action::None };
@@ -2620,7 +2666,9 @@ impl App {
         if let Some(ed) = l.editor {
             if rect_contains(ed, col, row) {
                 if let Some(e) = &mut self.editor {
-                    e.scroll_lines(dir * 3);
+                    // One line per event: the editor used to jump 3 lines and
+                    // felt "extremadamente sensible" (S28).
+                    e.scroll_lines(dir);
                 }
                 return Action::None;
             }
@@ -2629,7 +2677,7 @@ impl App {
             if rect_contains(df, col, row) {
                 if let Some(v) = &mut self.viewer {
                     let len = v.diff.len();
-                    v.diff_scroll = (v.diff_scroll as isize + dir * 3).clamp(0, len.saturating_sub(1) as isize) as usize;
+                    v.diff_scroll = (v.diff_scroll as isize + dir).clamp(0, len.saturating_sub(1) as isize) as usize;
                 }
                 return Action::None;
             }
@@ -3772,6 +3820,7 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "        ↑↓ PgUp PgDn scroll the diff · click the terminal/helper to focus".into(),
         "        terminal: run commands (touch, mkdir, background jobs) · Esc back".into(),
         "        helper: type a question + Enter — Haiku recommends commands · Esc back".into(),
+        "        terminal/helper also scroll with the wheel (one line per notch)".into(),
         "        with the diff/terminal/helper focused: z maximize that box · m".into(),
         "        minimize it to a title bar; each box has [_]/[□] buttons, click a".into(),
         "        minimized box to restore it (S26).".into(),
@@ -3783,7 +3832,10 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "      Arquitectura row opens the architecture engine (Arch overlay)".into(),
         "Panes: [_] minimize · [□] zoom on each title bar; click a minimized".into(),
         "       title bar or strip to restore it.".into(),
-        "Mouse: click selects panes and places the cursor; wheel scrolls.".into(),
+        "Chat/inputs: Shift+Enter inserts a newline (never sends); Enter sends.".into(),
+        "        Arch brief also submits with Alt+Enter or Ctrl+Enter.".into(),
+        "Mouse: click selects panes and places the cursor; wheel scrolls one line".into(),
+        "       per event (editor, diff, chat, shell terminal, helper, overlays).".into(),
     ]
     .into_iter()
     .map(Line::raw)
@@ -4004,8 +4056,8 @@ fn conversations_lines(app: &App) -> Vec<Line<'static>> {
 }
 
 /// Colors cycled across graph lanes so parallel branches stay distinguishable.
-const GRAPH_LANE_COLORS: [Color; 6] =
-    [Color::Cyan, Color::Green, Color::Yellow, Color::Magenta, Color::Blue, Color::Red];
+/// Centralized in [`crate::theme`] so no dark `Color::Blue` lane remains (S28).
+const GRAPH_LANE_COLORS: [Color; 6] = crate::theme::GRAPH_LANES;
 
 /// Renders the git graph overlay (S20): a lane-based commit DAG with branch/tag
 /// labels, then a worktrees section. Pure given [`GitGraphData`].
@@ -5458,7 +5510,8 @@ mod tests {
         render(&mut app, 120, 40);
         let up = MouseEvent { kind: MouseEventKind::ScrollUp, column: 60, row: 20, modifiers: KeyModifiers::NONE };
         assert_eq!(app.handle_mouse(up), Action::None, "the wheel must not reach the chat");
-        assert_eq!(app.explain.scroll, 3);
+        // S28: one line per wheel event for smooth scrolling (was 3).
+        assert_eq!(app.explain.scroll, 1);
         let down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 60, row: 20, modifiers: KeyModifiers::NONE };
         app.handle_mouse(down);
         assert_eq!(app.explain.scroll, 0);
@@ -5598,10 +5651,10 @@ mod tests {
         assert_eq!(app.reader.scroll, 11);
         app.handle_key(key(KeyCode::Up));
         assert_eq!(app.reader.scroll, 10);
-        // The wheel scrolls too (down adds).
+        // The wheel scrolls too (down adds); S28 makes it one line per event.
         let down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 50, row: 15, modifiers: KeyModifiers::NONE };
         app.handle_mouse(down);
-        assert_eq!(app.reader.scroll, 13);
+        assert_eq!(app.reader.scroll, 11);
         // `y` copies the whole issue text and reports "copied".
         let act = app.handle_key(ch('y'));
         match act {
@@ -5978,6 +6031,101 @@ mod tests {
         prefix_key(&mut app, 'z'); // zoom diff
         let t = render(&mut app, 120, 40);
         assert!(screen_text(&t).contains("zoom: diff"), "status reports the zoomed pane");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // --- S28: legible colors, smooth scroll, Shift+Enter newline ---------
+
+    fn shift_enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+    }
+
+    #[test]
+    fn shift_enter_in_chat_forwards_the_newline_sequence() {
+        // S28: in the chat (gentle-shell child PTY) Shift+Enter must forward the
+        // CSI-u newline sequence Pi maps to "new line" (\x1b[13;2u), while plain
+        // Enter still submits with \r.
+        let (root, mut app) = workspace("chat-shift-enter");
+        let chat = app.layout.unwrap().chat;
+        app.handle_mouse(click(chat.x + 5, chat.y + 2));
+        assert_eq!(app.effective_focus(), Focus::Chat);
+        assert_eq!(app.handle_key(shift_enter()), Action::Forward(b"\x1b[13;2u".to_vec()));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::Forward(b"\r".to_vec()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shift_enter_in_helper_inserts_a_newline_and_does_not_send() {
+        // S28: the command-helper question accepts a Shift+Enter newline and
+        // never sends; plain Enter sends a Suggest.
+        let (root, mut app) = workspace("helper-shift-enter");
+        app.apply_explain_msg(ExMsg::Status { key: ExKey::Set, model: "m".into() });
+        render(&mut app, 120, 40);
+        let helper = app.helper_area.expect("helper region captured");
+        app.handle_mouse(click(helper.x, helper.y));
+        assert_eq!(app.focus, Focus::Helper);
+        app.handle_key(ch('a'));
+        assert_eq!(app.handle_key(shift_enter()), Action::None, "Shift+Enter does not send");
+        app.handle_key(ch('b'));
+        assert_eq!(app.helper.question, "a\nb", "a newline was inserted");
+        match app.handle_key(key(KeyCode::Enter)) {
+            Action::Helper { question, .. } => assert_eq!(question, "a\nb"),
+            other => panic!("expected a Helper send, got {other:?}"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn shift_enter_in_arch_brief_inserts_a_newline_and_keeps_alt_enter_submit() {
+        // S28: the Arch brief inserts a newline on Shift+Enter without sending,
+        // and Alt+Enter still submits (S23).
+        let (root, mut app) = arch_app("arch-shift-enter");
+        open_arch(&mut app);
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter)); // into the brief editor
+        assert_eq!(app.arch.stage, ArchStage::Brief);
+        app.handle_key(ch('x'));
+        assert_eq!(app.handle_key(shift_enter()), Action::None, "Shift+Enter does not submit");
+        app.handle_key(ch('y'));
+        assert_eq!(app.arch.brief, "x\ny");
+        assert!(matches!(
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)),
+            Action::Arch(ArReq::Design { .. })
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wheel_over_editor_scrolls_one_line() {
+        // S28: the editor wheel moves one line per event (was 3, "extremadamente
+        // sensible").
+        let root = fixture("editor-wheel");
+        let body = (0..30).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
+        fs::write(root.join("src/main.rs"), body).unwrap();
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.editor = Some(Editor::open(&root, Path::new("src/main.rs")));
+        app.focus = Focus::Editor;
+        render(&mut app, 120, 40);
+        let ed = app.layout.unwrap().editor.expect("editor rect");
+        let before = app.editor.as_ref().unwrap().cursor_line;
+        let down = MouseEvent { kind: MouseEventKind::ScrollDown, column: ed.x + 2, row: ed.y + 2, modifiers: KeyModifiers::NONE };
+        app.handle_mouse(down);
+        assert_eq!(app.editor.as_ref().unwrap().cursor_line, before + 1, "one line per event");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wheel_over_term_area_returns_scroll_shell() {
+        // S28: the wheel over the Agent-changes shell routes to the shell PTY
+        // scrollback via Action::ScrollShell (positive = older), mirroring chat.
+        let (root, mut app) = workspace("term-wheel");
+        render(&mut app, 120, 40);
+        let term = app.term_area.expect("terminal region captured");
+        let up = MouseEvent { kind: MouseEventKind::ScrollUp, column: term.x + 1, row: term.y + 1, modifiers: KeyModifiers::NONE };
+        assert_eq!(app.handle_mouse(up), Action::ScrollShell(1));
+        let down = MouseEvent { kind: MouseEventKind::ScrollDown, column: term.x + 1, row: term.y + 1, modifiers: KeyModifiers::NONE };
+        assert_eq!(app.handle_mouse(down), Action::ScrollShell(-1));
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -470,8 +470,8 @@ fn read_string(chars: &[char], start: usize, quote: char) -> (String, usize) {
 
 /// Rainbow colour for a bracket at nesting `depth`, cycling through four hues.
 pub fn bracket_color(depth: u16) -> Color {
-    const CYCLE: [Color; 4] = [Color::Yellow, Color::Magenta, Color::Cyan, Color::Green];
-    CYCLE[(depth as usize) % CYCLE.len()]
+    let cycle = crate::theme::BRACKETS;
+    cycle[(depth as usize) % cycle.len()]
 }
 
 /// Style for a token class, readable on a dark background.
@@ -481,7 +481,7 @@ pub fn class_style(class: Class) -> Style {
         Class::Str => Style::default().fg(Color::Green),
         Class::Number => Style::default().fg(Color::Cyan),
         Class::Comment => Style::default().fg(Color::DarkGray),
-        Class::Function => Style::default().fg(Color::Blue),
+        Class::Function => Style::default().fg(crate::theme::FUNCTION),
         Class::Type => Style::default().fg(Color::Yellow),
         Class::Punct => Style::default().fg(Color::Gray),
         Class::Bracket(depth) => Style::default().fg(bracket_color(depth)),

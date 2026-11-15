@@ -413,6 +413,11 @@ fn event_loop(
                         }
                     }
                     Action::ScrollChat(delta) => ptys[app.active_conversation].scroll_chat(delta),
+                    Action::ScrollShell(delta) => {
+                        if let Some(sh) = &mut shell {
+                            sh.scroll_chat(delta);
+                        }
+                    }
                     Action::Apps(msg) => {
                         if let Some(a) = &apps {
                             a.send(msg);
@@ -479,6 +484,11 @@ fn event_loop(
                     }
                 }
                 Action::ScrollChat(delta) => ptys[app.active_conversation].scroll_chat(delta),
+                Action::ScrollShell(delta) => {
+                    if let Some(sh) = &mut shell {
+                        sh.scroll_chat(delta);
+                    }
+                }
                 Action::Apps(msg) => {
                     if let Some(a) = &apps {
                         a.send(msg);

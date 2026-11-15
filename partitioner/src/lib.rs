@@ -13,6 +13,7 @@ pub mod keys;
 pub mod layout;
 pub mod pane;
 pub mod predict;
+pub mod theme;
 pub mod predict_server;
 pub mod tree;
 pub mod viewer;

@@ -431,8 +431,13 @@ invalidated from the edited line down (S11).
 - **Languages:** Python, Rust, JS/TS (+JSX/TSX), JSON, TOML, YAML, shell, SQL,
   Markdown, C, C++, Go, Java, HTML and CSS.
 - **Token classes & colours:** keyword (magenta), string (green), number (cyan),
-  comment (dark gray), function call (blue), type / capitalised name (yellow)
-  and punctuation (gray) — readable on a dark background.
+  comment (dark gray), function call (**light blue** `Rgb(110,170,255)`), type /
+  capitalised name (yellow) and punctuation (gray) — readable on a dark
+  background. Colours come from the central **`theme.rs`** palette so they stay
+  consistent; the former dark `Color::Blue` (hard to read on dark) was replaced
+  by `theme::BLUE`, a lighter blue, for function names and the git-graph lanes
+  (S28). The ASCII/no-colour path is unchanged. A guard test in `theme.rs`
+  keeps dark `Color::Blue` from reappearing as a foreground outside the palette.
 - **Rainbow brackets:** `()`, `[]`, `{}` are coloured by nesting depth on a
   four-colour cycle; brackets inside strings and comments are ignored, and an
   unbalanced closing bracket is shown in **red**.
@@ -569,9 +574,23 @@ sub-box instead of the pane (S26, see “Agent changes” below).
   **✿ ?** mascot badge after the selection (ASCII fallback `(?)`); click it, or
   press `Ctrl+E`, to ask the explainer about exactly that selection.
 - **Overlays:** `↑↓` move · `Enter` open · `Esc` close.
+- **Shift+Enter = newline (S28):** in the **chat** (gentle-shell child),
+  `Shift+Enter` inserts a new line instead of sending — it is encoded as the
+  CSI-u sequence `\x1b[13;2u`, which the Pi/gentle-shell editor maps to
+  *newline* (`tui.input.newLine` defaults to `shift+enter`), while plain `Enter`
+  still submits (`\r`). In every multi-line partitioner input — the **Arch
+  brief**, the **command-helper** question, the **explain** follow-up and the
+  **Slack reply** — `Shift+Enter` inserts a newline and never sends; the
+  single-line **conversation title** ignores it. The Arch brief still submits on
+  `Alt+Enter`/`Ctrl+Enter` (S23).
 - **Mouse:** click selects panes and places the editor cursor, opens files and
-  tools; the wheel scrolls the chat, the editor, the diff, or the sidebar
-  depending on where it is over.
+  tools. The **wheel scrolls one line per event** (smooth; terminals emit
+  several events per notch) over the chat, the editor, the diff, the sidebar,
+  the **Agent-changes `$SHELL` terminal** (its own PTY scrollback) and the
+  command helper, and over the **explain**, **reader**, **git-graph** and
+  **arch-report** overlays — the open overlay captures the wheel so it never
+  scrolls the panes behind it. The editor used to jump three lines per event
+  and felt over-sensitive (S28).
 
 ## Architecture
 
