@@ -385,13 +385,15 @@ fn match_to_item(m: &serde_json::Value, users: &HashMap<String, String>) -> Opti
         })
         .unwrap_or_else(|| "unknown".to_string());
 
-    let title = if is_im {
+    // Channel and user names are attacker-controllable; keep the title to one
+    // sanitized line (T35, S31, F1).
+    let title = crate::sanitize::sanitize_line(&if is_im {
         format!("DM · {author}")
     } else if is_private {
         format!("🔒#{channel_name}")
     } else {
         format!("#{channel_name} · {author}")
-    };
+    });
 
     let raw = m.get("text").and_then(|t| t.as_str()).unwrap_or("");
     let text = render_text(raw, users);
@@ -453,7 +455,10 @@ pub fn render_text(raw: &str, users: &HashMap<String, String>) -> String {
         }
     }
     out.push_str(&unescape_entities(rest));
-    out
+    // Defensive layer 1 (T35, S31, F1): message text is attacker-controllable,
+    // so strip terminal control/escape bytes and bidi overrides before it enters
+    // the protocol. Newlines are kept for multi-line messages.
+    crate::sanitize::sanitize_display(&out)
 }
 
 fn render_token(token: &str, users: &HashMap<String, String>) -> String {

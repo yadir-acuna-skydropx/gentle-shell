@@ -906,3 +906,30 @@ fn checkout_treats_untracked_only_as_dirty() {
     assert_eq!(head_branch(&repo), "main");
     std::fs::remove_dir_all(&repo).ok();
 }
+
+// ---------- T35 / S31 / F1: control-char sanitization ----------
+
+#[test]
+fn build_detail_strips_terminal_control_and_escape_sequences() {
+    // A malicious issue with OSC window-title, OSC 52 clipboard, CSI clear and a
+    // bidi override in the title, body and a comment.
+    let obj = serde_json::json!({
+        "title": "pwn\x1b]0;hijack\x07\u{202e}title",
+        "state": "open",
+        "user": {"login": "attacker\x1b[31m"},
+        "html_url": "https://example/1",
+        "body": "line1\x1b[2J\nline2\x1b]52;c;ZXZpbA==\x07end",
+    });
+    let comments = vec![serde_json::json!({
+        "user": {"login": "c\x07"},
+        "body": "hi\x1bthere",
+    })];
+    let (title, body) = gentle_apps::github::build_detail("octo/repo", 7, false, &obj, &comments);
+    assert!(!title.contains('\x1b'), "title: {title:?}");
+    assert!(!title.contains('\n'), "window title must stay one line: {title:?}");
+    assert!(title.chars().all(|c| !gentle_apps::sanitize::is_unsafe(c)));
+    // The body keeps newlines but no other control/escape/bidi bytes.
+    assert!(body.contains('\n'));
+    assert!(body.chars().all(|c| c == '\n' || !gentle_apps::sanitize::is_unsafe(c)), "body: {body:?}");
+    assert!(!body.contains('\x1b'));
+}

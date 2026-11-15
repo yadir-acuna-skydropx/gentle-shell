@@ -615,3 +615,18 @@ fn token_is_refreshed_when_near_expiry() {
     c.poll().unwrap();
     assert_eq!(store.load(SLACK_ACCOUNT).unwrap().unwrap().access_token, "xoxp-NEW");
 }
+
+// ---------- T35 / S31 / F1: control-char sanitization ----------
+
+#[test]
+fn render_text_strips_terminal_control_and_escape_sequences() {
+    let users = HashMap::new();
+    let raw = "hey \x1b]0;pwn\x07 look \x1b[2J here\u{202e}rtl\nsecond line\x07";
+    let out = gentle_apps::slack::render_text(raw, &users);
+    assert!(!out.contains('\x1b'), "{out:?}");
+    assert!(out.contains('\n'), "newlines kept: {out:?}");
+    assert!(
+        out.chars().all(|c| c == '\n' || !gentle_apps::sanitize::is_unsafe(c)),
+        "no control/escape/bidi except newline: {out:?}"
+    );
+}

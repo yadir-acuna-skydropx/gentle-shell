@@ -24,6 +24,7 @@ use crate::icons::{self, IconMode};
 use crate::layout::{self, AgentBox, AgentBoxes, Layout, Mode, Pane};
 use crate::pane::{self, PtyPane};
 use crate::predict::{Engine, PredictMode};
+use crate::sanitize::{display_char, sanitize_display, sanitize_line};
 use crate::tree::{self, Entry, GitStatus};
 use crate::viewer::{self, DiffKind, Viewer};
 
@@ -1758,7 +1759,9 @@ impl App {
                 if self.reader.body.is_empty() {
                     return Action::None;
                 }
-                let mut text = self.reader.body.clone();
+                // Copy the sanitized text, never the raw issue body (T35, S31,
+                // F1); the OSC 52 transport base64-encodes it separately.
+                let mut text = sanitize_display(&self.reader.body);
                 if text.len() > MAX_COPY_BYTES {
                     let mut end = MAX_COPY_BYTES;
                     while end > 0 && !text.is_char_boundary(end) {
@@ -2800,7 +2803,10 @@ fn app_dot_style(status: AppState) -> Style {
 
 /// Truncates `s` to `w` columns (char-based; glyphs here are single-width).
 fn fit(s: &str, w: usize) -> String {
-    s.chars().take(w).collect()
+    // The apps panel renders attacker-controllable item titles, previews,
+    // breadcrumbs and engine error/status strings through `fit`; sanitize to a
+    // single line before truncating (T35, S31, F1).
+    sanitize_line(s).chars().take(w).collect()
 }
 
 /// Truncates `s` to `w` columns and right-pads it with spaces to exactly `w`.
@@ -3274,7 +3280,11 @@ fn code_spans(segs: &[highlight::Seg], scroll_col: usize, text_w: usize, emph: &
                     flush(&mut spans, &mut cur, cur_style);
                     cur_style = Some(st);
                 }
-                cur.push(ch);
+                // Display-only sanitization of file content (T35, S31, F1): map
+                // a raw ESC/control byte to a space so the editor can never emit
+                // an escape sequence to the terminal; the column count (and thus
+                // the cursor and bracket-match alignment) is preserved.
+                cur.push(display_char(ch));
             }
             col += 1;
         }
@@ -3415,8 +3425,16 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
                         match &highlighter {
                             Some(h) => spans.extend(code_spans(h.segs(i), scroll_col, text_w, &emph)),
                             None => {
-                                let shown: String =
-                                    vis.line(i).chars().skip(scroll_col).take(text_w).collect();
+                                // Display-only sanitization of file content: a
+                                // raw ESC in a viewed file must not drive the
+                                // terminal; columns are preserved (T35, S31, F1).
+                                let shown: String = vis
+                                    .line(i)
+                                    .chars()
+                                    .skip(scroll_col)
+                                    .take(text_w)
+                                    .map(display_char)
+                                    .collect();
                                 spans.push(Span::raw(shown));
                             }
                         }
@@ -3571,7 +3589,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
                                 DiffKind::Meta => Style::default().fg(Color::DarkGray),
                                 DiffKind::Context => Style::default(),
                             };
-                            Line::styled(d.text.clone(), style)
+                            Line::styled(sanitize_line(&d.text), style)
                         })
                         .collect();
                     frame.render_widget(Paragraph::new(lines).block(diff_block), drect);
@@ -3656,7 +3674,9 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
                 let ctitle = if app.conversations.len() > 1 {
                     format!(
                         " Chat · {} [{}] ",
-                        app.conversations.get(app.active_conversation).map(|c| c.title.as_str()).unwrap_or("gentle-shell"),
+                        sanitize_line(
+                            app.conversations.get(app.active_conversation).map(|c| c.title.as_str()).unwrap_or("gentle-shell")
+                        ),
                         app.conversation_label()
                     )
                 } else {
@@ -3795,7 +3815,8 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
     let status = if app.prefix {
         Line::styled(format!(" {PREFIX_LABEL} … w workspace · t files · c changes · a apps · g graph · n convs · z zoom · m min · d changes-only · Tab/1-4 focus · ? help · q quit · ] send {PREFIX_LABEL}"), Style::default().fg(Color::Black).bg(Color::Cyan))
     } else if let Some(msg) = &app.status_msg {
-        Line::styled(format!(" {msg}"), Style::default().fg(Color::Black).bg(Color::Yellow))
+        // Status messages can embed engine error strings (T35, S31, F1).
+        Line::styled(format!(" {}", sanitize_line(msg)), Style::default().fg(Color::Black).bg(Color::Yellow))
     } else if focus == Focus::Editor && app.editor.as_ref().is_some_and(|e| e.has_selection()) {
         // While a selection exists, point to the mascot badge (S17, L48).
         Line::styled(format!(" {}", mascot_hint(app.icons)), Style::default().fg(Color::Magenta))
@@ -3883,7 +3904,7 @@ fn reader_lines(r: &ReaderUi, w: usize, h: usize) -> (Vec<Line<'static>>, usize)
         return (vec![Line::styled("loading…", Style::default().fg(Color::DarkGray))], 0);
     }
     if let Some(err) = &r.error {
-        return (vec![Line::styled(format!("⚠ {err}"), Style::default().fg(Color::Red))], 0);
+        return (vec![Line::styled(format!("⚠ {}", sanitize_line(err)), Style::default().fg(Color::Red))], 0);
     }
     let body_rows = h.max(1);
     let wrapped = wrap_text(&r.body, w);
@@ -3894,9 +3915,14 @@ fn reader_lines(r: &ReaderUi, w: usize, h: usize) -> (Vec<Line<'static>>, usize)
     (wrapped[start..end].iter().map(|l| Line::raw(l.clone())).collect(), max_down)
 }
 
-/// Wraps `s` to width `w` on word boundaries, preserving blank lines.
+/// Wraps `s` to width `w` on word boundaries, preserving blank lines. The input
+/// is sanitized first (T35, S31, F1): this is the rendering boundary for all
+/// untrusted multi-line text (the issue/PR reader, the explain/helper/arch
+/// streamed output), so control/escape bytes and bidi overrides never reach the
+/// terminal.
 fn wrap_text(s: &str, w: usize) -> Vec<String> {
     let w = w.max(1);
+    let s = sanitize_display(s);
     let mut out = Vec::new();
     for para in s.split('\n') {
         if para.is_empty() {
@@ -3979,7 +4005,7 @@ fn arch_lines(a: &ArchUi, w: usize, h: usize) -> Vec<Line<'static>> {
             }
             let mut wrapped = wrap_text(&content, w);
             if let Some(err) = &a.error {
-                wrapped.push(format!("⚠ {err}"));
+                wrapped.push(format!("⚠ {}", sanitize_line(err)));
             }
             if let Some(path) = &a.report_path {
                 wrapped.push(format!("✓ report: {path}  (press o to open)"));
@@ -4025,7 +4051,7 @@ fn explain_lines(e: &ExplainUi, w: usize, h: usize, blink_on: bool) -> Vec<Line<
     }
     let mut wrapped = wrap_text(&content, w);
     if let Some(err) = &e.error {
-        wrapped.push(format!("⚠ {err}"));
+        wrapped.push(format!("⚠ {}", sanitize_line(err)));
     }
     let total = wrapped.len();
     let max_up = total.saturating_sub(body_rows);
@@ -4102,7 +4128,7 @@ fn gitgraph_lines(data: &GitGraphData, loading: bool, scroll: usize, _w: usize, 
         return out;
     }
     if let Some(err) = &data.error {
-        out.push(Line::styled(err.clone(), Style::default().fg(Color::Red)));
+        out.push(Line::styled(sanitize_line(err), Style::default().fg(Color::Red)));
         return out;
     }
     out.push(Line::styled(
@@ -4140,7 +4166,7 @@ fn gitgraph_lines(data: &GitGraphData, loading: bool, scroll: usize, _w: usize, 
                     spans.push(Span::styled(", ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
                 }
                 spans.push(Span::styled(
-                    r.clone(),
+                    sanitize_line(r),
                     Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
                 ));
                 if let Some(pr) = gitgraph::pr_for_ref(r, &data.pr_heads) {
@@ -4152,7 +4178,8 @@ fn gitgraph_lines(data: &GitGraphData, loading: bool, scroll: usize, _w: usize, 
             }
             spans.push(Span::styled(")", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
         }
-        spans.push(Span::raw(format!(" {}", row.commit.subject)));
+        // Commit subjects are attacker-controllable in a repo (T35, S31, F1).
+        spans.push(Span::raw(format!(" {}", sanitize_line(&row.commit.subject))));
         out.push(Line::from(spans));
     }
 
@@ -4160,10 +4187,10 @@ fn gitgraph_lines(data: &GitGraphData, loading: bool, scroll: usize, _w: usize, 
         out.push(Line::raw(""));
         out.push(Line::styled("Worktrees", Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD)));
         for wt in &data.worktrees {
-            let label = if wt.detached { "(detached)".to_string() } else { wt.branch.clone() };
+            let label = if wt.detached { "(detached)".to_string() } else { sanitize_line(&wt.branch) };
             out.push(Line::from(vec![
                 Span::styled(format!("  {} ", label), Style::default().fg(Color::Cyan)),
-                Span::styled(wt.path.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled(sanitize_line(&wt.path), Style::default().fg(Color::DarkGray)),
             ]));
         }
     }
@@ -5803,6 +5830,73 @@ mod tests {
         // Esc closes the reader.
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.overlay, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn reader_render_and_copy_strip_terminal_escape_sequences() {
+        // T35 / S31 / F1: a malicious issue body with OSC title, OSC 52
+        // clipboard, CSI clear and a bidi override must never reach the terminal.
+        let root = fixture("reader-escape");
+        let mut app = App::new(root.clone());
+        app.overlay = Some(Overlay::Reader);
+        app.reader.id = 1;
+        app.reader.loading = false;
+        app.reader.app = "github".into();
+        app.reader.item = "issue:o/r#1".into();
+        app.reader.body =
+            "start \x1b]0;pwn\x07 mid \x1b]52;c;ZXZpbA==\x07 \x1b[2J end\u{202e}rtl\nsecond line".into();
+        let t = render(&mut app, 100, 30);
+        // Scan every rendered cell: no ESC (0x1B) nor any other control byte.
+        let buf = t.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                for ch in buf[(x, y)].symbol().chars() {
+                    assert!(!crate::sanitize::is_unsafe(ch), "rendered unsafe cell {ch:?} at {x},{y}");
+                }
+            }
+        }
+        // Copying returns the sanitized body (no ESC/control/bidi bytes).
+        match app.handle_key(ch('y')) {
+            Action::Copy(text) => {
+                assert!(!text.contains('\x1b'));
+                assert!(text.chars().all(|c| c == '\n' || !crate::sanitize::is_unsafe(c)), "{text:?}");
+                assert!(text.contains("second line"));
+            }
+            other => panic!("expected a copy action, got {other:?}"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apps_item_render_strips_terminal_escape_sequences() {
+        // T35 / S31 / F1: a malicious Slack-style flat item title + preview is
+        // sanitized at the rendering boundary (`fit`).
+        let root = fixture("apps-escape");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("slack", "Slack", AppStatusKind::Connected)] });
+        app.apply_apps_msg(EngineMsg::Items {
+            app: "slack".into(),
+            items: vec![AppItem {
+                id: "c:1".into(),
+                title: "#gen \x1b]0;pwn\x07\u{202e}".into(),
+                text: "body \x1b[2J line".into(),
+                ..Default::default()
+            }],
+        });
+        render(&mut app, 120, 40);
+        app.handle_key(key(KeyCode::Enter)); // enter the app (View::Items)
+        let t = render(&mut app, 120, 40);
+        let buf = t.backend().buffer();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                for c in buf[(x, y)].symbol().chars() {
+                    assert!(!crate::sanitize::is_unsafe(c), "unsafe cell {c:?} at {x},{y}");
+                }
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

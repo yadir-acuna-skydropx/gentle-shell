@@ -389,6 +389,13 @@ pub fn build_detail(
         out.push_str(&format!("\n\n\u{2026} {} more comments", comments.len() - shown));
     }
 
+    // Defensive layer 1 (T35, S31, F1): the title, body and comments are
+    // attacker-controllable, so strip terminal control/escape bytes and bidi
+    // overrides before the text enters the protocol. Multi-line body keeps
+    // newlines; the window title is a single line.
+    let mut out = crate::sanitize::sanitize_display(&out);
+    let window_title = crate::sanitize::sanitize_line(&window_title);
+
     if out.len() > MAX_DETAIL_BYTES {
         truncate_on_char_boundary(&mut out, MAX_DETAIL_BYTES);
         out.push_str("\n\n\u{2026} (truncated)");
@@ -558,7 +565,15 @@ impl GithubConnector {
         }
     }
 
-    fn record(&mut self, item: Item) -> Item {
+    fn record(&mut self, mut item: Item) -> Item {
+        // Defensive layer 1 (T35, S31, F1): item titles and previews embed
+        // attacker-controllable GitHub strings (titles, authors, branch/ref and
+        // worktree names); strip terminal control/escape bytes and bidi
+        // overrides before they enter the protocol.
+        item.title = crate::sanitize::sanitize_line(&item.title);
+        if !item.text.is_empty() {
+            item.text = crate::sanitize::sanitize_display(&item.text);
+        }
         if !item.link.is_empty() {
             self.links.insert(item.id.clone(), item.link.clone());
         }
@@ -666,7 +681,7 @@ impl GithubConnector {
                 Ok(_) => "dirty",
                 Err(_) => "unknown",
             };
-            out.push(Item {
+            let item = Item {
                 id: format!("wt:{}", w.path),
                 title: format!("{} \u{b7} {} \u{b7} {}", w.path, branch, dirty),
                 text: String::new(),
@@ -675,7 +690,8 @@ impl GithubConnector {
                 kind: Some("worktree".into()),
                 expandable: false,
                 actions: vec![],
-            });
+            };
+            out.push(self.record(item));
         }
         Ok(out)
     }

@@ -12,6 +12,7 @@ pub mod http;
 pub mod oauth;
 pub mod pkce;
 pub mod protocol;
+pub mod sanitize;
 pub mod slack;
 pub mod store;
 
