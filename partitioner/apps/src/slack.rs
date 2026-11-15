@@ -153,7 +153,11 @@ impl SlackConnector {
             .ok_or_else(|| format!("unknown item: {item_id}"))?;
         let url = match (self.opener.slack_desktop_installed(), self.team_id.as_deref()) {
             (true, Some(team)) if !team.is_empty() => {
-                format!("slack://channel?team={team}&id={}", mref.channel)
+                format!(
+                    "slack://channel?team={}&id={}",
+                    deep_link_encode(team),
+                    deep_link_encode(&mref.channel)
+                )
             }
             _ => {
                 if mref.permalink.is_empty() {
@@ -164,6 +168,17 @@ impl SlackConnector {
         };
         self.opener.open(&url)?;
         Ok(format!("opened {url}"))
+    }
+
+    /// Records a Slack error on the connector: sets the panel status and a clear
+    /// detail. Auth failures drop to Disconnected and clear the cached user id so
+    /// the next poll re-runs `auth.test` after a fresh login.
+    fn apply_error(&mut self, code: &str) {
+        self.status = status_for_error(code);
+        self.detail = Some(error_detail(code));
+        if self.status == Status::Disconnected {
+            self.user_id = None;
+        }
     }
 
     /// Loads the token, refreshing it first when it is near expiry.
@@ -285,14 +300,57 @@ fn rate_limit_wait(resp: &HttpResponse) -> Option<u64> {
     }
 }
 
-/// Maps a Slack error code to the detail shown in the panel.
+/// True when `code` means the stored token is no longer usable, so the panel
+/// should drop to the Disconnected state and prompt a fresh login (S29).
+fn is_auth_error(code: &str) -> bool {
+    matches!(
+        code,
+        "invalid_auth"
+            | "token_revoked"
+            | "token_expired"
+            | "account_inactive"
+            | "not_authed"
+            | "no_permission"
+    )
+}
+
+/// The panel [`Status`] a Slack error code maps to: auth failures disconnect
+/// (re-login needed); everything else is a transient/config Error.
+fn status_for_error(code: &str) -> Status {
+    if is_auth_error(code) {
+        Status::Disconnected
+    } else {
+        Status::Error
+    }
+}
+
+/// Maps a Slack error code to a clear, UI-safe detail shown in the panel. The
+/// code itself is a fixed Slack enum (never a token or user text), so echoing
+/// the unknown ones is safe.
 fn error_detail(code: &str) -> String {
     match code {
-        "invalid_auth" | "token_revoked" | "account_inactive" => {
-            "token revoked — run `gentle-apps slack login`".to_string()
+        c if is_auth_error(c) => "disconnected — run `gentle-apps slack login`".to_string(),
+        "missing_scope" => {
+            "missing a Slack permission — re-run `gentle-apps slack login` to re-authorize".to_string()
         }
+        "ratelimited" => "Slack is rate-limiting; retrying shortly".to_string(),
         other => format!("Slack error: {other}"),
     }
+}
+
+/// Percent-encodes a value for a `slack://` deep link (L47 advisory: Slack
+/// deep-link values were not URL-encoded). Keeps the RFC 3986 unreserved set
+/// and escapes every other byte, so an unexpected id can never break the URL.
+fn deep_link_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
 }
 
 /// Extracts the `thread_ts` query parameter from a permalink, if present.
@@ -469,8 +527,7 @@ impl Connector for SlackConnector {
             match self.auth_test(&access) {
                 Ok(uid) => self.user_id = Some(uid),
                 Err(code) => {
-                    self.status = Status::Error;
-                    self.detail = Some(error_detail(&code));
+                    self.apply_error(&code);
                     return Err(code);
                 }
             }
@@ -483,8 +540,7 @@ impl Connector for SlackConnector {
         let v = &resp.body;
         if !v.get("ok").and_then(|o| o.as_bool()).unwrap_or(false) {
             let code = v.get("error").and_then(|e| e.as_str()).unwrap_or("search_failed").to_string();
-            self.status = Status::Error;
-            self.detail = Some(error_detail(&code));
+            self.apply_error(&code);
             return Err(code);
         }
         self.status = Status::Connected;
@@ -512,11 +568,18 @@ impl Connector for SlackConnector {
             self.resolve_users(&unknown, &access);
         }
 
-        // Build, dedupe by channel+ts, keep the newest MAX_ITEMS.
+        // Build, keep only real mentions of the user, dedupe by channel+ts,
+        // keep the newest MAX_ITEMS. `search.messages` can return fuzzy hits
+        // that do not actually contain `<@uid>`, so we filter on the raw text.
+        let mention = format!("<@{uid}");
         let mut items: Vec<Item> = Vec::new();
         let mut seen: HashMap<String, ()> = HashMap::new();
         self.matches.clear();
         for m in &matches {
+            let raw = m.get("text").and_then(|t| t.as_str()).unwrap_or("");
+            if !uid.is_empty() && !raw.contains(&mention) {
+                continue;
+            }
             if let Some((item, mref)) = match_to_item(m, &self.users) {
                 if seen.insert(item.id.clone(), ()).is_none() {
                     self.matches.insert(item.id.clone(), mref);
@@ -697,8 +760,25 @@ mod tests {
     }
 
     #[test]
-    fn error_detail_maps_invalid_auth() {
-        assert!(error_detail("invalid_auth").contains("token revoked"));
+    fn error_detail_maps_known_codes_and_statuses() {
+        assert!(error_detail("invalid_auth").contains("slack login"));
+        assert!(error_detail("token_revoked").contains("slack login"));
+        assert!(error_detail("missing_scope").contains("permission"));
+        assert!(error_detail("ratelimited").contains("rate-limiting"));
         assert!(error_detail("some_other").contains("some_other"));
+        assert_eq!(status_for_error("invalid_auth"), Status::Disconnected);
+        assert_eq!(status_for_error("token_revoked"), Status::Disconnected);
+        assert_eq!(status_for_error("missing_scope"), Status::Error);
+        assert_eq!(status_for_error("ratelimited"), Status::Error);
+        assert_eq!(status_for_error("some_other"), Status::Error);
+    }
+
+    #[test]
+    fn deep_link_encode_escapes_unsafe_chars_and_keeps_ids() {
+        // Real Slack ids are unreserved, so they pass through unchanged.
+        assert_eq!(deep_link_encode("T1"), "T1");
+        assert_eq!(deep_link_encode("C0A1B2C3"), "C0A1B2C3");
+        // Anything unexpected is percent-encoded so it cannot break the URL.
+        assert_eq!(deep_link_encode("a b&c=d"), "a%20b%26c%3Dd");
     }
 }

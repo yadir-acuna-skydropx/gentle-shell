@@ -310,8 +310,53 @@ fn status_error_on_invalid_auth() {
     let mut c = SlackConnector::new(cfg(&server.base()), Some("cid".into()), seeded_store(plain("xoxp-x")), "/tmp".into());
     let err = c.poll().unwrap_err();
     assert_eq!(err, "invalid_auth");
-    assert_eq!(c.status(), Status::Error);
-    assert!(c.detail().unwrap().contains("token revoked"));
+    // An auth failure must drop to the Disconnected state so the panel prompts
+    // the user to re-run `gentle-apps slack login` (not a generic Error).
+    assert_eq!(c.status(), Status::Disconnected);
+    assert!(c.detail().unwrap().contains("slack login"));
+}
+
+#[test]
+fn token_revoked_after_connect_drops_to_disconnected() {
+    // First poll connects; the second finds the token revoked.
+    let step = Arc::new(AtomicUsize::new(0));
+    let s2 = step.clone();
+    let server = FakeServer::start(move |req| match req.path.as_str() {
+        "/auth.test" => FakeResp::json(r#"{"ok":true,"user_id":"U1"}"#),
+        "/search.messages" => {
+            if s2.fetch_add(1, Ordering::SeqCst) == 0 {
+                FakeResp::json(r#"{"ok":true,"messages":{"matches":[]}}"#)
+            } else {
+                FakeResp::json(r#"{"ok":false,"error":"token_revoked"}"#)
+            }
+        }
+        _ => FakeResp::json(r#"{"ok":false,"error":"unexpected"}"#),
+    });
+    let mut c = SlackConnector::new(cfg(&server.base()), Some("cid".into()), seeded_store(plain("xoxp-x")), "/tmp".into());
+    c.poll().unwrap();
+    assert_eq!(c.status(), Status::Connected);
+    let err = c.poll().unwrap_err();
+    assert_eq!(err, "token_revoked");
+    assert_eq!(c.status(), Status::Disconnected);
+    assert!(c.detail().unwrap().contains("slack login"));
+}
+
+#[test]
+fn poll_keeps_only_messages_that_mention_the_user() {
+    let server = FakeServer::start(|req| match req.path.as_str() {
+        "/auth.test" => FakeResp::json(r#"{"ok":true,"user_id":"U1"}"#),
+        "/search.messages" => FakeResp::json(
+            r#"{"ok":true,"messages":{"matches":[
+                {"ts":"2.0","username":"ana","text":"hey <@U1>","permalink":"https://x?cid=C1","channel":{"id":"C1","name":"general"}},
+                {"ts":"1.0","username":"bob","text":"a fuzzy search hit with no real mention","permalink":"https://x?cid=C2","channel":{"id":"C2","name":"random"}}
+            ]}}"#,
+        ),
+        _ => FakeResp::json(r#"{"ok":false,"error":"unexpected"}"#),
+    });
+    let mut c = SlackConnector::new(cfg(&server.base()), Some("cid".into()), seeded_store(plain("xoxp-x")), "/tmp".into());
+    let items = c.poll().unwrap();
+    assert_eq!(items.len(), 1, "only the real mention is kept: {items:?}");
+    assert_eq!(items[0].id, "C1:2.0");
 }
 
 #[test]
