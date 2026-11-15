@@ -366,6 +366,9 @@ pub struct App {
     pub conv_sel: usize,
     /// Monotonic source for conversation titles.
     next_conversation: usize,
+    /// Title being typed in the conversations manager (S22): `(None, buf)`
+    /// names a new conversation, `(Some(i), buf)` renames conversation `i`.
+    pub conv_edit: Option<(Option<usize>, String)>,
     /// Blink phase for the animated explainer caret (S21): toggled on each
     /// timer tick while the explain popup accepts input.
     pub blink_on: bool,
@@ -425,6 +428,7 @@ impl App {
             active_conversation: 0,
             conv_sel: 0,
             next_conversation: 1,
+            conv_edit: None,
             blink_on: true,
             gitgraph: GitGraphData::default(),
             gitgraph_scroll: 0,
@@ -1523,12 +1527,22 @@ impl App {
     /// Starts a new conversation (a fresh gentle-shell child), made active
     /// (S22, Option A). Capped at [`MAX_CONVERSATIONS`].
     pub fn new_conversation(&mut self) -> Action {
+        self.new_conversation_named(None)
+    }
+
+    /// Starts a new conversation with an optional user title (S22); a blank
+    /// title falls back to its number.
+    pub fn new_conversation_named(&mut self, title: Option<String>) -> Action {
         if self.conversations.len() >= MAX_CONVERSATIONS {
             self.status_msg = Some(format!("conversation limit reached ({MAX_CONVERSATIONS})"));
             return Action::None;
         }
         self.next_conversation += 1;
-        self.conversations.push(Conversation { title: self.next_conversation.to_string() });
+        let title = title
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| self.next_conversation.to_string());
+        self.conversations.push(Conversation { title });
         self.active_conversation = self.conversations.len() - 1;
         self.conv_sel = self.active_conversation;
         Action::NewConversation
@@ -1568,8 +1582,43 @@ impl App {
     /// Conversations manager reducer (S22): navigate, Enter switches, `n`
     /// creates, `x` closes, Esc leaves.
     fn conversations_key(&mut self, key: KeyEvent) -> Action {
+        // While typing a title: Enter applies, Esc cancels, text edits.
+        if let Some((target, buf)) = self.conv_edit.as_mut() {
+            match key.code {
+                KeyCode::Esc => self.conv_edit = None,
+                KeyCode::Backspace => {
+                    buf.pop();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => buf.push(c),
+                KeyCode::Enter => {
+                    let (target, title) = (*target, buf.clone());
+                    self.conv_edit = None;
+                    match target {
+                        None => {
+                            let act = self.new_conversation_named(Some(title));
+                            self.overlay = None;
+                            return act;
+                        }
+                        Some(i) => {
+                            let t = title.trim();
+                            if let (Some(c), false) = (self.conversations.get_mut(i), t.is_empty()) {
+                                c.title = t.to_string();
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
         let len = self.conversations.len();
         match key.code {
+            // `r` renames the selected conversation.
+            KeyCode::Char('r') => {
+                let cur = self.conversations.get(self.conv_sel).map(|c| c.title.clone()).unwrap_or_default();
+                self.conv_edit = Some((Some(self.conv_sel), cur));
+                Action::None
+            }
             KeyCode::Esc => {
                 self.overlay = None;
                 Action::None
@@ -1582,7 +1631,11 @@ impl App {
                 self.conv_sel = (self.conv_sel + 1).min(len.saturating_sub(1));
                 Action::None
             }
-            KeyCode::Char('n') => self.new_conversation(),
+            // `n` starts a new conversation by asking for its title first.
+            KeyCode::Char('n') => {
+                self.conv_edit = Some((None, String::new()));
+                Action::None
+            }
             KeyCode::Char('x') => self.close_conversation(self.conv_sel),
             KeyCode::Enter => {
                 self.switch_conversation(self.conv_sel);
@@ -2108,9 +2161,11 @@ impl App {
             }
             Overlay::Apps => return self.click_apps(area, (area.x + 1).max(0), row),
             Overlay::Conversations => {
-                // The first line is the hint; rows below are conversations.
-                if rel >= 1 {
-                    let i = rel - 1;
+                // Line 0 is the hint, line 1 the "+ new" row, then conversations.
+                if rel == 1 {
+                    self.conv_edit = Some((None, String::new()));
+                } else if rel >= 2 {
+                    let i = rel - 2;
                     if i < self.conversations.len() {
                         self.conv_sel = i;
                         self.switch_conversation(i);
@@ -3081,7 +3136,11 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
                 None
             } else if l.show_chat {
                 let ctitle = if app.conversations.len() > 1 {
-                    format!(" Chat · gentle-shell [{}] ", app.conversation_label())
+                    format!(
+                        " Chat · {} [{}] ",
+                        app.conversations.get(app.active_conversation).map(|c| c.title.as_str()).unwrap_or("gentle-shell"),
+                        app.conversation_label()
+                    )
                 } else {
                     " Chat · gentle-shell ".to_string()
                 };
@@ -3246,7 +3305,7 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "  m      minimize the focused pane (restore with m or a click)".into(),
         "  d      changes only (focus + zoom the agent-changes pane)".into(),
         "  g      git graph (commit/branch DAG + worktrees overlay)".into(),
-        "  n      conversations (manage: new / switch / close gentle-shells)".into(),
+        "  n      conversations: + new (with a title) / r rename / switch / x close".into(),
         "  Tab    next pane   1-4 sidebar / editor / changes / chat".into(),
         "  q      quit (stops gentle-shell)".into(),
         format!("  ]      send a literal {PREFIX_LABEL} to the chat"),
@@ -3439,8 +3498,12 @@ fn explain_lines(e: &ExplainUi, w: usize, h: usize, blink_on: bool) -> Vec<Line<
 fn conversations_lines(app: &App) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     out.push(Line::styled(
-        "↑↓ select · Enter switch · n new · x close · Esc back",
+        "↑↓ select · Enter switch · n new · r rename · x close · Esc back",
         Style::default().fg(Color::DarkGray),
+    ));
+    out.push(Line::styled(
+        "＋ Nueva conversación  (n)",
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
     ));
     for (i, c) in app.conversations.iter().enumerate() {
         let active = i == app.active_conversation;
@@ -3452,7 +3515,15 @@ fn conversations_lines(app: &App) -> Vec<Line<'static>> {
         if i == app.conv_sel {
             style = style.add_modifier(Modifier::REVERSED);
         }
-        out.push(Line::styled(format!("{marker}{}. gentle-shell [{}]", i + 1, c.title), style));
+        out.push(Line::styled(format!("{marker}{}. {}", i + 1, c.title), style));
+    }
+    if let Some((target, buf)) = &app.conv_edit {
+        let label = if target.is_none() { "Título de la nueva conversación" } else { "Nuevo título" };
+        out.push(Line::raw(""));
+        out.push(Line::styled(
+            format!("{label}: {buf}▌  (Enter ok · Esc cancelar)"),
+            Style::default().fg(Color::Yellow),
+        ));
     }
     out
 }
@@ -3793,12 +3864,48 @@ mod tests {
         let (root, mut app) = workspace("conversations-manager");
         prefix_key(&mut app, 'n');
         assert_eq!(app.overlay, Some(Overlay::Conversations));
+        // `n` asks for a title first; Enter creates it, active, and closes.
         app.handle_key(ch('n'));
+        assert_eq!(app.conversations.len(), 1, "nothing is created until the title is confirmed");
+        for c in "ticket A".chars() {
+            app.handle_key(ch(c));
+        }
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::NewConversation);
         assert_eq!(app.conversations.len(), 2);
+        assert_eq!(app.conversations[1].title, "ticket A");
+        assert_eq!((app.active_conversation, app.overlay), (1, None));
+        // Reopen and switch back to the first.
+        prefix_key(&mut app, 'n');
         app.conv_sel = 0;
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.active_conversation, 0);
         assert_eq!(app.overlay, None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn conversations_can_be_renamed_and_esc_cancels() {
+        let (root, mut app) = workspace("conversations-rename");
+        prefix_key(&mut app, 'n');
+        app.conv_sel = 0;
+        app.handle_key(ch('r'));
+        // The buffer starts with the current title; clear it and type a new one.
+        app.handle_key(key(KeyCode::Backspace));
+        for c in "soporte".chars() {
+            app.handle_key(ch(c));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.conversations[0].title, "soporte");
+        // Esc while naming a new one creates nothing.
+        app.handle_key(ch('n'));
+        app.handle_key(ch('x'));
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(app.conversations.len(), 1);
+        assert_eq!(app.conv_edit, None);
+        // The title shows in the manager.
+        let t = render(&mut app, 120, 40);
+        assert!(screen_text(&t).contains("soporte"));
+        assert!(screen_text(&t).contains("Nueva conversaci"));
         fs::remove_dir_all(root).unwrap();
     }
 
