@@ -42,12 +42,62 @@ pub struct Worktree {
     pub detached: bool,
 }
 
+/// An open pull request's head branch, used to mark graph refs (S20, T21b).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PrHead {
+    pub number: u64,
+    pub branch: String,
+    pub title: String,
+}
+
 /// Everything the overlay needs; empty + `error` set when git is unavailable.
 #[derive(Debug, Default, Clone)]
 pub struct GitGraphData {
     pub rows: Vec<GraphRow>,
     pub worktrees: Vec<Worktree>,
+    /// Open PR head branches for the repo (empty when gh is missing /
+    /// unauthenticated / not a GitHub remote). Annotations are computed on
+    /// render via [`pr_for_ref`].
+    pub pr_heads: Vec<PrHead>,
     pub error: Option<String>,
+}
+
+/// Returns the open PR whose head branch matches a graph ref label, ignoring a
+/// remote prefix (`origin/feature` matches head `feature`) and skipping tags.
+/// Pure and unit-tested so PR annotation needs no git/gh (S20, T21b).
+pub fn pr_for_ref<'a>(label: &str, pr_heads: &'a [PrHead]) -> Option<&'a PrHead> {
+    if label.starts_with("tag:") || label.is_empty() {
+        return None;
+    }
+    pr_heads
+        .iter()
+        .find(|p| !p.branch.is_empty() && (label == p.branch || label.ends_with(&format!("/{}", p.branch))))
+}
+
+/// Parses `gh pr list --json number,headRefName,title` output into PR heads.
+/// Pure; any malformed entry is skipped. An empty / non-array input yields no
+/// heads (so markers simply do not appear).
+pub fn parse_pr_heads(json: &str) -> Vec<PrHead> {
+    let value: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let Some(arr) = value.as_array() else {
+        return Vec::new();
+    };
+    arr.iter()
+        .filter_map(|e| {
+            let branch = e.get("headRefName")?.as_str()?.to_string();
+            if branch.is_empty() {
+                return None;
+            }
+            Some(PrHead {
+                number: e.get("number").and_then(|n| n.as_u64()).unwrap_or(0),
+                branch,
+                title: e.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+            })
+        })
+        .collect()
 }
 
 /// Parses one ref-decoration string like `HEAD -> main, origin/main, tag: v1`.
@@ -195,7 +245,22 @@ pub fn collect(repo_root: &Path) -> GitGraphData {
         .filter(|o| o.status.success())
         .map(|o| parse_worktrees(&String::from_utf8_lossy(&o.stdout)))
         .unwrap_or_default();
-    GitGraphData { rows, worktrees, error: None }
+    let pr_heads = collect_pr_heads(repo_root);
+    GitGraphData { rows, worktrees, pr_heads, error: None }
+}
+
+/// Fetches open PR head branches via `gh`, run in `repo_root`. Fails silently to
+/// an empty list when gh is missing, unauthenticated, or the remote is not a
+/// GitHub repo, so the graph simply shows no PR markers (S20, T21b).
+fn collect_pr_heads(repo_root: &Path) -> Vec<PrHead> {
+    let out = Command::new("gh")
+        .args(["pr", "list", "--state", "open", "--json", "number,headRefName,title", "--limit", "100"])
+        .current_dir(repo_root)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => parse_pr_heads(&String::from_utf8_lossy(&o.stdout)),
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -251,6 +316,38 @@ mod tests {
         let base = rows.last().unwrap();
         assert_eq!(base.commit.subject, "base");
         assert_eq!(base.col, 0);
+    }
+
+    #[test]
+    fn pr_heads_mark_matching_refs_only() {
+        // T21b: a branch with an open PR gets the marker; others don't; a tag or
+        // a non-matching ref does not; an empty PR list marks nothing.
+        let heads = parse_pr_heads(
+            r#"[{"number":123,"headRefName":"feature","title":"Add feature"},
+                {"number":7,"headRefName":"fix/bug","title":"Fix"}]"#,
+        );
+        assert_eq!(heads.len(), 2);
+        assert_eq!(pr_for_ref("feature", &heads).map(|p| p.number), Some(123));
+        // A remote-prefixed ref still matches the head branch.
+        assert_eq!(pr_for_ref("origin/feature", &heads).map(|p| p.number), Some(123));
+        assert_eq!(pr_for_ref("origin/fix/bug", &heads).map(|p| p.number), Some(7));
+        // No PR, a tag, and a near-miss name do not match.
+        assert!(pr_for_ref("main", &heads).is_none());
+        assert!(pr_for_ref("tag:feature", &heads).is_none());
+        assert!(pr_for_ref("myfeature", &heads).is_none());
+        // Empty PR list = no change (nothing marked).
+        assert!(pr_for_ref("feature", &[]).is_none());
+    }
+
+    #[test]
+    fn parse_pr_heads_ignores_bad_input() {
+        assert!(parse_pr_heads("").is_empty());
+        assert!(parse_pr_heads("not json").is_empty());
+        assert!(parse_pr_heads("{}").is_empty());
+        // An entry missing headRefName is skipped; a valid sibling is kept.
+        let heads = parse_pr_heads(r#"[{"number":1},{"headRefName":"x","number":2}]"#);
+        assert_eq!(heads.len(), 1);
+        assert_eq!(heads[0].branch, "x");
     }
 
     #[test]

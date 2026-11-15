@@ -568,13 +568,18 @@ impl Highlighter {
         }
     }
 
-    /// Lexes forward until line `upto` (inclusive) is cached.
+    /// Lexes forward until line `upto` (inclusive) is cached. `lines` are the
+    /// RAW buffer lines; each newly lexed line is tab-expanded here so the
+    /// caller no longer needs to expand the whole file every frame (S32). The
+    /// cache is keyed by absolute line index, so only un-cached lines are
+    /// expanded and lexed.
     pub fn ensure(&mut self, lines: &[String], upto: usize) {
         let target = (upto + 1).min(lines.len());
         while self.cache.len() < target {
             let idx = self.cache.len();
             let state = if idx == 0 { State::default() } else { self.cache[idx - 1].1 };
-            let (segs, end) = highlight_line(&lines[idx], self.lang, state);
+            let expanded = crate::editor::expand_tabs(&lines[idx]);
+            let (segs, end) = highlight_line(&expanded, self.lang, state);
             self.cache.push((segs, end));
         }
     }

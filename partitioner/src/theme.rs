@@ -33,6 +33,10 @@ pub const ERROR: Color = Color::Red;
 /// Keyword / mascot accent.
 pub const KEYWORD: Color = Color::Magenta;
 
+/// Open-PR marker on git-graph branch labels (S20, T21b). A warm amber, legible
+/// on dark and distinct from the green ref labels and the yellow commit hash.
+pub const PR_MARKER: Color = Color::Rgb(255, 170, 80);
+
 /// Rainbow bracket cycle by nesting depth (all legible on dark).
 pub const BRACKETS: [Color; 4] = [Color::Yellow, Color::Magenta, Color::Cyan, Color::Green];
 

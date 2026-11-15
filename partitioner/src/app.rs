@@ -192,6 +192,10 @@ pub enum Action {
     Arch(ArchReq),
     /// Open a finished report file with the system opener (xdg-open).
     OpenReport(String),
+    /// Collect the git graph (git log + worktrees + open PRs) off the UI
+    /// thread; main.rs runs [`gitgraph::collect`] and posts the data back (S20,
+    /// S32). The overlay shows a loading state until it arrives.
+    LoadGitGraph,
     /// Copy text to the system clipboard via the OSC 52 escape sequence (S27);
     /// main.rs base64-encodes it and writes it to the real terminal.
     Copy(String),
@@ -444,6 +448,9 @@ pub struct App {
     pub gitgraph: GitGraphData,
     /// Scroll offset (commit rows) of the git graph overlay.
     pub gitgraph_scroll: usize,
+    /// True while the git graph is being collected off the UI thread (S32); the
+    /// overlay shows a loading state until [`App::apply_gitgraph`] fills it.
+    pub gitgraph_loading: bool,
 }
 
 impl App {
@@ -507,6 +514,7 @@ impl App {
             blink_on: true,
             gitgraph: GitGraphData::default(),
             gitgraph_scroll: 0,
+            gitgraph_loading: false,
         };
         app.rescan();
         app
@@ -570,8 +578,15 @@ impl App {
         self.selected = self.selected.min(self.entries.len().saturating_sub(1));
     }
 
-    /// Applies fresh git statuses (computed off the UI thread) and reloads the viewer diff.
-    pub fn apply_statuses(&mut self, statuses: HashMap<PathBuf, GitStatus>) {
+    /// Applies fresh git statuses (computed off the UI thread) and reloads the
+    /// viewer diff. Returns whether anything changed: when the new statuses
+    /// equal the current map, nothing is rescanned and the caller skips the
+    /// repaint, so idle PTY bursts no longer force a full tree rescan + redraw
+    /// every refresh (S32, S11).
+    pub fn apply_statuses(&mut self, statuses: HashMap<PathBuf, GitStatus>) -> bool {
+        if statuses == self.statuses {
+            return false;
+        }
         self.statuses = statuses;
         self.rescan();
         if let Some(v) = &mut self.viewer {
@@ -580,6 +595,7 @@ impl App {
             v.content_scroll = cs.min(v.content.len().saturating_sub(1));
             v.diff_scroll = ds.min(v.diff.len().saturating_sub(1));
         }
+        true
     }
 
     pub fn changes(&self) -> Vec<(PathBuf, GitStatus)> {
@@ -1979,10 +1995,21 @@ impl App {
 
     /// Opens the graphical git overlay (S20), refreshing the DAG from git.
     fn open_gitgraph(&mut self) -> Action {
-        self.gitgraph = gitgraph::collect(&self.root);
+        // The graph (git log + worktrees + open PRs) is collected off the UI
+        // thread so opening the overlay never blocks on git/gh (S32). Clear the
+        // old data, show the loading state, and let main.rs run the job.
+        self.gitgraph = GitGraphData::default();
         self.gitgraph_scroll = 0;
+        self.gitgraph_loading = true;
         self.overlay = Some(Overlay::GitGraph);
-        Action::None
+        Action::LoadGitGraph
+    }
+
+    /// Applies git graph data collected off the UI thread (S32).
+    pub fn apply_gitgraph(&mut self, data: GitGraphData) {
+        self.gitgraph = data;
+        self.gitgraph_loading = false;
+        self.gitgraph_scroll = self.gitgraph_scroll.min(self.gitgraph.rows.len().saturating_sub(1));
     }
 
     fn open_arch(&mut self) -> Action {
@@ -3355,21 +3382,30 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
                 e.ensure_visible(text_h, text_w);
                 let (scroll_row, scroll_col) = (e.scroll_row, e.scroll_col);
                 let cursor_line = e.cursor_line;
-                let cursor_vcol = e.cursor_visual_col();
-                // Highlight runs on the tab-expanded lines, matching what the
-                // cursor column and the rendered slice use.
-                let expanded_lines: Vec<String> = e.lines.iter().map(|t| crate::editor::expand_tabs(t)).collect();
+                // Expand tabs only for the visible rows (S32): a large file is no
+                // longer expanded in full every frame. The highlighter expands
+                // the un-cached lines it lexes itself.
+                let vis = crate::editor::expand_visible(&e.lines, scroll_row, scroll_row + text_h, &[]);
                 if let Some(h) = &mut highlighter {
-                    h.ensure(&expanded_lines, scroll_row + text_h);
+                    h.ensure(&e.lines, scroll_row + text_h);
                 }
                 // The bracket under/after the cursor and its match (if any).
-                let matched = if focus == Focus::Editor {
-                    bracket_pair(&expanded_lines, cursor_line, cursor_vcol)
+                // Matching runs on the RAW buffer — brackets and nesting are
+                // unaffected by tabs — and only the two resulting positions are
+                // converted to visual columns, so no off-screen line is expanded
+                // for bracket matching (S32).
+                let matched: Option<[(usize, usize); 2]> = if focus == Focus::Editor {
+                    bracket_pair(&e.lines, cursor_line, e.cursor_col).map(|[a, b]| {
+                        [
+                            (a.0, crate::editor::visual_col(&e.lines[a.0], a.1)),
+                            (b.0, crate::editor::visual_col(&e.lines[b.0], b.1)),
+                        ]
+                    })
                 } else {
                     None
                 };
                 let text_w = text_w.max(1);
-                let last = (scroll_row + text_h).min(expanded_lines.len());
+                let last = (scroll_row + text_h).min(e.lines.len());
                 let lines: Vec<Line> = (scroll_row..last)
                     .map(|i| {
                         let mut spans =
@@ -3380,7 +3416,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
                             Some(h) => spans.extend(code_spans(h.segs(i), scroll_col, text_w, &emph)),
                             None => {
                                 let shown: String =
-                                    expanded_lines[i].chars().skip(scroll_col).take(text_w).collect();
+                                    vis.line(i).chars().skip(scroll_col).take(text_w).collect();
                                 spans.push(Span::raw(shown));
                             }
                         }
@@ -3403,7 +3439,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
                             if row < scroll_row || row >= last {
                                 continue;
                             }
-                            let line_vcols = expanded_lines[row].chars().count();
+                            let line_vcols = vis.line(row).chars().count();
                             let (cstart, cend) = if sl == el {
                                 (sv, ev)
                             } else if row == sl {
@@ -3697,7 +3733,7 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
             let title = " Git graph · ↑↓ scroll · Esc close ".to_string();
             let w = area.width.saturating_sub(2) as usize;
             let h = area.height.saturating_sub(2) as usize;
-            let lines = gitgraph_lines(&app.gitgraph, app.gitgraph_scroll, w, h);
+            let lines = gitgraph_lines(&app.gitgraph, app.gitgraph_loading, app.gitgraph_scroll, w, h);
             frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
         } else if overlay == Overlay::Conversations {
             let title = " Conversations · Enter switch · n new · x close · Esc ".to_string();
@@ -3708,17 +3744,12 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
             let title = format!(" {} · ↑↓ scroll · y copy · o open · Esc ", app.reader.title);
             let w = area.width.saturating_sub(2) as usize;
             let h = area.height.saturating_sub(2).max(1) as usize;
-            // Clamp the scroll to the wrapped length so it cannot run off the end.
-            let total = if app.reader.loading || app.reader.error.is_some() {
-                0
-            } else {
-                wrap_text(&app.reader.body, w).len()
-            };
-            let max_down = total.saturating_sub(h);
+            // Wrap the body once and reuse it for both the scroll clamp and the
+            // rendered slice (S32): the reader no longer wraps twice per frame.
+            let (lines, max_down) = reader_lines(&app.reader, w, h);
             if app.reader.scroll > max_down {
                 app.reader.scroll = max_down;
             }
-            let lines = reader_lines(&app.reader, w, h);
             frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
         } else {
         let (title, lines) = match overlay {
@@ -3844,12 +3875,15 @@ pub fn help_lines() -> Vec<Line<'static>> {
 
 /// Renders the in-terminal GitHub reader body (S27): a loading/error line, or
 /// the word-wrapped content scrolled `scroll` lines down from the top.
-fn reader_lines(r: &ReaderUi, w: usize, h: usize) -> Vec<Line<'static>> {
+/// Wrapped, scrolled body lines for the reader overlay plus the maximum scroll
+/// offset. The body is wrapped exactly once here so the caller can both clamp
+/// the scroll and render from the same result (S32).
+fn reader_lines(r: &ReaderUi, w: usize, h: usize) -> (Vec<Line<'static>>, usize) {
     if r.loading {
-        return vec![Line::styled("loading…", Style::default().fg(Color::DarkGray))];
+        return (vec![Line::styled("loading…", Style::default().fg(Color::DarkGray))], 0);
     }
     if let Some(err) = &r.error {
-        return vec![Line::styled(format!("⚠ {err}"), Style::default().fg(Color::Red))];
+        return (vec![Line::styled(format!("⚠ {err}"), Style::default().fg(Color::Red))], 0);
     }
     let body_rows = h.max(1);
     let wrapped = wrap_text(&r.body, w);
@@ -3857,7 +3891,7 @@ fn reader_lines(r: &ReaderUi, w: usize, h: usize) -> Vec<Line<'static>> {
     let max_down = total.saturating_sub(body_rows);
     let start = r.scroll.min(max_down);
     let end = (start + body_rows).min(total);
-    wrapped[start..end].iter().map(|l| Line::raw(l.clone())).collect()
+    (wrapped[start..end].iter().map(|l| Line::raw(l.clone())).collect(), max_down)
 }
 
 /// Wraps `s` to width `w` on word boundaries, preserving blank lines.
@@ -4061,8 +4095,12 @@ const GRAPH_LANE_COLORS: [Color; 6] = crate::theme::GRAPH_LANES;
 
 /// Renders the git graph overlay (S20): a lane-based commit DAG with branch/tag
 /// labels, then a worktrees section. Pure given [`GitGraphData`].
-fn gitgraph_lines(data: &GitGraphData, scroll: usize, _w: usize, h: usize) -> Vec<Line<'static>> {
+fn gitgraph_lines(data: &GitGraphData, loading: bool, scroll: usize, _w: usize, h: usize) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
+    if loading {
+        out.push(Line::styled("loading…", Style::default().fg(Color::DarkGray)));
+        return out;
+    }
     if let Some(err) = &data.error {
         out.push(Line::styled(err.clone(), Style::default().fg(Color::Red)));
         return out;
@@ -4094,10 +4132,25 @@ fn gitgraph_lines(data: &GitGraphData, scroll: usize, _w: usize, h: usize) -> Ve
         spans.push(Span::raw(" "));
         spans.push(Span::styled(row.commit.short.clone(), Style::default().fg(Color::Yellow)));
         if !row.commit.refs.is_empty() {
-            spans.push(Span::styled(
-                format!(" ({})", row.commit.refs.join(", ")),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-            ));
+            // Render refs one at a time so a branch with an open PR can carry a
+            // distinct marker right after its name (S20, T21b).
+            spans.push(Span::styled(" (", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+            for (ri, r) in row.commit.refs.iter().enumerate() {
+                if ri > 0 {
+                    spans.push(Span::styled(", ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
+                }
+                spans.push(Span::styled(
+                    r.clone(),
+                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                ));
+                if let Some(pr) = gitgraph::pr_for_ref(r, &data.pr_heads) {
+                    spans.push(Span::styled(
+                        format!(" \u{21e1}PR #{}", pr.number),
+                        Style::default().fg(crate::theme::PR_MARKER).add_modifier(Modifier::BOLD),
+                    ));
+                }
+            }
+            spans.push(Span::styled(")", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
         }
         spans.push(Span::raw(format!(" {}", row.commit.subject)));
         out.push(Line::from(spans));
@@ -4320,11 +4373,53 @@ mod tests {
 
     #[test]
     fn gitgraph_lines_handle_empty_and_error_data() {
-        let lines = gitgraph_lines(&GitGraphData::default(), 0, 80, 20);
+        let lines = gitgraph_lines(&GitGraphData::default(), false, 0, 80, 20);
         assert_eq!(lines.len(), 1, "empty data shows only the header");
         let err = GitGraphData { error: Some("boom".into()), ..Default::default() };
-        let lines = gitgraph_lines(&err, 0, 80, 20);
+        let lines = gitgraph_lines(&err, false, 0, 80, 20);
         assert_eq!(lines.len(), 1, "an error shows a single line");
+    }
+
+    #[test]
+    fn git_graph_opens_with_a_loading_state_then_fills() {
+        // S32: opening the graph returns a load request immediately and shows a
+        // loading line; applying the collected data fills it and clears loading.
+        let root = fixture("gitgraph-loading");
+        let mut app = App::new(root.clone());
+        render(&mut app, 120, 40);
+        assert_eq!(prefix_key(&mut app, 'g'), Action::LoadGitGraph);
+        assert!(app.gitgraph_loading, "the overlay opens in a loading state");
+        let lines = gitgraph_lines(&app.gitgraph, app.gitgraph_loading, 0, 80, 20);
+        let text = lines[0].spans.iter().map(|s| s.content.as_ref()).collect::<String>();
+        assert!(text.contains("loading"), "shows loading until data arrives: {text:?}");
+        // The collected data replaces the loading state.
+        let commits = crate::gitgraph::build_rows(crate::gitgraph::parse_log("aaa\0aaa\0\0\0only"));
+        app.apply_gitgraph(GitGraphData { rows: commits, ..Default::default() });
+        assert!(!app.gitgraph_loading);
+        assert_eq!(app.gitgraph.rows.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn gitgraph_lines_mark_branches_with_an_open_pr() {
+        // T21b: a ref whose branch has an open PR carries a "⇡PR #N" marker;
+        // other refs do not.
+        use crate::gitgraph::{build_rows, parse_log, PrHead};
+        let rows = build_rows(parse_log("aaa\0aaa\0\0feature, main\0tip"));
+        let data = GitGraphData {
+            rows,
+            pr_heads: vec![PrHead { number: 42, branch: "feature".into(), title: "x".into() }],
+            ..Default::default()
+        };
+        let lines = gitgraph_lines(&data, false, 0, 80, 20);
+        let text = lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("⇡PR #42"), "the feature branch is marked: {text:?}");
+        assert_eq!(text.matches("⇡PR").count(), 1, "only the PR branch is marked, not main: {text:?}");
+        // Empty PR list = no markers.
+        let none = GitGraphData { pr_heads: vec![], ..data.clone() };
+        let text2 = gitgraph_lines(&none, false, 0, 80, 20)
+            .iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>()).collect::<Vec<_>>().join("\n");
+        assert!(!text2.contains("⇡PR"), "no markers without PRs: {text2:?}");
     }
 
     #[test]
@@ -4627,6 +4722,24 @@ mod tests {
     fn prefix_e(app: &mut App) -> Action {
         app.handle_key(prefix());
         app.handle_key(ch('e'))
+    }
+
+    #[test]
+    fn editor_renders_visible_tab_expanded_lines() {
+        // S32: the editor expands tabs only for the visible slice, but the
+        // rendered output for a file with tabs is unchanged — a tab-indented
+        // line still appears expanded to the tab stop.
+        let root = fixture("editor-tabs");
+        fs::write(root.join("src/main.rs"), "fn main() {\n\tlet x = 1;\n}\n").unwrap();
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.editor = Some(Editor::open(&root, Path::new("src/main.rs")));
+        app.focus = Focus::Sidebar; // isolate the slice expansion from bracket/cursor
+        let t = render(&mut app, 120, 40);
+        let text = screen_text(&t);
+        assert!(text.contains("    let x = 1;"), "the tab is expanded to a tab stop: {text:?}");
+        assert!(!text.contains("\tlet"), "no raw tab is rendered");
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4939,6 +5052,26 @@ mod tests {
         assert_eq!(app.change_selected, 1, "clamped to the last change");
         app.handle_key(key(KeyCode::Enter));
         assert_eq!(app.viewer.as_ref().unwrap().path, PathBuf::from("src/main.rs"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn apply_statuses_skips_rescan_and_redraw_when_unchanged() {
+        // S32: identical statuses mean no rescan and no redraw; a real change
+        // rescans and reports that a redraw is needed.
+        let root = fixture("statuses-eq");
+        let mut app = App::new(root.clone());
+        let first: HashMap<PathBuf, GitStatus> =
+            [(PathBuf::from("src/main.rs"), GitStatus::Modified)].into();
+        assert!(app.apply_statuses(first.clone()), "the first non-empty status changes state");
+        let entries_before = app.entries.clone();
+        // Re-applying the same map is a no-op: no redraw and the tree is untouched.
+        assert!(!app.apply_statuses(first.clone()), "identical statuses need no redraw");
+        assert_eq!(app.entries, entries_before, "no rescan happened");
+        // A different map rescans and asks for a redraw.
+        let second: HashMap<PathBuf, GitStatus> =
+            [(PathBuf::from("README.md"), GitStatus::Added)].into();
+        assert!(app.apply_statuses(second), "a change needs a redraw");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5880,9 +6013,9 @@ mod tests {
         (root, app)
     }
 
-    fn prefix_key(app: &mut App, c: char) {
+    fn prefix_key(app: &mut App, c: char) -> Action {
         app.handle_key(prefix());
-        app.handle_key(ch(c));
+        app.handle_key(ch(c))
     }
 
     #[test]

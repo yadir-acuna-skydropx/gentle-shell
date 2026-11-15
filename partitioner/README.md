@@ -503,7 +503,7 @@ else is forwarded to the chat.
 | `z` | Zoom (maximize) the focused pane; press again to restore |
 | `m` | Minimize the focused pane to its title bar; press again to restore |
 | `d` | Changes only — focus and zoom the agent-changes pane |
-| `g` | Git graph overlay — commit/branch DAG + local worktrees (S20) |
+| `g` | Git graph overlay — commit/branch DAG + local worktrees + open-PR markers (S20) |
 | `n` | Conversations manager — new / switch / close gentle-shells (S22) |
 | `?` | Help overlay |
 | `Tab` | Next pane (skips minimized) · `1`-`4` focus sidebar / editor / changes / chat |
@@ -551,7 +551,12 @@ sub-box instead of the pane (S26, see “Agent changes” below).
     `[_]`/`[□]` buttons still minimize/zoom the whole Agent-changes pane (S14).
 - **Git graph (`Ctrl+]` `g`, S20):** a full overlay drawing the commit/branch
   DAG with branch/tag labels and the local worktrees; `↑↓`/`PgUp`/`PgDn` scroll,
-  `Esc` closes.
+  `Esc` closes. The data (git log + worktrees + open PRs) is collected on a
+  background thread, so the overlay opens instantly showing *loading…* and fills
+  when ready — the UI thread never blocks on git/`gh` (S32). Any branch label
+  with an **open pull request** is marked ` ⇡PR #123` in a distinct amber
+  (fetched off-thread via `gh pr list`; absent when `gh` is missing,
+  unauthenticated or the remote is not GitHub) (T21b).
 - **Conversations (`Ctrl+]` `n` or the *Conversaciones* apps row, S22):** manage
   several gentle-shell conversations, each its own child process; `↑↓` select,
   `Enter` switch, `n` new, `x` close, `Esc` back. The active one shows as

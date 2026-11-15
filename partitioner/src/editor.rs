@@ -73,6 +73,55 @@ pub fn expand_tabs(s: &str) -> String {
     out
 }
 
+/// Tab-expanded editor lines materialised only for the rows a frame needs — the
+/// visible slice `[start, end)` plus any `extra` indices (e.g. the cursor line
+/// for bracket matching). Off-screen lines are never expanded, so a large file
+/// costs O(visible) per frame instead of O(file) (S32). [`line`] returns an
+/// empty string for any index that was not materialised.
+pub struct VisibleExpanded {
+    start: usize,
+    end: usize,
+    visible: Vec<String>,
+    extra: std::collections::BTreeMap<usize, String>,
+}
+
+impl VisibleExpanded {
+    /// The tab-expanded text for absolute line index `i`, or `""` when `i` was
+    /// outside the materialised window and not an `extra`.
+    pub fn line(&self, i: usize) -> &str {
+        if i >= self.start && i < self.end {
+            &self.visible[i - self.start]
+        } else {
+            self.extra.get(&i).map(String::as_str).unwrap_or("")
+        }
+    }
+
+    /// How many lines were actually tab-expanded (for tests/perf assertions).
+    pub fn expanded_count(&self) -> usize {
+        self.visible.len() + self.extra.len()
+    }
+}
+
+/// Builds a [`VisibleExpanded`] over `lines`, expanding only `[start, end)`
+/// (clamped to the buffer) plus any `extra` indices that fall outside it (S32).
+pub fn expand_visible(lines: &[String], start: usize, end: usize, extra: &[usize]) -> VisibleExpanded {
+    let end = end.min(lines.len());
+    let start = start.min(end);
+    let visible: Vec<String> = lines[start..end].iter().map(|l| expand_tabs(l)).collect();
+    let mut extra_map = std::collections::BTreeMap::new();
+    for &i in extra {
+        if i < lines.len() && (i < start || i >= end) {
+            extra_map.entry(i).or_insert_with(|| expand_tabs(&lines[i]));
+        }
+    }
+    VisibleExpanded { start, end, visible, extra: extra_map }
+}
+
+/// Visual column (tab-expanded) of character column `col` within `line`.
+pub fn visual_col(line: &str, col: usize) -> usize {
+    expanded_col(line, col)
+}
+
 /// Visual column (tab-expanded) of character column `col` within `line`.
 fn expanded_col(line: &str, col: usize) -> usize {
     let mut vis = 0usize;
@@ -731,6 +780,32 @@ mod tests {
         assert_eq!(e.cursor_visual_col(), 4);
         assert_eq!(expand_tabs("\tx"), "    x");
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn expand_visible_only_expands_the_window_and_extras() {
+        // S32: the helper must expand only the visible rows (plus explicit
+        // extras), never the whole file, and must keep tab expansion correct.
+        let lines: Vec<String> =
+            (0..100).map(|i| format!("\tline{i}")).collect();
+        let vis = expand_visible(&lines, 10, 15, &[]);
+        assert_eq!(vis.expanded_count(), 5, "only the 5 visible rows are expanded");
+        assert_eq!(vis.line(10), "    line10", "tabs expanded for a visible row");
+        assert_eq!(vis.line(14), "    line14");
+        assert_eq!(vis.line(0), "", "an off-screen row is not expanded");
+        assert_eq!(vis.line(99), "", "an off-screen row is not expanded");
+        // An explicit extra index outside the window IS expanded.
+        let vis2 = expand_visible(&lines, 10, 15, &[2, 12]);
+        assert_eq!(vis2.expanded_count(), 6, "extra index 2 adds one; 12 is already in-window");
+        assert_eq!(vis2.line(2), "    line2");
+    }
+
+    #[test]
+    fn expand_visible_clamps_out_of_range_window() {
+        let lines: Vec<String> = vec!["a".into(), "b".into()];
+        let vis = expand_visible(&lines, 5, 10, &[]);
+        assert_eq!(vis.expanded_count(), 0, "a window past the end expands nothing");
+        assert_eq!(vis.line(0), "");
     }
 
     #[test]

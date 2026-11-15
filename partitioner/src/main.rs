@@ -32,6 +32,7 @@ use gentle_partitioner::app::{draw, Action, App, Focus};
 use gentle_partitioner::apps_client::{AppsClient, AppsEvent};
 use gentle_partitioner::arch_client::{ArchClient, ArchEvent};
 use gentle_partitioner::explain_client::{ExplainClient, ExplainEvent};
+use gentle_partitioner::gitgraph::{self, GitGraphData};
 use gentle_partitioner::pane::PtyPane;
 use gentle_partitioner::predict::{self, Engine};
 use gentle_partitioner::predict_server::PredictServer;
@@ -86,6 +87,8 @@ enum Event {
     Tick,
     /// The Agent-changes interactive shell produced output (coalesced, S24).
     ShellOutput,
+    /// Git graph data collected off the UI thread (S20, S32).
+    GitGraph(GitGraphData),
 }
 
 fn main() {
@@ -450,6 +453,7 @@ fn event_loop(
                     }
                     Action::OpenReport(path) => open_with_system(&path),
                     Action::Copy(text) => copy_to_clipboard(&text),
+                    Action::LoadGitGraph => spawn_gitgraph_job(tx.clone(), root.clone()),
                     Action::Quit => break,
                 }
                 // A save asks for a fresh git status off the UI thread.
@@ -516,6 +520,7 @@ fn event_loop(
                 }
                 Action::OpenReport(path) => open_with_system(&path),
                 Action::Copy(text) => copy_to_clipboard(&text),
+                Action::LoadGitGraph => spawn_gitgraph_job(tx.clone(), root.clone()),
                 Action::Quit => break,
             },
             Event::Input(CtEvent::Paste(text)) => {
@@ -546,7 +551,11 @@ fn event_loop(
                     let _ = git_tx.send(());
                 }
             }
-            Event::Statuses(statuses) => app.apply_statuses(statuses),
+            // Repaint only when the statuses actually changed (S32, S11): an
+            // idle PTY burst re-runs `git status` but the map is usually equal.
+            Event::Statuses(statuses) => needs_redraw = app.apply_statuses(statuses),
+            // Fresh git graph data from the background collect job (S20, S32).
+            Event::GitGraph(data) => app.apply_gitgraph(data),
             Event::Apps(AppsEvent::Msg(msg)) => app.apply_apps_msg(msg),
             Event::Apps(AppsEvent::Offline) => app.set_apps_offline(),
             Event::Explain(ExplainEvent::Msg(msg)) => app.apply_explain_msg(msg),
@@ -681,6 +690,19 @@ fn spawn_git_worker(tx: Sender<Event>, root: PathBuf) -> Sender<()> {
         })
         .expect("spawn git worker");
     req_tx
+}
+
+/// Collects the git graph (git log + worktrees + open PRs) off the UI thread
+/// and posts it back, so opening the overlay never blocks on git/gh (S20, S32).
+/// One-shot: the thread ends after sending.
+fn spawn_gitgraph_job(tx: Sender<Event>, root: PathBuf) {
+    std::thread::Builder::new()
+        .name("git-graph".into())
+        .spawn(move || {
+            let data = gitgraph::collect(&root);
+            let _ = tx.send(Event::GitGraph(data));
+        })
+        .expect("spawn git-graph job");
 }
 
 fn spawn_pty(
