@@ -478,6 +478,8 @@ else is forwarded to the chat.
 | `z` | Zoom (maximize) the focused pane; press again to restore |
 | `m` | Minimize the focused pane to its title bar; press again to restore |
 | `d` | Changes only — focus and zoom the agent-changes pane |
+| `g` | Git graph overlay — commit/branch DAG + local worktrees (S20) |
+| `n` | Conversations manager — new / switch / close gentle-shells (S22) |
 | `?` | Help overlay |
 | `Tab` | Next pane (skips minimized) · `1`-`4` focus sidebar / editor / changes / chat |
 | `q` | Quit (stops gentle-shell) |
@@ -503,7 +505,20 @@ else is forwarded to the chat.
   - Opening another file or quitting with unsaved edits warns first; repeat the
     action to discard.
   - Binary, unreadable and oversized files stay read-only.
-- **Agent changes (right pane):** `↑↓` `PgUp` `PgDn` scroll · `Esc` back to chat (or restores the zoom when this pane is zoomed).
+- **Agent changes (right pane, S24):** splits into three — the **diff** on top
+  (`↑↓` `PgUp` `PgDn` scroll · `Esc` back to chat, or restores the zoom when this
+  pane is zoomed), an interactive **`$SHELL` terminal** (bottom-left) for system
+  commands and background jobs, and a **command helper** (bottom-right) that
+  recommends commands with Claude Haiku from the terminal's recent output.
+  Click the terminal or helper to focus it; in the helper, type a question and
+  press `Enter`; `Esc` returns to the diff.
+- **Git graph (`Ctrl+]` `g`, S20):** a full overlay drawing the commit/branch
+  DAG with branch/tag labels and the local worktrees; `↑↓`/`PgUp`/`PgDn` scroll,
+  `Esc` closes.
+- **Conversations (`Ctrl+]` `n` or the *Conversaciones* apps row, S22):** manage
+  several gentle-shell conversations, each its own child process; `↑↓` select,
+  `Enter` switch, `n` new, `x` close, `Esc` back. The active one shows as
+  `[n/total]` in the chat title.
 - **Zoom & minimize (S14):** every pane's top border carries two small buttons at its right end — `[_]` minimize and `[□]` zoom (`[_]`/`[^]` with `GENTLE_PARTITIONER_ICONS=ascii`). A click runs that pane's action even when it is not focused. A **zoomed** pane fills the whole body and hides the others; `z` again, or `Esc` outside an editing context, restores it. A **minimized** pane collapses to a one-row title bar (the sidebar to a 3-column icon strip) while the rest grow; several panes may be minimized but never all four. Click a minimized title bar or strip to restore it. The status line shows the zoomed pane and the minimized ones. While the chat is minimized its PTY keeps its last size, so gentle-shell does not reflow.
 - **Apps panel:** `↑↓` select an app or item · `Enter` drills in (app → items →
   reply box) · type to edit the reply, `Enter` sends it, `a` opens the action
