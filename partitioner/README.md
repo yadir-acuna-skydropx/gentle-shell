@@ -486,6 +486,8 @@ else is forwarded to the chat.
 | `]` | Send a literal `Ctrl+]` to the chat |
 
 `z`, `m` and `d` are workspace-only; in chat mode they report *available in workspace mode*.
+With the diff, terminal or helper focused, `z`/`m` act on that Agent-changes
+sub-box instead of the pane (S26, see “Agent changes” below).
 
 - **Sidebar:** `↑↓` (or `k`/`j`) move · `Enter`/`→` open · `←` collapse / go to
   parent · `Esc` back to chat.
@@ -512,6 +514,16 @@ else is forwarded to the chat.
   recommends commands with Claude Haiku from the terminal's recent output.
   Click the terminal or helper to focus it; in the helper, type a question and
   press `Enter`; `Esc` returns to the diff.
+  - **Sub-box zoom & minimize (S26):** each sub-box carries its own `[_]`
+    minimize and `[□]` zoom buttons on its top border (click them even when the
+    box is unfocused). With the **diff**, **terminal** or **helper** focused,
+    `Ctrl+]` `z` **maximizes** that box to fill the whole Agent-changes pane
+    (and zooms the pane itself so the box fills the screen; `z` again restores
+    both), and `Ctrl+]` `m` **minimizes** it to a one-row title bar while the
+    others grow — click the bar (or press `m` again) to restore it. The three
+    boxes are never all minimized at once. A minimized or hidden terminal keeps
+    its PTY at its last size, so the shell does not reflow. The pane's own
+    `[_]`/`[□]` buttons still minimize/zoom the whole Agent-changes pane (S14).
 - **Git graph (`Ctrl+]` `g`, S20):** a full overlay drawing the commit/branch
   DAG with branch/tag labels and the local worktrees; `↑↓`/`PgUp`/`PgDn` scroll,
   `Esc` closes.

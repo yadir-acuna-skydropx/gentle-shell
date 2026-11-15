@@ -130,6 +130,33 @@ impl Layout {
     }
 }
 
+/// One of the three sub-boxes inside the Agent-changes pane (S26): the diff
+/// (top), the interactive terminal (bottom-left) and the command helper
+/// (bottom-right). Each can be zoomed to fill the pane or minimized to a
+/// one-row title bar, like the pane-level zoom/minimize (S14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentBox {
+    Diff,
+    Terminal,
+    Helper,
+}
+
+impl AgentBox {
+    /// The three boxes in a stable order.
+    pub const ALL: [AgentBox; 3] = [AgentBox::Diff, AgentBox::Terminal, AgentBox::Helper];
+}
+
+/// Zoom / minimize request for the Agent-changes sub-boxes (S26). Zoom wins
+/// over minimize: a zoomed box fills the whole pane and the others are hidden.
+/// The caller guarantees the three boxes are never all minimized at once.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AgentBoxes {
+    pub zoom: Option<AgentBox>,
+    pub min_diff: bool,
+    pub min_terminal: bool,
+    pub min_helper: bool,
+}
+
 /// Splits the Agent-changes pane into the diff (top), an interactive terminal
 /// (bottom-left) and the command helper (bottom-right) (S24). The diff keeps
 /// the top ~55% of the height; the remaining row splits evenly left/right. The
@@ -148,6 +175,93 @@ pub fn split_agent_changes(diff: Rect) -> (Rect, Rect, Rect) {
     let term = Rect::new(diff.x, by, left_w, bottom_h);
     let helper = Rect::new(diff.x + left_w, by, diff.width - left_w, bottom_h);
     (top, term, helper)
+}
+
+/// Splits the Agent-changes pane honouring the per-box zoom / minimize state
+/// (S26). Returns `(diff, terminal, helper)` rects: a hidden box is zero-size,
+/// a minimized box is a one-row bar docked at the bottom, a zoomed box fills
+/// the whole pane. With the default (no zoom, nothing minimized) it is exactly
+/// [`split_agent_changes`]. The rects never overlap and stay within `diff`.
+pub fn split_agent_changes_with(diff: Rect, boxes: AgentBoxes) -> (Rect, Rect, Rect) {
+    let zero = Rect::new(diff.x, diff.y, 0, 0);
+    // Zoom wins: the zoomed box fills the pane; the others are hidden.
+    if let Some(z) = boxes.zoom {
+        return match z {
+            AgentBox::Diff => (diff, zero, zero),
+            AgentBox::Terminal => (zero, diff, zero),
+            AgentBox::Helper => (zero, zero, diff),
+        };
+    }
+    // Nothing minimized: identical to the plain split.
+    if !(boxes.min_diff || boxes.min_terminal || boxes.min_helper) {
+        return split_agent_changes(diff);
+    }
+
+    // Dock minimized boxes as one-row bars at the bottom, stacked in box order;
+    // the top region holds the non-minimized boxes (diff on top, terminal and
+    // helper splitting the lower band).
+    let bar_count = [boxes.min_diff, boxes.min_terminal, boxes.min_helper].iter().filter(|b| **b).count() as u16;
+    let bars_h = (bar_count * MIN_BAR_HEIGHT).min(diff.height);
+    let top_h = diff.height - bars_h;
+    let top = Rect::new(diff.x, diff.y, diff.width, top_h);
+
+    let has_d = !boxes.min_diff;
+    let has_t = !boxes.min_terminal;
+    let has_h = !boxes.min_helper;
+
+    let mut d_rect = zero;
+    let mut t_rect = zero;
+    let mut h_rect = zero;
+
+    if top.height > 0 && top.width > 0 {
+        let bottom_present = has_t || has_h;
+        // The diff takes an upper band when a bottom box is present, else the
+        // whole top region; the bottom band holds terminal and/or helper.
+        let band = if has_d && bottom_present {
+            let d_h = (top.height * 55 / 100).max(1).min(top.height.saturating_sub(1));
+            d_rect = Rect::new(top.x, top.y, top.width, d_h);
+            Rect::new(top.x, top.y + d_h, top.width, top.height - d_h)
+        } else if has_d {
+            d_rect = top;
+            Rect::new(top.x, top.y + top.height, top.width, 0)
+        } else {
+            top
+        };
+        if band.height > 0 && band.width > 0 {
+            match (has_t, has_h) {
+                (true, true) => {
+                    let lw = band.width / 2;
+                    t_rect = Rect::new(band.x, band.y, lw, band.height);
+                    h_rect = Rect::new(band.x + lw, band.y, band.width - lw, band.height);
+                }
+                (true, false) => t_rect = band,
+                (false, true) => h_rect = band,
+                (false, false) => {}
+            }
+        }
+    }
+
+    // Dock the one-row bars at the bottom in box order.
+    let mut bar_y = diff.y + top_h;
+    for b in AgentBox::ALL {
+        let min = match b {
+            AgentBox::Diff => boxes.min_diff,
+            AgentBox::Terminal => boxes.min_terminal,
+            AgentBox::Helper => boxes.min_helper,
+        };
+        if !min || bar_y >= diff.y + diff.height {
+            continue;
+        }
+        let bar = Rect::new(diff.x, bar_y, diff.width, MIN_BAR_HEIGHT);
+        match b {
+            AgentBox::Diff => d_rect = bar,
+            AgentBox::Terminal => t_rect = bar,
+            AgentBox::Helper => h_rect = bar,
+        }
+        bar_y += MIN_BAR_HEIGHT;
+    }
+
+    (d_rect, t_rect, h_rect)
 }
 
 /// Minimum Agent-changes height before it splits into diff + terminal + helper.
@@ -348,6 +462,95 @@ mod tests {
         assert_eq!(top, diff);
         assert_eq!((term.width, term.height), (0, 0));
         assert_eq!((helper.width, helper.height), (0, 0));
+    }
+
+    // ---- Agent-changes sub-box zoom / minimize (S26) ----
+
+    fn empty(r: Rect) -> bool {
+        r.width == 0 || r.height == 0
+    }
+
+    #[test]
+    fn agent_default_equals_the_plain_split() {
+        for diff in [Rect::new(60, 2, 40, 20), Rect::new(0, 0, 40, 6), Rect::new(3, 1, 80, 30)] {
+            assert_eq!(
+                split_agent_changes_with(diff, AgentBoxes::default()),
+                split_agent_changes(diff),
+                "{diff:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn agent_zoom_fills_the_pane_and_hides_the_others() {
+        let diff = Rect::new(60, 2, 40, 20);
+        let cases = [
+            (AgentBox::Diff, 0usize),
+            (AgentBox::Terminal, 1),
+            (AgentBox::Helper, 2),
+        ];
+        for (box_, idx) in cases {
+            let boxes = AgentBoxes { zoom: Some(box_), ..Default::default() };
+            let rects = {
+                let (d, t, h) = split_agent_changes_with(diff, boxes);
+                [d, t, h]
+            };
+            assert_eq!(rects[idx], diff, "zoomed {box_:?} fills the pane");
+            for (i, r) in rects.iter().enumerate() {
+                if i != idx {
+                    assert!(empty(*r), "hidden box {i} is zero-size when {box_:?} is zoomed");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn agent_minimize_one_box_gives_it_one_row_and_the_others_share_the_rest() {
+        let diff = Rect::new(60, 2, 40, 20);
+        // Minimize the terminal: it becomes a one-row bar; diff and helper stay.
+        let boxes = AgentBoxes { min_terminal: true, ..Default::default() };
+        let (d, t, h) = split_agent_changes_with(diff, boxes);
+        assert_eq!(t.height, MIN_BAR_HEIGHT, "minimized terminal is a title bar");
+        assert!(!empty(d) && !empty(h), "diff and helper remain visible");
+        // No overlap and within the pane.
+        for (a, b) in [(d, t), (d, h), (t, h)] {
+            assert!(empty(a) || empty(b) || !a.intersects(b), "{a:?} overlaps {b:?}");
+        }
+        for r in [d, t, h] {
+            assert!(diff.union(r) == diff, "{r:?} escapes the pane {diff:?}");
+        }
+    }
+
+    #[test]
+    fn agent_boxes_never_overlap_and_stay_within_bounds_for_all_combinations() {
+        for diff in [Rect::new(60, 2, 40, 20), Rect::new(0, 0, 50, 24), Rect::new(10, 5, 30, 14)] {
+            // Zoom of each box, plus every minimize subset that leaves one box up.
+            let mut cases: Vec<AgentBoxes> = vec![AgentBoxes::default()];
+            for z in [AgentBox::Diff, AgentBox::Terminal, AgentBox::Helper] {
+                cases.push(AgentBoxes { zoom: Some(z), ..Default::default() });
+            }
+            for mask in 0u8..8 {
+                // Skip all-three-minimized (the app refuses it).
+                if mask == 7 {
+                    continue;
+                }
+                cases.push(AgentBoxes {
+                    zoom: None,
+                    min_diff: mask & 1 != 0,
+                    min_terminal: mask & 2 != 0,
+                    min_helper: mask & 4 != 0,
+                });
+            }
+            for boxes in cases {
+                let (d, t, h) = split_agent_changes_with(diff, boxes);
+                for (a, b) in [(d, t), (d, h), (t, h)] {
+                    assert!(empty(a) || empty(b) || !a.intersects(b), "{boxes:?} {a:?} overlaps {b:?}");
+                }
+                for r in [d, t, h] {
+                    assert!(empty(r) || diff.union(r) == diff, "{boxes:?} {r:?} escapes {diff:?}");
+                }
+            }
+        }
     }
 
     #[test]

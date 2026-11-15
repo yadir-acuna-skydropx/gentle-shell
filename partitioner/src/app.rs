@@ -21,7 +21,7 @@ use crate::editor::{Editor, SaveOutcome};
 use crate::gitgraph::{self, GitGraphData};
 use crate::highlight::{self, Highlighter};
 use crate::icons::{self, IconMode};
-use crate::layout::{self, Layout, Mode, Pane};
+use crate::layout::{self, AgentBox, AgentBoxes, Layout, Mode, Pane};
 use crate::pane::{self, PtyPane};
 use crate::predict::{Engine, PredictMode};
 use crate::tree::{self, Entry, GitStatus};
@@ -194,6 +194,19 @@ pub struct TitleButton {
     pub zoom_range: (u16, u16),
 }
 
+/// A clickable minimize / zoom button on an Agent-changes sub-box top border
+/// (S26). Captured during draw so a click runs the action even when the box is
+/// not focused, mirroring [`TitleButton`] for the three sub-boxes.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentBoxButton {
+    pub box_: AgentBox,
+    pub row: u16,
+    /// `[start, end)` columns of the minimize button.
+    pub min_range: (u16, u16),
+    /// `[start, end)` columns of the zoom button.
+    pub zoom_range: (u16, u16),
+}
+
 /// The code region to explain plus its surrounding context (S17).
 struct ExplainTarget {
     path: String,
@@ -277,6 +290,15 @@ fn pane_focus(pane: Pane) -> Focus {
     }
 }
 
+/// Focus target for an Agent-changes sub-box (S26).
+fn agent_box_focus(box_: AgentBox) -> Focus {
+    match box_ {
+        AgentBox::Diff => Focus::Diff,
+        AgentBox::Terminal => Focus::Terminal,
+        AgentBox::Helper => Focus::Helper,
+    }
+}
+
 pub struct App {
     pub root: PathBuf,
     /// Mode the user asked for; the layout may degrade it on small terminals.
@@ -350,6 +372,16 @@ pub struct App {
     pub title_buttons: Vec<TitleButton>,
     /// Minimized pane regions captured in the last draw; a click restores them.
     pub minimized_regions: Vec<(Pane, Rect)>,
+    /// Zoomed Agent-changes sub-box (S26); `None` for the normal three-way split.
+    pub agent_zoom: Option<AgentBox>,
+    /// Per-sub-box minimized flags for the Agent-changes pane (S26).
+    pub agent_min_diff: bool,
+    pub agent_min_terminal: bool,
+    pub agent_min_helper: bool,
+    /// Sub-box minimize/zoom buttons captured in the last draw (S26).
+    pub agent_buttons: Vec<AgentBoxButton>,
+    /// Minimized sub-box regions captured in the last draw; a click restores them.
+    pub agent_regions: Vec<(AgentBox, Rect)>,
     /// Code-explainer popup state (S17).
     pub explain: ExplainUi,
     /// Architecture overlay state (S18).
@@ -421,6 +453,12 @@ impl App {
             min_chat: false,
             title_buttons: Vec::new(),
             minimized_regions: Vec::new(),
+            agent_zoom: None,
+            agent_min_diff: false,
+            agent_min_terminal: false,
+            agent_min_helper: false,
+            agent_buttons: Vec::new(),
+            agent_regions: Vec::new(),
             explain: ExplainUi::default(),
             arch: ArchUi::default(),
             helper: ExplainUi::default(),
@@ -521,6 +559,16 @@ impl App {
             min_editor: self.min_editor,
             min_diff: self.min_diff,
             min_chat: self.min_chat,
+        }
+    }
+
+    /// Per-sub-box zoom / minimize state to feed the Agent-changes split (S26).
+    pub fn agent_boxes(&self) -> AgentBoxes {
+        AgentBoxes {
+            zoom: self.agent_zoom,
+            min_diff: self.agent_min_diff,
+            min_terminal: self.agent_min_terminal,
+            min_helper: self.agent_min_helper,
         }
     }
 
@@ -659,6 +707,102 @@ impl App {
         }
     }
 
+    /// The Agent-changes sub-box the focus currently belongs to, if any (S26).
+    fn focused_agent_box(&self) -> Option<AgentBox> {
+        match self.effective_focus() {
+            Focus::Diff => Some(AgentBox::Diff),
+            Focus::Terminal => Some(AgentBox::Terminal),
+            Focus::Helper => Some(AgentBox::Helper),
+            _ => None,
+        }
+    }
+
+    fn is_agent_min(&self, box_: AgentBox) -> bool {
+        match box_ {
+            AgentBox::Diff => self.agent_min_diff,
+            AgentBox::Terminal => self.agent_min_terminal,
+            AgentBox::Helper => self.agent_min_helper,
+        }
+    }
+
+    fn set_agent_min(&mut self, box_: AgentBox, value: bool) {
+        match box_ {
+            AgentBox::Diff => self.agent_min_diff = value,
+            AgentBox::Terminal => self.agent_min_terminal = value,
+            AgentBox::Helper => self.agent_min_helper = value,
+        }
+    }
+
+    fn agent_unminimized_count(&self) -> usize {
+        AgentBox::ALL.iter().filter(|b| !self.is_agent_min(**b)).count()
+    }
+
+    /// prefix `z` on the terminal / helper / diff sub-box: toggle its zoom
+    /// (S26). Zooming a box also zooms the diff pane so the box fills the
+    /// whole screen; un-zooming restores both.
+    pub fn agent_zoom_focused(&mut self) {
+        if let Some(box_) = self.focused_agent_box() {
+            self.toggle_agent_zoom(box_);
+        }
+    }
+
+    /// Toggles zoom on a specific Agent-changes sub-box and focuses it.
+    pub fn toggle_agent_zoom(&mut self, box_: AgentBox) {
+        if self.agent_zoom == Some(box_) {
+            self.agent_zoom = None;
+            // Leave the diff pane zoom as it was unless we set it ourselves.
+            if self.zoom == Some(Pane::Diff) {
+                self.zoom = None;
+            }
+        } else {
+            self.agent_zoom = Some(box_);
+            // Fill the screen: the Agent-changes (diff) pane zooms too (S26).
+            self.zoom = Some(Pane::Diff);
+            self.focus = agent_box_focus(box_);
+        }
+    }
+
+    /// prefix `m` on the terminal / helper / diff sub-box: toggle its minimize
+    /// (S26). Minimizing the last visible sub-box is refused; focus moves off a
+    /// box we minimize.
+    pub fn agent_minimize_focused(&mut self) {
+        if let Some(box_) = self.focused_agent_box() {
+            self.toggle_agent_minimize(box_);
+        }
+    }
+
+    /// Minimizes a sub-box, or restores it when already minimized.
+    pub fn toggle_agent_minimize(&mut self, box_: AgentBox) {
+        if self.is_agent_min(box_) {
+            self.set_agent_min(box_, false);
+            return;
+        }
+        if self.agent_unminimized_count() <= 1 {
+            self.status_msg = Some("can\u{2019}t minimize the last visible box".into());
+            return;
+        }
+        self.set_agent_min(box_, true);
+        // A zoomed box that we minimize gives up its zoom.
+        if self.agent_zoom == Some(box_) {
+            self.agent_zoom = None;
+        }
+        if self.focused_agent_box() == Some(box_) {
+            self.focus = self.next_agent_focus(box_);
+        }
+    }
+
+    /// Next non-minimized Agent-changes sub-box after `from`, as a focus target.
+    fn next_agent_focus(&self, from: AgentBox) -> Focus {
+        let idx = AgentBox::ALL.iter().position(|b| *b == from).unwrap_or(0);
+        for off in 1..=3 {
+            let b = AgentBox::ALL[(idx + off) % 3];
+            if !self.is_agent_min(b) {
+                return agent_box_focus(b);
+            }
+        }
+        Focus::Diff
+    }
+
     pub fn open_file(&mut self, rel: &Path) {
         // A dirty buffer is not discarded on the first open of a new target:
         // warn and only switch when the same target is opened again.
@@ -772,6 +916,8 @@ impl App {
             && matches!(self.effective_focus(), Focus::Sidebar | Focus::Diff)
         {
             self.zoom = None;
+            // A diff-pane Esc also drops any Agent-changes sub-box zoom (S26).
+            self.agent_zoom = None;
             return Action::None;
         }
 
@@ -1316,11 +1462,21 @@ impl App {
                 Action::None
             }
             KeyCode::Char('z') => {
-                self.zoom_focused();
+                // On the Agent-changes sub-boxes, zoom that box (S26); other
+                // panes keep the pane-level zoom (S14).
+                if self.mode == Mode::Workspace && self.focused_agent_box().is_some() {
+                    self.agent_zoom_focused();
+                } else {
+                    self.zoom_focused();
+                }
                 Action::None
             }
             KeyCode::Char('m') => {
-                self.minimize_focused();
+                if self.mode == Mode::Workspace && self.focused_agent_box().is_some() {
+                    self.agent_minimize_focused();
+                } else {
+                    self.minimize_focused();
+                }
                 Action::None
             }
             KeyCode::Char('d') => {
@@ -2130,6 +2286,29 @@ impl App {
                 return Action::None;
             }
         }
+        // Agent-changes sub-box minimize / zoom buttons act on their box even
+        // when it is not focused (S26); checked before the click-to-focus so a
+        // click on a button is not swallowed by the region underneath.
+        for b in self.agent_buttons.clone() {
+            if row == b.row {
+                if col >= b.min_range.0 && col < b.min_range.1 {
+                    self.toggle_agent_minimize(b.box_);
+                    return Action::None;
+                }
+                if col >= b.zoom_range.0 && col < b.zoom_range.1 {
+                    self.toggle_agent_zoom(b.box_);
+                    return Action::None;
+                }
+            }
+        }
+        // A click on a minimized sub-box title bar restores it (S26).
+        for (box_, rect) in self.agent_regions.clone() {
+            if rect_contains(rect, col, row) {
+                self.set_agent_min(box_, false);
+                self.focus = agent_box_focus(box_);
+                return Action::None;
+            }
+        }
         // The terminal and helper sub-regions of the Agent-changes pane focus
         // on click (S24); checked before the diff so their rects win.
         if let Some(term) = self.term_area {
@@ -2442,6 +2621,41 @@ fn draw_title_buttons(frame: &mut Frame, pane: Pane, rect: Rect, icons: IconMode
     buf.set_string(start, row, min_s, style);
     buf.set_string(start + min_w, row, zoom_s, style);
     Some(TitleButton { pane, row, min_range: (start, start + min_w), zoom_range: (start + min_w, start + total) })
+}
+
+/// Columns an Agent-changes sub-box must leave free at its right end when its
+/// top border coincides with the pane's, so the pane-level diff buttons keep
+/// their place (S26): both button pairs plus a one-column gap.
+fn agent_button_reserve(icons: IconMode) -> u16 {
+    let (min_s, zoom_s) = button_labels(icons);
+    min_s.chars().count() as u16 + zoom_s.chars().count() as u16 + 1
+}
+
+/// Draws the minimize/zoom buttons on an Agent-changes sub-box top border and
+/// returns their click target, or `None` when the box is too narrow (S26).
+/// `reserve_right` keeps room for the pane-level buttons on a shared border.
+fn draw_agent_buttons(
+    frame: &mut Frame,
+    box_: AgentBox,
+    rect: Rect,
+    icons: IconMode,
+    focused: bool,
+    reserve_right: u16,
+) -> Option<AgentBoxButton> {
+    let (min_s, zoom_s) = button_labels(icons);
+    let min_w = min_s.chars().count() as u16;
+    let total = min_w + zoom_s.chars().count() as u16;
+    // Keep the title readable: drop the buttons before squeezing it out.
+    if rect.height == 0 || rect.width < total + reserve_right + 4 {
+        return None;
+    }
+    let row = rect.y;
+    let start = rect.x + rect.width - 1 - reserve_right - total;
+    let style = if focused { Style::default().fg(Color::Cyan) } else { Style::default().fg(Color::DarkGray) };
+    let buf = frame.buffer_mut();
+    buf.set_string(start, row, min_s, style);
+    buf.set_string(start + min_w, row, zoom_s, style);
+    Some(AgentBoxButton { box_, row, min_range: (start, start + min_w), zoom_range: (start + min_w, start + total) })
 }
 
 /// Draws the apps-panel header controls on its top border and returns their
@@ -3090,46 +3304,67 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
     }
 
     if let Some(df) = l.diff {
+        app.agent_buttons.clear();
+        app.agent_regions.clear();
         if l.is_minimized(Pane::Diff) {
             draw_min_bar(frame, "Agent changes", df, focus == Focus::Diff, app.icons);
             app.term_area = None;
             app.helper_area = None;
         } else {
-        // The Agent-changes pane always splits into the diff (top), an
-        // interactive $SHELL terminal (bottom-left) and the command helper
-        // (bottom-right) (S24). A short pane keeps the diff whole.
-        let (top, term, helper) = layout::split_agent_changes(df);
+        // The Agent-changes pane splits into the diff (top), an interactive
+        // $SHELL terminal (bottom-left) and the command helper (bottom-right)
+        // (S24); each sub-box can be zoomed to fill the pane or minimized to a
+        // one-row title bar (S26). A short pane keeps the diff whole.
+        let boxes = app.agent_boxes();
+        let (drect, trect, hrect) = layout::split_agent_changes_with(df, boxes);
+        // Room reserved on a sub-box border that shares the pane's top border
+        // for the pane-level diff [_]/[□] buttons painted later (S26).
+        let reserve_for = |rect: Rect| if rect.y == df.y { agent_button_reserve(app.icons) } else { 0 };
+
         // Top: the agent's changes (read-only).
-        let diff_block = pane_block(" Agent changes ".into(), focus == Focus::Diff);
-        match &app.viewer {
-            Some(v) => {
-                let lines: Vec<Line> = v
-                    .diff
-                    .iter()
-                    .skip(v.diff_scroll)
-                    .take(top.height as usize)
-                    .map(|d| {
-                        let style = match d.kind {
-                            DiffKind::Added => Style::default().fg(Color::Green),
-                            DiffKind::Removed => Style::default().fg(Color::Red),
-                            DiffKind::Hunk => Style::default().fg(Color::Cyan),
-                            DiffKind::Meta => Style::default().fg(Color::DarkGray),
-                            DiffKind::Context => Style::default(),
-                        };
-                        Line::styled(d.text.clone(), style)
-                    })
-                    .collect();
-                frame.render_widget(Paragraph::new(lines).block(diff_block), top);
+        if boxes.min_diff {
+            draw_min_bar(frame, "Agent changes", drect, focus == Focus::Diff, app.icons);
+            app.agent_regions.push((AgentBox::Diff, drect));
+        } else if drect.width > 0 && drect.height > 0 {
+            let diff_block = pane_block(" Agent changes ".into(), focus == Focus::Diff);
+            match &app.viewer {
+                Some(v) => {
+                    let lines: Vec<Line> = v
+                        .diff
+                        .iter()
+                        .skip(v.diff_scroll)
+                        .take(drect.height as usize)
+                        .map(|d| {
+                            let style = match d.kind {
+                                DiffKind::Added => Style::default().fg(Color::Green),
+                                DiffKind::Removed => Style::default().fg(Color::Red),
+                                DiffKind::Hunk => Style::default().fg(Color::Cyan),
+                                DiffKind::Meta => Style::default().fg(Color::DarkGray),
+                                DiffKind::Context => Style::default(),
+                            };
+                            Line::styled(d.text.clone(), style)
+                        })
+                        .collect();
+                    frame.render_widget(Paragraph::new(lines).block(diff_block), drect);
+                }
+                None => {
+                    frame.render_widget(Paragraph::new("").block(diff_block), drect);
+                }
             }
-            None => {
-                frame.render_widget(Paragraph::new("").block(diff_block), top);
+            if let Some(tb) = draw_agent_buttons(frame, AgentBox::Diff, drect, app.icons, focus == Focus::Diff, reserve_for(drect)) {
+                app.agent_buttons.push(tb);
             }
         }
-        if term.width > 0 && term.height > 0 {
-            // Bottom-left: the interactive shell PTY.
+
+        // Bottom-left: the interactive shell PTY.
+        if boxes.min_terminal {
+            draw_min_bar(frame, "Terminal · $SHELL", trect, focus == Focus::Terminal, app.icons);
+            app.agent_regions.push((AgentBox::Terminal, trect));
+            app.term_area = None;
+        } else if trect.width > 0 && trect.height > 0 {
             let tblock = pane_block(" Terminal · $SHELL ".into(), focus == Focus::Terminal);
-            let tinner = tblock.inner(term);
-            frame.render_widget(tblock, term);
+            let tinner = tblock.inner(trect);
+            frame.render_widget(tblock, trect);
             match shell {
                 Some(sh) if sh.is_alive() => sh.with_screen(|screen| {
                     pane::render_screen(screen, tinner, frame.buffer_mut());
@@ -3151,16 +3386,30 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
                 ),
             }
             app.term_area = Some(tinner);
-            // Bottom-right: the command helper (S24) — streamed Haiku answer +
-            // a question input line; it reads the terminal's recent output.
+            if let Some(tb) = draw_agent_buttons(frame, AgentBox::Terminal, trect, app.icons, focus == Focus::Terminal, reserve_for(trect)) {
+                app.agent_buttons.push(tb);
+            }
+        } else {
+            app.term_area = None;
+        }
+
+        // Bottom-right: the command helper (S24) — streamed Haiku answer + a
+        // question input line; it reads the terminal's recent output.
+        if boxes.min_helper {
+            draw_min_bar(frame, "Helper", hrect, focus == Focus::Helper, app.icons);
+            app.agent_regions.push((AgentBox::Helper, hrect));
+            app.helper_area = None;
+        } else if hrect.width > 0 && hrect.height > 0 {
             let hblock = pane_block(" Helper · type + Enter ".into(), focus == Focus::Helper);
-            let hinner = hblock.inner(helper);
-            frame.render_widget(hblock, helper);
+            let hinner = hblock.inner(hrect);
+            frame.render_widget(hblock, hrect);
             let hlines = explain_lines(&app.helper, hinner.width as usize, hinner.height as usize, app.blink_on);
             frame.render_widget(Paragraph::new(hlines), hinner);
             app.helper_area = Some(hinner);
+            if let Some(tb) = draw_agent_buttons(frame, AgentBox::Helper, hrect, app.icons, focus == Focus::Helper, reserve_for(hrect)) {
+                app.agent_buttons.push(tb);
+            }
         } else {
-            app.term_area = None;
             app.helper_area = None;
         }
         }
@@ -3360,6 +3609,9 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "        ↑↓ PgUp PgDn scroll the diff · click the terminal/helper to focus".into(),
         "        terminal: run commands (touch, mkdir, background jobs) · Esc back".into(),
         "        helper: type a question + Enter — Haiku recommends commands · Esc back".into(),
+        "        with the diff/terminal/helper focused: z maximize that box · m".into(),
+        "        minimize it to a title bar; each box has [_]/[□] buttons, click a".into(),
+        "        minimized box to restore it (S26).".into(),
         "Apps: ↑↓ select · Enter app→items→reply · a actions (open) · Esc back".into(),
         "      +/- resize the expanded panel (40-70%) · click an app to open it".into(),
         "      header: [_] collapse · [□] expand · click “Apps” to toggle".into(),
@@ -3856,6 +4108,80 @@ mod tests {
         assert_eq!(app.focus, Focus::Helper);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.focus, Focus::Diff);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prefix_z_with_terminal_focus_fills_the_agent_pane() {
+        // S26: zooming the terminal sub-box fills the whole Agent-changes pane
+        // (which also zooms the diff pane so it fills the screen); the helper
+        // region is then hidden.
+        let (root, mut app) = workspace("agent-zoom-terminal");
+        render(&mut app, 120, 40);
+        let term = app.term_area.expect("terminal region captured in the draw");
+        app.handle_mouse(click(term.x, term.y));
+        assert_eq!(app.focus, Focus::Terminal);
+        prefix_key(&mut app, 'z');
+        assert_eq!(app.agent_zoom, Some(layout::AgentBox::Terminal));
+        assert_eq!(app.zoom, Some(Pane::Diff), "the diff pane is zoomed so the box fills the screen");
+        render(&mut app, 120, 40);
+        let pane = app.layout.unwrap().diff.expect("diff pane fills the body");
+        let inner = Block::default().borders(Borders::ALL).inner(pane);
+        let filled = app.term_area.expect("terminal region captured");
+        assert_eq!((filled.width, filled.height), (inner.width, inner.height), "terminal fills the pane");
+        assert_eq!(app.helper_area, None, "the helper is hidden while the terminal is zoomed");
+        // Toggle off restores the split and the pane zoom.
+        prefix_key(&mut app, 'z');
+        assert_eq!((app.agent_zoom, app.zoom), (None, None));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn prefix_m_with_helper_focus_minimizes_it_and_the_terminal_grows() {
+        // S26: minimizing the helper collapses it to a title bar (helper_area
+        // becomes None) and the terminal grows into the freed width.
+        let (root, mut app) = workspace("agent-min-helper");
+        render(&mut app, 120, 40);
+        let term0 = app.term_area.expect("terminal region captured");
+        let helper = app.helper_area.expect("helper region captured");
+        app.handle_mouse(click(helper.x, helper.y));
+        assert_eq!(app.focus, Focus::Helper);
+        prefix_key(&mut app, 'm');
+        assert!(app.agent_min_helper, "helper minimized");
+        assert_ne!(app.focus, Focus::Helper, "focus moves off the minimized box");
+        render(&mut app, 120, 40);
+        assert_eq!(app.helper_area, None, "a minimized helper keeps no live region");
+        let term1 = app.term_area.expect("terminal still drawn");
+        assert!(term1.width > term0.width, "the terminal grew into the freed width");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clicking_an_agent_box_title_button_toggles_it() {
+        // S26: each sub-box's [_]/[□] buttons act on a click, like the panes.
+        let (root, mut app) = workspace("agent-box-buttons");
+        render(&mut app, 120, 40);
+        let z = app
+            .agent_buttons
+            .iter()
+            .find(|b| b.box_ == layout::AgentBox::Terminal)
+            .copied()
+            .expect("terminal box buttons");
+        app.handle_mouse(click(z.zoom_range.0, z.row));
+        assert_eq!(app.agent_zoom, Some(layout::AgentBox::Terminal));
+        assert_eq!(app.focus, Focus::Terminal);
+        // Un-zoom with z (focus followed the zoom), then the split returns.
+        prefix_key(&mut app, 'z');
+        assert_eq!(app.agent_zoom, None);
+        render(&mut app, 120, 40);
+        let m = app
+            .agent_buttons
+            .iter()
+            .find(|b| b.box_ == layout::AgentBox::Helper)
+            .copied()
+            .expect("helper box buttons");
+        app.handle_mouse(click(m.min_range.0, m.row));
+        assert!(app.agent_min_helper, "the helper [_] button minimizes it");
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -5234,8 +5560,12 @@ mod tests {
         prefix_key(&mut app, 'm'); // sidebar
         prefix_key(&mut app, '2');
         prefix_key(&mut app, 'm'); // editor
-        prefix_key(&mut app, '3');
-        prefix_key(&mut app, 'm'); // diff
+        // The diff is the Agent-changes pane: prefix m on it drives the diff
+        // sub-box now (S26), so minimize the whole pane via its title button.
+        render(&mut app, 120, 40);
+        let d = app.title_buttons.iter().find(|b| b.pane == Pane::Diff).copied().expect("diff pane buttons");
+        app.handle_mouse(click(d.min_range.0, d.row));
+        assert!(app.min_diff, "diff pane minimized via its title button");
         assert_eq!(app.unminimized_count(), 1);
         prefix_key(&mut app, '4'); // focus chat (the last visible)
         prefix_key(&mut app, 'm');
