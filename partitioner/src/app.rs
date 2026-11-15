@@ -876,6 +876,23 @@ impl App {
                 self.helper.question.pop();
                 Action::None
             }
+            // Scroll the streamed answer (lines up from the bottom), like explain.
+            KeyCode::Up => {
+                self.helper.scroll += 1;
+                Action::None
+            }
+            KeyCode::Down => {
+                self.helper.scroll = self.helper.scroll.saturating_sub(1);
+                Action::None
+            }
+            KeyCode::PageUp => {
+                self.helper.scroll += 10;
+                Action::None
+            }
+            KeyCode::PageDown => {
+                self.helper.scroll = self.helper.scroll.saturating_sub(10);
+                Action::None
+            }
             KeyCode::Char(c) if !ctrl => {
                 self.helper.question.push(c);
                 Action::None
@@ -2208,6 +2225,16 @@ impl App {
                     let idx = rel - 1;
                     if idx < self.apps.visible_items().len() {
                         self.apps.set_visible_sel(idx);
+                        // A click on an item acts like Enter (expand a section,
+                        // open its menu or the reply box), matching the
+                        // keyboard (L67). Not while a menu/confirm or the reply
+                        // editor is open, where a click only selects.
+                        if self.apps.view == View::Items && self.apps.menu.is_none() && self.apps.confirm.is_none() {
+                            if self.mode == Mode::Workspace && self.overlay.is_none() {
+                                self.focus = Focus::Apps;
+                            }
+                            return self.apps_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+                        }
                     }
                 }
             }
@@ -2234,6 +2261,19 @@ impl App {
     }
 
     fn mouse_wheel(&mut self, col: u16, row: u16, dir: isize) -> Action {
+        // The explain popup is modal: the wheel scrolls its text (L67).
+        // `scroll` counts lines up from the bottom, so wheel-up (dir < 0) adds.
+        if self.overlay == Some(Overlay::Explain) {
+            self.explain.scroll = (self.explain.scroll as isize - dir * 3).max(0) as usize;
+            return Action::None;
+        }
+        // The Agent-changes helper box sits inside the diff rect: check it first.
+        if let Some(h) = self.helper_area {
+            if self.overlay.is_none() && rect_contains(h, col, row) {
+                self.helper.scroll = (self.helper.scroll as isize - dir * 3).max(0) as usize;
+                return Action::None;
+            }
+        }
         let Some(l) = self.layout else { return Action::None };
         if let Some(tree) = self.tree_area {
             if rect_contains(tree, col, row) {
@@ -4855,6 +4895,55 @@ mod tests {
         assert_eq!(app.apps.view, View::Items);
         app.handle_key(key(KeyCode::Esc));
         assert_eq!(app.apps.view, View::Apps);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clicking_a_github_section_expands_it_like_enter() {
+        // L67: with the mouse a section row must expand, not only highlight.
+        let root = fixture("gh-click");
+        let mut app = App::new(root.clone());
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("github", "GitHub", AppStatusKind::Connected)] });
+        app.apply_apps_msg(EngineMsg::Items {
+            app: "github".into(),
+            items: vec![expandable("sec:repos", "Repositories (1)", "section")],
+        });
+        render(&mut app, 120, 40);
+        app.handle_key(key(KeyCode::Enter)); // into the app
+        render(&mut app, 120, 40);
+        let ap = app.apps_area.expect("apps panel region");
+        // Row 0 inside the border is the header; the first item is the next row.
+        match app.handle_mouse(click(ap.x + 2, ap.y + 2)) {
+            Action::Apps(ClientMsg::Expand { item, .. }) => assert_eq!(item, "sec:repos"),
+            other => panic!("expected an expand from the click, got {other:?}"),
+        }
+        assert_eq!(app.apps.nav.len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn wheel_scrolls_the_explain_popup_and_keys_scroll_the_helper() {
+        // L67: the wheel scrolls the open explain popup (not the chat behind),
+        // and the helper box scrolls with the arrows.
+        let (root, mut app) = workspace("explain-wheel");
+        app.overlay = Some(Overlay::Explain);
+        app.explain.body = "line\n".repeat(200);
+        render(&mut app, 120, 40);
+        let up = MouseEvent { kind: MouseEventKind::ScrollUp, column: 60, row: 20, modifiers: KeyModifiers::NONE };
+        assert_eq!(app.handle_mouse(up), Action::None, "the wheel must not reach the chat");
+        assert_eq!(app.explain.scroll, 3);
+        let down = MouseEvent { kind: MouseEventKind::ScrollDown, column: 60, row: 20, modifiers: KeyModifiers::NONE };
+        app.handle_mouse(down);
+        assert_eq!(app.explain.scroll, 0);
+        app.overlay = None;
+        app.focus = Focus::Helper;
+        app.handle_key(key(KeyCode::Up));
+        app.handle_key(key(KeyCode::PageUp));
+        assert_eq!(app.helper.scroll, 11);
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.helper.scroll, 10);
         fs::remove_dir_all(root).unwrap();
     }
 
