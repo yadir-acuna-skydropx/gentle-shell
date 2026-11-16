@@ -11,6 +11,109 @@ Each partition is a render of its own terminal, composed into a single visual
 component (S3): when one pane needs to update, the whole terminal is not
 repainted — only the changed cells of that fragment are written out.
 
+## Install / update everything (S33)
+
+One idempotent, user-space installer brings up the whole stack on a fresh
+server or laptop — **no sudo**. It installs gentle-shell (which itself pins and
+installs **gentle-ai** and **Engram**), the Rust toolchain if `cargo` is
+missing, every partitioner engine, the `gentle-shell` launcher, and the pinned,
+SHA-256-verified security tools (gitleaks, osv-scanner, trivy, cargo-audit,
+semgrep). It never modifies gentle-shell sources (S1).
+
+Fresh machine — one flow:
+
+```sh
+git clone https://github.com/<your-fork>/gentle-shell.git
+cd gentle-shell
+git checkout feat/gentle-partitioner
+partitioner/scripts/install.sh
+```
+
+Then finish the one-time manual steps the installer lists at the end (Anthropic
+key, `gh auth login`, a Nerd Font, `source ~/.bashrc`, …).
+
+Keep it up to date (safe to run from cron — fast-forward only, never reset):
+
+```sh
+partitioner/scripts/update.sh          # = install.sh --update
+```
+
+The updater fetches and **fast-forwards the current branch only when the
+worktree is clean**, runs `gentle-shell upgrade`, rebuilds the engines only when
+the checked-out commit changed (recorded in
+`~/.local/state/gentle-partitioner/installed-commit`; `--force` overrides), and
+bumps a security tool only when its pinned version in
+`partitioner/scripts/lib/tools.sh` changed.
+
+Useful flags:
+
+| Flag | Effect |
+| --- | --- |
+| `--dry-run` | print every command without executing anything |
+| `--force` | rebuild/reinstall even when nothing changed |
+| `--update` | refresh everything (what `update.sh` passes) |
+| `--no-security-tools` | skip gitleaks/osv-scanner/trivy/cargo-audit/semgrep |
+
+Everything lands under `$HOME`: engines in `~/.cargo/bin`, release tools in
+`~/.local/bin`, a dedicated semgrep venv in
+`~/.local/share/gentle-partitioner/semgrep-venv`. Security-tool versions and
+their expected checksums are pinned in `partitioner/scripts/lib/tools.sh`; each
+download is verified **before** it is extracted, a mismatch refuses that tool,
+and any single tool failure is reported in the final summary without aborting
+the install. Test the scripts (syntax, shellcheck, dry-run plan, and the
+checksum-refuse path — no real downloads) with
+`partitioner/scripts/test-install.sh`.
+
+### gentle-sec engine (S35)
+
+`gentle-sec` scans the repo with whatever tools are installed on PATH
+(Semgrep, OSV-Scanner, cargo-audit, Gitleaks, Trivy). Missing tools are
+reported, never fatal; everything runs offline and without a shell.
+
+    gentle-sec scan [PATH] [--staged] [--fail-on low|medium|high|critical] [--json]
+    gentle-sec list                 # saved reports, newest first
+    gentle-sec show <id>            # print a report's summary.md
+    gentle-sec hook install         # pre-commit hook (chains an existing one)
+    gentle-sec hook uninstall       # remove it (restores a chained original)
+    gentle-sec hook status
+
+Reports are written to `<repo>/.gentle/security/<UTC timestamp>/` as
+`report.json`, `report.sarif` (SARIF 2.1.0) and `summary.md`. Findings are
+normalized with severity, CWE and OWASP Top 10 2021 category; secrets are
+always redacted. `.gentle/` is added to `.git/info/exclude` so reports are
+never committed.
+
+The pre-commit hook runs `gentle-sec scan --staged --fail-on high`; a finding
+at or above `high` blocks the commit. Bypass once with `git commit --no-verify`.
+
+In the partitioner, the **Ciberseguridad** app lists these reports (expand into
+findings grouped by severity), opens a report summary or finding detail in the
+reader, and offers **Scan now** and **Install pre-commit hook** actions. Its
+status line shows which scanners are installed.
+
+### gentle-session (S34)
+
+`gentle-session` keeps the partitioner (and its gentle-shell children, shell and
+engines) running after you close the terminal or lose SSH. Reopen `gentle-shell`
+in the same folder to reattach.
+
+- `gentle-session attach [--dir DIR] -- <cmd...>` — attach to the folder's live
+  session or spawn a detached one running `<cmd>` in a PTY.
+- `gentle-session list` — folder, pid, age, attached?
+- `gentle-session kill [--dir DIR]` — terminate the session for a folder.
+
+The launcher wraps the partitioner automatically when `gentle-session` is on
+PATH.
+- **Detach without killing:** press `Ctrl+\` twice. The session keeps running.
+- **Opt out:** set `GENTLE_NO_SESSION=1` to run the partitioner without a session.
+- Only one client attaches at a time; a new attach takes over and the old client
+  is detached with a message.
+
+Sockets live under `$XDG_RUNTIME_DIR/gentle-session/` (fallback
+`~/.local/state/gentle-session/`), dir `0700`, socket `0600`, same-user only
+(SO_PEERCRED), symlinked session dirs refused, no shell invocation. Linux only
+for now.
+
 ## Open it with `gentle-shell` (optional, T26)
 
 By default you launch the partitioner with `gentle-partitioner`. To make the
