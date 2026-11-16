@@ -197,12 +197,19 @@ use the same definitions):
   - `{"type":"items","app":"slack","items":[{"id":"…","title":"#channel · author","text":"…","ts":"…","link":"…"}]}` — the full current item list for one app;
   - `{"type":"result","id":N,"ok":true|false,"error":"…"?}` — the correlated outcome of a `reply`/`refresh`/`expand` request;
   - `{"type":"children","id":N,"app":"github","item":"<item id>","items":[…]}` — the children of an `expand`;
-  - `{"type":"actionresult","id":N,"ok":true|false,"message":"…"?,"error":"…"?}` — the outcome of an `action`.
+  - `{"type":"actionresult","id":N,"ok":true|false,"message":"…"?,"error":"…"?}` — the outcome of an `action` and of the issue `issueedit`/`issuecreate`/`issuebranch`/`issuecommit` requests (S30);
+  - `{"type":"issueform","id":N,"app":"github","item":"…","schema":{…}}` — the editable schema of an issue (or a blank new issue) for the editor overlay (S30): current values + options (repo labels, assignable users, milestones) + Project (v2) fields, with an optional `note` (e.g. the missing-scope hint).
 - **partitioner → engine**
   - `{"type":"reply","id":N,"app":"slack","item":"<item id>","text":"…"}`;
   - `{"type":"refresh","id":N,"app":"slack"}`;
   - `{"type":"expand","id":N,"app":"github","item":"<item id>"}`;
   - `{"type":"action","id":N,"app":"github","item":"<item id>","action":"<action id>"}`;
+  - `{"type":"issueform","id":N,"app":"github","item":"issue:o/r#N"}` — request an issue's editable schema (S30);
+  - `{"type":"newissueform","id":N,"app":"github","repo":"owner/name"}` — request the blank schema/options for a new issue (S30);
+  - `{"type":"issueedit","id":N,"app":"github","item":"issue:o/r#N","edit":{…}}` — apply a form diff (only changed fields + project fields + an optional comment), S30;
+  - `{"type":"issuecreate","id":N,"app":"github","repo":"owner/name","issue":{…}}` — create a new issue (S30);
+  - `{"type":"issuebranch","id":N,"app":"github","item":"issue:o/r#N"}` — create/switch the issue's local branch (S30);
+  - `{"type":"issuecommit","id":N,"app":"github","item":"issue:o/r#N","message":"…"}` — commit the already-staged changes (S30);
   - `{"type":"shutdown"}`.
 - An unknown message type gets a `result` error when it carries an `id`, and is
   ignored otherwise.
@@ -349,9 +356,49 @@ that support it) and shows *copied*; **`o`** opens it in the browser as a
 fallback; **`Esc`** closes. The overlay shows *loading…* until the detail
 arrives and an inline error if the fetch fails.
 
+### Edit issues, Project fields, create, branch & commit (S30)
+
+Issues are **your tickets**: you can fill and change them from the terminal.
+From an issue (in the apps panel or the Reader overlay):
+
+- **`e`** (or the **Edit issue** action) opens the **issue editor overlay**. It
+  lists the editable fields — **Title, Body** (multi-line; **Shift+Enter** inserts
+  a newline), **State** (open/closed toggle), **Assignees** and **Labels**
+  (comma-separated, with the repo's allowed users/labels offered), **Milestone**
+  (pick-list), **Comment** (adds a comment) — followed by the **Project (v2)
+  fields** of every project the issue belongs to: **Status/Type** (single-select
+  pick-list), **Estimate** (number), **Iteration** (pick-list). `↑↓`/`Tab` move,
+  **`Enter`** edits / toggles / opens a pick-list, **`s`** (or **Ctrl+S**) saves,
+  **`Esc`** closes. Saving shows a **confirmation summary listing only the
+  changed fields**; **`y`** sends it. Only the changed fields are sent: issue
+  fields go in a single `PATCH /repos/{o}/{r}/issues/{n}`, the comment in
+  `POST …/comments`, and each project field via the GraphQL
+  `updateProjectV2ItemFieldValue` mutation (an empty value clears it).
+- The **`＋ New issue`** row at the top of **Assigned issues** (press **`e`** or
+  **`Enter`**) opens the same editor empty, with the repo defaulting to the
+  local GitHub remote; saving `POST`s `/repos/{o}/{r}/issues`.
+- **`b`** creates or switches to the issue's **local branch**
+  `<n>-<slug-of-title>` in the partitioner root (confirmation first). Switching
+  to an existing branch refuses on a dirty tree (*working tree has changes — commit
+  or stash first*); it **never** uses `--force` and never pushes.
+- **`c`** commits the **already-staged** changes with a prefilled, editable
+  message `<title> (refs #N)` (change `refs`→`closes` as you like; **Enter**
+  commits, **Esc** cancels). It refuses when nothing is staged
+  (*nothing staged — stage changes first with `git add`*) and **never stages
+  automatically** (`git add -A` is never run) and never pushes.
+
+Every mutating action is **confirmed in the UI** before any request, runs off
+the UI thread in `gentle-apps`, and reports its result in the status line. If
+the `gh` token lacks the Projects scope, project fields are skipped and the
+editor shows *Project fields need: gh auth refresh -s project* instead of
+crashing (today's `gh` scopes are `gist, read:org, repo, workflow`).
+
 ### Actions (with confirmation in the panel)
 
 - **view** — on an issue or PR: returns the reader content as an `EngineMsg::Detail` (plain markdown text) instead of running a side effect; opened first by `Enter`. No confirmation.
+- **edit** — on an issue: opens the issue editor overlay (S30) instead of running a side effect. No confirmation (the save step confirms).
+- **new** — on the `＋ New issue` row: opens the empty editor for a new issue (S30).
+- **issue branch / commit** — reached with `b` / `c` on an issue; both confirm in the UI, operate only on the local repo, never push, never `--force`, never auto-stage (S30).
 - **open** — on a PR, issue, repo, branch or file: opens the github.com URL with `xdg-open` (no shell). No confirmation.
 - **worktree_add** — on a branch, only when the local repo's `origin` matches that GitHub repo (https/ssh URLs are normalized). Runs `git fetch origin <branch>`, then `git worktree add <repo-parent>/<repo-name>-<sanitized-branch> <branch>` (or `-b <branch> origin/<branch>` when there is no local branch). Refuses if the target dir exists; returns the created path. **Confirmation required.**
 - **checkout** — on a branch, only for the local matching repo and only if `git status --porcelain` is empty, else it refuses with *working tree has changes — commit or stash first*. Never uses `--force` and never stashes or discards. **Confirmation required.**

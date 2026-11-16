@@ -217,9 +217,11 @@ impl AppsPanel {
                     });
                 }
             }
-            // The in-terminal reader detail (S27) is handled in `app.rs` before
-            // it reaches the panel, so the panel ignores it here.
+            // The in-terminal reader detail (S27) and the issue editor schema
+            // (S30) are handled in `app.rs` before they reach the panel, so the
+            // panel ignores them here.
             EngineMsg::Detail { .. } => {}
+            EngineMsg::IssueForm { .. } => {}
         }
     }
 

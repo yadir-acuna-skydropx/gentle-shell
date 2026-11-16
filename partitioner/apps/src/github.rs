@@ -17,7 +17,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::connector::{Connector, Result};
 use crate::http::{self, GithubResponse};
-use crate::protocol::{Item, ItemAction, Status};
+use crate::protocol::{
+    FieldOption, IssueFieldEdit, IssueSchema, Item, ItemAction, MilestoneOption, NewIssue, ProjectFieldEdit,
+    ProjectFieldSchema, ProjectSchema, Status,
+};
+use serde_json::{json, Value};
 
 /// Poll every 60 seconds (S15).
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
@@ -404,6 +408,222 @@ pub fn build_detail(
     (window_title, out)
 }
 
+/// The hint shown when the `gh` token lacks the Projects (v2) scope (S30). The
+/// user grants it with this command; project fields never crash the editor.
+pub const PROJECT_SCOPE_HINT: &str = "Project fields need: gh auth refresh -s project";
+
+/// The edit action offered on an issue item (S30); the UI turns it into the
+/// editor overlay rather than a side effect.
+fn edit_action() -> ItemAction {
+    ItemAction { id: "edit".into(), label: "Edit issue".into(), confirm: false }
+}
+
+/// Builds the PATCH body for an issue from a form diff (S30): only the changed
+/// issue fields (title/body/state/assignees/labels/milestone) are included.
+/// `comment` and project fields are applied separately. Returns `None` when no
+/// PATCH-able field changed, so no request is sent.
+pub fn issue_edit_payload(edit: &IssueFieldEdit) -> Option<String> {
+    let mut obj = serde_json::Map::new();
+    if let Some(t) = &edit.title {
+        obj.insert("title".into(), json!(t));
+    }
+    if let Some(b) = &edit.body {
+        obj.insert("body".into(), json!(b));
+    }
+    if let Some(s) = &edit.state {
+        obj.insert("state".into(), json!(s));
+    }
+    if let Some(a) = &edit.assignees {
+        obj.insert("assignees".into(), json!(a));
+    }
+    if let Some(l) = &edit.labels {
+        obj.insert("labels".into(), json!(l));
+    }
+    match edit.milestone {
+        // Some(0) clears the milestone (null); Some(n) sets it; None leaves it.
+        Some(0) => {
+            obj.insert("milestone".into(), Value::Null);
+        }
+        Some(n) => {
+            obj.insert("milestone".into(), json!(n));
+        }
+        None => {}
+    }
+    if obj.is_empty() {
+        None
+    } else {
+        Some(Value::Object(obj).to_string())
+    }
+}
+
+/// Builds the POST body that creates a new issue (S30).
+pub fn create_issue_payload(issue: &NewIssue) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("title".into(), json!(issue.title));
+    if !issue.body.is_empty() {
+        obj.insert("body".into(), json!(issue.body));
+    }
+    if !issue.assignees.is_empty() {
+        obj.insert("assignees".into(), json!(issue.assignees));
+    }
+    if !issue.labels.is_empty() {
+        obj.insert("labels".into(), json!(issue.labels));
+    }
+    if let Some(n) = issue.milestone {
+        obj.insert("milestone".into(), json!(n));
+    }
+    Value::Object(obj).to_string()
+}
+
+/// Builds the GraphQL mutation body (query + variables) that sets one Project
+/// (v2) field value, or clears it when `value` is empty (S30).
+pub fn project_field_mutation(edit: &ProjectFieldEdit) -> String {
+    if edit.value.is_empty() {
+        let q = "mutation($p:ID!,$i:ID!,$f:ID!){clearProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f}){projectV2Item{id}}}";
+        return json!({"query": q, "variables": {"p": edit.project_id, "i": edit.item_id, "f": edit.field_id}}).to_string();
+    }
+    let value = match edit.kind.as_str() {
+        "number" => json!({ "number": edit.value.parse::<f64>().unwrap_or(0.0) }),
+        "single_select" => json!({ "singleSelectOptionId": edit.value }),
+        "iteration" => json!({ "iterationId": edit.value }),
+        "date" => json!({ "date": edit.value }),
+        _ => json!({ "text": edit.value }),
+    };
+    let q = "mutation($p:ID!,$i:ID!,$f:ID!,$v:ProjectV2FieldValue!){updateProjectV2ItemFieldValue(input:{projectId:$p,itemId:$i,fieldId:$f,value:$v}){projectV2Item{id}}}";
+    json!({"query": q, "variables": {"p": edit.project_id, "i": edit.item_id, "f": edit.field_id, "v": value}}).to_string()
+}
+
+/// Lowercase alphanumeric slug with single dashes, capped to 40 chars (S30).
+fn slugify(title: &str) -> String {
+    let mut out = String::new();
+    for c in title.chars() {
+        if c.is_ascii_alphanumeric() {
+            out.extend(c.to_ascii_lowercase().to_string().chars());
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    if out.len() > 40 {
+        out.truncate(40);
+        while out.ends_with('-') {
+            out.pop();
+        }
+    }
+    out
+}
+
+/// Derives the local branch name for an issue (S30): `<n>-<slug-of-title>`,
+/// passed through [`sanitize_branch`] so it is always filesystem/ref safe.
+pub fn issue_branch_name(number: u64, title: &str) -> String {
+    let slug = slugify(title);
+    let name = if slug.is_empty() { number.to_string() } else { format!("{number}-{slug}") };
+    sanitize_branch(&name)
+}
+
+/// Formats a Project number field value without a trailing `.0`.
+fn trim_number(n: f64) -> String {
+    if n.fract() == 0.0 {
+        format!("{}", n as i64)
+    } else {
+        format!("{n}")
+    }
+}
+
+/// True when a GraphQL response's `errors` indicate the token lacks the
+/// Projects scope (S30), so the editor shows [`PROJECT_SCOPE_HINT`] instead of
+/// crashing.
+pub fn project_scope_missing(body: &serde_json::Value) -> bool {
+    let Some(errors) = body.get("errors").and_then(|e| e.as_array()) else {
+        return false;
+    };
+    errors.iter().any(|e| {
+        let ty = e.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let msg = e.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        ty.eq_ignore_ascii_case("INSUFFICIENT_SCOPES")
+            || ty.eq_ignore_ascii_case("FORBIDDEN")
+            || msg.to_ascii_lowercase().contains("scope")
+    })
+}
+
+/// Parses the `projectItems` nodes of an issue's GraphQL response into editable
+/// [`ProjectSchema`]s (S30). Pure: unit-tested with fixtures.
+pub fn parse_project_items(body: &serde_json::Value) -> Vec<ProjectSchema> {
+    let Some(nodes) = body.pointer("/data/repository/issue/projectItems/nodes").and_then(|n| n.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for pi in nodes {
+        let item_id = pi.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let project_id = pi.pointer("/project/id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let title = pi.pointer("/project/title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        // Current value per field id, read from the item's fieldValues.
+        let mut current: HashMap<String, String> = HashMap::new();
+        if let Some(vals) = pi.pointer("/fieldValues/nodes").and_then(|v| v.as_array()) {
+            for v in vals {
+                let Some(fid) = v.pointer("/field/id").and_then(|x| x.as_str()) else { continue };
+                let display = v
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+                    .or_else(|| v.get("number").and_then(|x| x.as_f64()).map(trim_number))
+                    .or_else(|| v.get("title").and_then(|x| x.as_str()).map(String::from))
+                    .or_else(|| v.get("text").and_then(|x| x.as_str()).map(String::from));
+                if let Some(d) = display {
+                    current.insert(fid.to_string(), d);
+                }
+            }
+        }
+        // Field definitions (+ options / iterations) from the project.
+        let mut fields = Vec::new();
+        if let Some(defs) = pi.pointer("/project/fields/nodes").and_then(|v| v.as_array()) {
+            for f in defs {
+                let field_id = f.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                if field_id.is_empty() {
+                    continue;
+                }
+                let name = f.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let kind = match f.get("dataType").and_then(|v| v.as_str()).unwrap_or("") {
+                    "SINGLE_SELECT" => "single_select",
+                    "NUMBER" => "number",
+                    "ITERATION" => "iteration",
+                    "DATE" => "date",
+                    "TEXT" | "TITLE" => "text",
+                    _ => continue, // assignees, labels, etc. are edited elsewhere
+                };
+                let mut options = Vec::new();
+                if let Some(opts) = f.get("options").and_then(|v| v.as_array()) {
+                    for o in opts {
+                        options.push(FieldOption {
+                            id: o.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            name: o.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        });
+                    }
+                }
+                if let Some(iters) = f.pointer("/configuration/iterations").and_then(|v| v.as_array()) {
+                    for it in iters {
+                        options.push(FieldOption {
+                            id: it.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                            name: it.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                        });
+                    }
+                }
+                fields.push(ProjectFieldSchema {
+                    field_id: field_id.to_string(),
+                    name,
+                    kind: kind.to_string(),
+                    current: current.get(field_id).cloned(),
+                    options,
+                });
+            }
+        }
+        out.push(ProjectSchema { project_id, item_id, title, fields });
+    }
+    out
+}
+
 fn branch_actions() -> Vec<ItemAction> {
     vec![
         open_action(),
@@ -498,6 +718,23 @@ impl GithubConnector {
             self.token = self.token_source.token()?;
             if let Some(t2) = self.token.clone() {
                 return http::github_post_json(&self.agent, &url, body, &t2);
+            }
+        }
+        Ok(resp)
+    }
+
+    /// PATCH a JSON body to a REST path, re-reading the token once on a 401.
+    fn api_patch(&mut self, path: &str, body: &str) -> std::result::Result<GithubResponse, String> {
+        let token = match self.ensure_token()? {
+            Some(t) => t,
+            None => return Err(DISCONNECTED_DETAIL.to_string()),
+        };
+        let url = format!("{}{}", self.cfg.api_base, path);
+        let resp = http::github_patch_json(&self.agent, &url, body, &token)?;
+        if resp.status == 401 {
+            self.token = self.token_source.token()?;
+            if let Some(t2) = self.token.clone() {
+                return http::github_patch_json(&self.agent, &url, body, &t2);
             }
         }
         Ok(resp)
@@ -604,7 +841,24 @@ impl GithubConnector {
 
     fn expand_issues(&mut self) -> std::result::Result<Vec<Item>, String> {
         let items = self.search_items("is:issue is:open assignee:@me archived:false")?;
-        Ok(items.iter().filter_map(|v| self.issue_item_from_search(v)).collect())
+        let mut out: Vec<Item> = items.iter().filter_map(|v| self.issue_item_from_search(v)).collect();
+        // A "\u{ff0b} New issue" row (S30): opens the empty editor with a repo
+        // picker defaulting to the local GitHub remote when there is one.
+        let default_repo = self.local_repo().map(|(o, n)| format!("{o}/{n}")).unwrap_or_default();
+        out.insert(
+            0,
+            self.record(Item {
+                id: format!("issue:new|{default_repo}"),
+                title: "\u{ff0b} New issue".into(),
+                text: String::new(),
+                ts: String::new(),
+                link: String::new(),
+                kind: Some("newissue".into()),
+                expandable: false,
+                actions: vec![ItemAction { id: "new".into(), label: "New issue".into(), confirm: false }],
+            }),
+        );
+        Ok(out)
     }
 
     fn expand_mine(&mut self) -> std::result::Result<Vec<Item>, String> {
@@ -1008,7 +1262,7 @@ impl GithubConnector {
             link: html_url,
             kind: Some("issue".into()),
             expandable: false,
-            actions: vec![view_action(), open_action()],
+            actions: vec![view_action(), edit_action(), open_action()],
         };
         Some(self.record(item))
     }
@@ -1033,6 +1287,233 @@ impl GithubConnector {
             .cloned()
             .unwrap_or_default();
         Ok(build_detail(&repo, number, is_pr, &obj, &comments))
+    }
+
+    /// Fetches the editable schema of an existing issue (S30): current values
+    /// plus the repo's labels, assignable users, milestones and the issue's
+    /// Project (v2) fields. All off the UI thread; project errors downgrade to
+    /// a note (never crash).
+    fn issue_form(&mut self, item_id: &str) -> std::result::Result<IssueSchema, String> {
+        let (is_pr, owner, name, number) =
+            parse_issue_or_pr_id(item_id).ok_or_else(|| format!("not an issue: {item_id}"))?;
+        if is_pr {
+            return Err("only issues are editable".to_string());
+        }
+        let obj = self.api_get(&format!("/repos/{owner}/{name}/issues/{number}"))?.body;
+        let title = obj.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let body = obj.get("body").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let state = obj.get("state").and_then(|v| v.as_str()).unwrap_or("open").to_string();
+        let assignees = obj
+            .get("assignees")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|u| u.get("login").and_then(|l| l.as_str()).map(String::from)).collect())
+            .unwrap_or_default();
+        let labels = obj
+            .get("labels")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(String::from)).collect())
+            .unwrap_or_default();
+        let milestone = obj.pointer("/milestone/number").and_then(|v| v.as_u64());
+        let (assignable_users, repo_labels, milestones) = self.fetch_issue_options(&owner, &name)?;
+        let (projects, note) = self.fetch_project_items(&owner, &name, number);
+        Ok(IssueSchema {
+            repo: format!("{owner}/{name}"),
+            number: Some(number),
+            title,
+            body,
+            state,
+            assignees,
+            labels,
+            milestone,
+            assignable_users,
+            repo_labels,
+            milestones,
+            projects,
+            note,
+        })
+    }
+
+    /// Fetches the blank editable schema (options only) for a new issue in
+    /// `repo` (`owner/name`), S30.
+    fn new_issue_form(&mut self, repo: &str) -> std::result::Result<IssueSchema, String> {
+        let (owner, name) = repo.split_once('/').ok_or_else(|| format!("not owner/name: {repo}"))?;
+        let (assignable_users, repo_labels, milestones) = self.fetch_issue_options(owner, name)?;
+        Ok(IssueSchema {
+            repo: repo.to_string(),
+            number: None,
+            state: "open".into(),
+            assignable_users,
+            repo_labels,
+            milestones,
+            ..Default::default()
+        })
+    }
+
+    /// Repo labels, assignable users and open milestones for the editor options.
+    fn fetch_issue_options(
+        &mut self,
+        owner: &str,
+        name: &str,
+    ) -> std::result::Result<(Vec<String>, Vec<String>, Vec<MilestoneOption>), String> {
+        let labels = self
+            .api_get(&format!("/repos/{owner}/{name}/labels?per_page=100"))?
+            .body
+            .as_array()
+            .map(|a| a.iter().filter_map(|l| l.get("name").and_then(|n| n.as_str()).map(String::from)).collect())
+            .unwrap_or_default();
+        let users = self
+            .api_get(&format!("/repos/{owner}/{name}/assignees?per_page=100"))?
+            .body
+            .as_array()
+            .map(|a| a.iter().filter_map(|u| u.get("login").and_then(|l| l.as_str()).map(String::from)).collect())
+            .unwrap_or_default();
+        let milestones = self
+            .api_get(&format!("/repos/{owner}/{name}/milestones?state=open&per_page=100"))?
+            .body
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| {
+                        Some(MilestoneOption {
+                            number: m.get("number").and_then(|n| n.as_u64())?,
+                            title: m.get("title").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Ok((users, labels, milestones))
+    }
+
+    /// The issue's Project (v2) items and their fields via GraphQL (S30).
+    /// Returns `(projects, note)`; a missing Projects scope yields no projects
+    /// and the [`PROJECT_SCOPE_HINT`] note instead of an error.
+    fn fetch_project_items(&mut self, owner: &str, name: &str, number: u64) -> (Vec<ProjectSchema>, Option<String>) {
+        let query = "query($o:String!,$n:String!,$num:Int!){repository(owner:$o,name:$n){issue(number:$num){projectItems(first:20){nodes{id project{id title fields(first:50){nodes{... on ProjectV2FieldCommon{id name dataType} ... on ProjectV2SingleSelectField{options{id name}} ... on ProjectV2IterationField{configuration{iterations{id title}}}}}} fieldValues(first:50){nodes{... on ProjectV2ItemFieldSingleSelectValue{name field{... on ProjectV2FieldCommon{id}}} ... on ProjectV2ItemFieldNumberValue{number field{... on ProjectV2FieldCommon{id}}} ... on ProjectV2ItemFieldIterationValue{title field{... on ProjectV2FieldCommon{id}}} ... on ProjectV2ItemFieldTextValue{text field{... on ProjectV2FieldCommon{id}}}}}}}}}}";
+        let body = json!({ "query": query, "variables": { "o": owner, "n": name, "num": number } }).to_string();
+        match self.api_post("/graphql", &body) {
+            Ok(resp) => {
+                if project_scope_missing(&resp.body) {
+                    (Vec::new(), Some(PROJECT_SCOPE_HINT.to_string()))
+                } else {
+                    (parse_project_items(&resp.body), None)
+                }
+            }
+            // Never crash the editor on a project fetch failure.
+            Err(_) => (Vec::new(), Some(PROJECT_SCOPE_HINT.to_string())),
+        }
+    }
+
+    /// Applies a form diff to an existing issue (S30): the PATCH (only changed
+    /// fields), then any project-field updates, then an optional comment. The
+    /// token is never logged.
+    fn issue_edit(&mut self, item_id: &str, edit: &IssueFieldEdit) -> std::result::Result<String, String> {
+        let (is_pr, owner, name, number) =
+            parse_issue_or_pr_id(item_id).ok_or_else(|| format!("not an issue: {item_id}"))?;
+        if is_pr {
+            return Err("only issues are editable".to_string());
+        }
+        let mut applied: Vec<String> = Vec::new();
+        if let Some(payload) = issue_edit_payload(edit) {
+            let resp = self.api_patch(&format!("/repos/{owner}/{name}/issues/{number}"), &payload)?;
+            if !(200..300).contains(&resp.status) {
+                let msg = resp.body.get("message").and_then(|v| v.as_str()).unwrap_or("edit failed");
+                return Err(format!("edit failed ({}): {msg}", resp.status));
+            }
+            applied.push("fields".into());
+        }
+        for pf in &edit.project_fields {
+            let resp = self.api_post("/graphql", &project_field_mutation(pf))?;
+            if project_scope_missing(&resp.body) {
+                return Err(PROJECT_SCOPE_HINT.to_string());
+            }
+            if let Some(err) = resp.body.pointer("/errors/0/message").and_then(|v| v.as_str()) {
+                return Err(format!("project field failed: {err}"));
+            }
+            applied.push("project field".into());
+        }
+        if let Some(comment) = &edit.comment {
+            if !comment.trim().is_empty() {
+                let payload = json!({ "body": comment }).to_string();
+                let resp = self.api_post(&format!("/repos/{owner}/{name}/issues/{number}/comments"), &payload)?;
+                if !(200..300).contains(&resp.status) {
+                    let msg = resp.body.get("message").and_then(|v| v.as_str()).unwrap_or("comment failed");
+                    return Err(format!("comment failed ({}): {msg}", resp.status));
+                }
+                applied.push("comment".into());
+            }
+        }
+        if applied.is_empty() {
+            Ok("no changes".to_string())
+        } else {
+            Ok(format!("updated {name}#{number}: {}", applied.join(", ")))
+        }
+    }
+
+    /// Creates a new issue in `repo` (`owner/name`), S30.
+    fn issue_create(&mut self, repo: &str, issue: &NewIssue) -> std::result::Result<String, String> {
+        let (owner, name) = repo.split_once('/').ok_or_else(|| format!("not owner/name: {repo}"))?;
+        if issue.title.trim().is_empty() {
+            return Err("a new issue needs a title".to_string());
+        }
+        let payload = create_issue_payload(issue);
+        let resp = self.api_post(&format!("/repos/{owner}/{name}/issues"), &payload)?;
+        if !(200..300).contains(&resp.status) {
+            let msg = resp.body.get("message").and_then(|v| v.as_str()).unwrap_or("create failed");
+            return Err(format!("create failed ({}): {msg}", resp.status));
+        }
+        let num = resp.body.get("number").and_then(|v| v.as_u64()).unwrap_or(0);
+        Ok(format!("created {name}#{num}"))
+    }
+
+    /// Creates or switches to the issue's local branch in the partitioner root
+    /// (S30). Switching refuses on a dirty tree (like checkout); never --force.
+    fn issue_branch(&mut self, item_id: &str) -> std::result::Result<String, String> {
+        let (is_pr, owner, name, number) =
+            parse_issue_or_pr_id(item_id).ok_or_else(|| format!("not an issue: {item_id}"))?;
+        if is_pr {
+            return Err("issue branches are only for issues".to_string());
+        }
+        let title = self
+            .api_get(&format!("/repos/{owner}/{name}/issues/{number}"))?
+            .body
+            .get("title")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let branch = issue_branch_name(number, &title);
+        validate_branch(&self.repo_root, &branch)?;
+        let exists = run_git(
+            &self.repo_root,
+            &["rev-parse".into(), "--verify".into(), "--quiet".into(), format!("refs/heads/{branch}")],
+        )
+        .is_ok();
+        if exists {
+            let status = run_git(&self.repo_root, &["status".into(), "--porcelain".into()])?;
+            if !status.trim().is_empty() {
+                return Err("working tree has changes \u{2014} commit or stash first".to_string());
+            }
+            run_git(&self.repo_root, &["checkout".into(), branch.clone(), "--".into()])?;
+            Ok(format!("switched to {branch}"))
+        } else {
+            // Create at HEAD, carrying any uncommitted work (never --force).
+            run_git(&self.repo_root, &["checkout".into(), "-b".into(), branch.clone(), "--".into()])?;
+            Ok(format!("created {branch}"))
+        }
+    }
+
+    /// Commits ONLY the already-staged changes with `message` (S30). Refuses
+    /// when nothing is staged; never stages automatically, never pushes.
+    fn issue_commit(&mut self, _item_id: &str, message: &str) -> std::result::Result<String, String> {
+        if message.trim().is_empty() {
+            return Err("commit message is empty".to_string());
+        }
+        let staged = run_git(&self.repo_root, &["diff".into(), "--cached".into(), "--name-only".into()])?;
+        if staged.trim().is_empty() {
+            return Err("nothing staged \u{2014} stage changes first with `git add` (this never stages automatically)".to_string());
+        }
+        run_git(&self.repo_root, &["commit".into(), "-m".into(), message.to_string()])?;
+        Ok("committed staged changes".to_string())
     }
 
     /// Runs an action. Returns a success detail (e.g. the created worktree path).
@@ -1355,11 +1836,153 @@ impl Connector for GithubConnector {
     fn view(&mut self, item_id: &str) -> Result<(String, String)> {
         self.view_item(item_id)
     }
+
+    fn issue_form(&mut self, item_id: &str) -> Result<IssueSchema> {
+        self.issue_form(item_id)
+    }
+
+    fn new_issue_form(&mut self, repo: &str) -> Result<IssueSchema> {
+        self.new_issue_form(repo)
+    }
+
+    fn issue_edit(&mut self, item_id: &str, edit: &IssueFieldEdit) -> Result<String> {
+        self.issue_edit(item_id, edit)
+    }
+
+    fn issue_create(&mut self, repo: &str, issue: &NewIssue) -> Result<String> {
+        self.issue_create(repo, issue)
+    }
+
+    fn issue_branch(&mut self, item_id: &str) -> Result<String> {
+        self.issue_branch(item_id)
+    }
+
+    fn issue_commit(&mut self, item_id: &str, message: &str) -> Result<String> {
+        self.issue_commit(item_id, message)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn issue_edit_payload_only_sends_changed_fields_and_clears_milestone() {
+        // Nothing changed -> no PATCH at all (form diff).
+        assert_eq!(issue_edit_payload(&IssueFieldEdit::default()), None);
+        // Only the title and labels changed.
+        let edit = IssueFieldEdit {
+            title: Some("New".into()),
+            labels: Some(vec!["bug".into(), "p1".into()]),
+            ..Default::default()
+        };
+        let v: Value = serde_json::from_str(&issue_edit_payload(&edit).unwrap()).unwrap();
+        assert_eq!(v, json!({"title": "New", "labels": ["bug", "p1"]}));
+        // Milestone 0 clears it (null); a comment is never part of the PATCH.
+        let clear = IssueFieldEdit { milestone: Some(0), comment: Some("hi".into()), ..Default::default() };
+        let v: Value = serde_json::from_str(&issue_edit_payload(&clear).unwrap()).unwrap();
+        assert_eq!(v, json!({"milestone": Value::Null}));
+        // Only a comment / project change => no PATCH body.
+        let comment_only = IssueFieldEdit { comment: Some("hi".into()), ..Default::default() };
+        assert_eq!(issue_edit_payload(&comment_only), None);
+        // State and milestone set.
+        let set = IssueFieldEdit { state: Some("closed".into()), milestone: Some(4), ..Default::default() };
+        let v: Value = serde_json::from_str(&issue_edit_payload(&set).unwrap()).unwrap();
+        assert_eq!(v, json!({"state": "closed", "milestone": 4}));
+    }
+
+    #[test]
+    fn create_issue_payload_includes_only_nonempty_fields() {
+        let v: Value = serde_json::from_str(&create_issue_payload(&NewIssue {
+            title: "T".into(),
+            body: String::new(),
+            assignees: vec![],
+            labels: vec!["bug".into()],
+            milestone: Some(2),
+        }))
+        .unwrap();
+        assert_eq!(v, json!({"title": "T", "labels": ["bug"], "milestone": 2}));
+    }
+
+    #[test]
+    fn project_field_mutation_shapes_each_value_kind_and_clears() {
+        let single = ProjectFieldEdit {
+            project_id: "P".into(),
+            item_id: "I".into(),
+            field_id: "F".into(),
+            kind: "single_select".into(),
+            value: "opt1".into(),
+        };
+        let v: Value = serde_json::from_str(&project_field_mutation(&single)).unwrap();
+        assert_eq!(v.pointer("/variables/v/singleSelectOptionId").unwrap(), "opt1");
+        assert!(v.get("query").unwrap().as_str().unwrap().contains("updateProjectV2ItemFieldValue"));
+
+        let number = ProjectFieldEdit { kind: "number".into(), value: "3".into(), ..single.clone() };
+        let v: Value = serde_json::from_str(&project_field_mutation(&number)).unwrap();
+        assert_eq!(v.pointer("/variables/v/number").unwrap(), 3.0);
+
+        let iter = ProjectFieldEdit { kind: "iteration".into(), value: "it9".into(), ..single.clone() };
+        let v: Value = serde_json::from_str(&project_field_mutation(&iter)).unwrap();
+        assert_eq!(v.pointer("/variables/v/iterationId").unwrap(), "it9");
+
+        let clear = ProjectFieldEdit { value: String::new(), ..single.clone() };
+        let v: Value = serde_json::from_str(&project_field_mutation(&clear)).unwrap();
+        assert!(v.get("query").unwrap().as_str().unwrap().contains("clearProjectV2ItemFieldValue"));
+    }
+
+    #[test]
+    fn missing_project_scope_maps_to_the_hint() {
+        let forbidden = json!({"errors": [{"type": "FORBIDDEN", "message": "Resource not accessible"}]});
+        assert!(project_scope_missing(&forbidden));
+        let scope = json!({"errors": [{"message": "Your token has not been granted the required scopes"}]});
+        assert!(project_scope_missing(&scope));
+        assert_eq!(PROJECT_SCOPE_HINT, "Project fields need: gh auth refresh -s project");
+        // A normal data response is not a scope error.
+        assert!(!project_scope_missing(&json!({"data": {}})));
+    }
+
+    #[test]
+    fn parse_project_items_reads_fields_options_and_current_values() {
+        let body = json!({"data": {"repository": {"issue": {"projectItems": {"nodes": [{
+            "id": "PVTI_1",
+            "project": {"id": "PVT_1", "title": "Roadmap", "fields": {"nodes": [
+                {"id": "F_status", "name": "Status", "dataType": "SINGLE_SELECT", "options": [{"id": "o1", "name": "Todo"}, {"id": "o2", "name": "Done"}]},
+                {"id": "F_est", "name": "Estimate", "dataType": "NUMBER"},
+                {"id": "F_it", "name": "Iteration", "dataType": "ITERATION", "configuration": {"iterations": [{"id": "i1", "title": "Sprint 1"}]}},
+                {"id": "F_assignee", "name": "Assignees", "dataType": "ASSIGNEES"}
+            ]}},
+            "fieldValues": {"nodes": [
+                {"name": "Todo", "field": {"id": "F_status"}},
+                {"number": 5.0, "field": {"id": "F_est"}}
+            ]}
+        }]}}}}});
+        let projects = parse_project_items(&body);
+        assert_eq!(projects.len(), 1);
+        let p = &projects[0];
+        assert_eq!(p.project_id, "PVT_1");
+        assert_eq!(p.item_id, "PVTI_1");
+        // ASSIGNEES is skipped; the other three are kept.
+        assert_eq!(p.fields.len(), 3);
+        let status = p.fields.iter().find(|f| f.name == "Status").unwrap();
+        assert_eq!(status.kind, "single_select");
+        assert_eq!(status.current.as_deref(), Some("Todo"));
+        assert_eq!(status.options.len(), 2);
+        let est = p.fields.iter().find(|f| f.name == "Estimate").unwrap();
+        assert_eq!(est.current.as_deref(), Some("5"));
+        let it = p.fields.iter().find(|f| f.name == "Iteration").unwrap();
+        assert_eq!(it.options[0].name, "Sprint 1");
+    }
+
+    #[test]
+    fn issue_branch_name_slugifies_and_bounds() {
+        assert_eq!(issue_branch_name(42, "Fix the Login Bug!"), "42-fix-the-login-bug");
+        assert_eq!(issue_branch_name(7, "   "), "7");
+        assert_eq!(issue_branch_name(7, "***"), "7");
+        // Very long titles are capped (<= 40 slug chars).
+        let long = issue_branch_name(1, &"word ".repeat(30));
+        assert!(long.len() <= 2 + 40, "{long}");
+        assert!(!long.ends_with('-'));
+    }
 
     #[test]
     fn ci_glyph_maps_rollup_states() {

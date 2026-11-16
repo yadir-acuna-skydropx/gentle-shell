@@ -5,7 +5,7 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::thread;
 
 use crate::connector::Connector;
-use crate::protocol::{parse_client_line, AppStatus, ClientMsg, EngineMsg, Parsed};
+use crate::protocol::{parse_client_line, AppStatus, ClientMsg, EngineMsg, IssueFieldEdit, NewIssue, Parsed};
 
 /// A command delivered to one connector's thread.
 enum Cmd {
@@ -13,6 +13,12 @@ enum Cmd {
     Refresh { id: u64 },
     Expand { id: u64, item: String },
     Action { id: u64, item: String, action: String },
+    IssueForm { id: u64, item: String },
+    NewIssueForm { id: u64, repo: String },
+    IssueEdit { id: u64, item: String, edit: IssueFieldEdit },
+    IssueCreate { id: u64, repo: String, issue: NewIssue },
+    IssueBranch { id: u64, item: String },
+    IssueCommit { id: u64, item: String, message: String },
     Stop,
 }
 
@@ -97,6 +103,42 @@ where
             Ev::Client(ClientMsg::Action { id, app, item, action }) => match senders.iter().find(|(a, _)| *a == app) {
                 Some((_, s)) => {
                     let _ = s.send(Cmd::Action { id, item, action });
+                }
+                None => write_msg(&mut output, &unknown_app_action(id, &app))?,
+            },
+            Ev::Client(ClientMsg::IssueForm { id, app, item }) => match senders.iter().find(|(a, _)| *a == app) {
+                Some((_, s)) => {
+                    let _ = s.send(Cmd::IssueForm { id, item });
+                }
+                None => write_msg(&mut output, &unknown_app(id, &app))?,
+            },
+            Ev::Client(ClientMsg::NewIssueForm { id, app, repo }) => match senders.iter().find(|(a, _)| *a == app) {
+                Some((_, s)) => {
+                    let _ = s.send(Cmd::NewIssueForm { id, repo });
+                }
+                None => write_msg(&mut output, &unknown_app(id, &app))?,
+            },
+            Ev::Client(ClientMsg::IssueEdit { id, app, item, edit }) => match senders.iter().find(|(a, _)| *a == app) {
+                Some((_, s)) => {
+                    let _ = s.send(Cmd::IssueEdit { id, item, edit });
+                }
+                None => write_msg(&mut output, &unknown_app_action(id, &app))?,
+            },
+            Ev::Client(ClientMsg::IssueCreate { id, app, repo, issue }) => match senders.iter().find(|(a, _)| *a == app) {
+                Some((_, s)) => {
+                    let _ = s.send(Cmd::IssueCreate { id, repo, issue });
+                }
+                None => write_msg(&mut output, &unknown_app_action(id, &app))?,
+            },
+            Ev::Client(ClientMsg::IssueBranch { id, app, item }) => match senders.iter().find(|(a, _)| *a == app) {
+                Some((_, s)) => {
+                    let _ = s.send(Cmd::IssueBranch { id, item });
+                }
+                None => write_msg(&mut output, &unknown_app_action(id, &app))?,
+            },
+            Ev::Client(ClientMsg::IssueCommit { id, app, item, message }) => match senders.iter().find(|(a, _)| *a == app) {
+                Some((_, s)) => {
+                    let _ = s.send(Cmd::IssueCommit { id, item, message });
                 }
                 None => write_msg(&mut output, &unknown_app_action(id, &app))?,
             },
@@ -248,6 +290,43 @@ fn connector_loop(mut c: Box<dyn Connector>, cmd_rx: Receiver<Cmd>, tx: Sender<E
                 let _ = tx.send(Ev::Emit(msg));
                 report_status(&mut c, &id, &tx, &mut last_status);
             }
+            Ok(Cmd::IssueForm { id: rid, item }) => {
+                let msg = match c.issue_form(&item) {
+                    Ok(schema) => EngineMsg::IssueForm { id: rid, app: id.clone(), item, schema },
+                    Err(e) => EngineMsg::Result { id: rid, ok: false, error: Some(e) },
+                };
+                let _ = tx.send(Ev::Emit(msg));
+                report_status(&mut c, &id, &tx, &mut last_status);
+            }
+            Ok(Cmd::NewIssueForm { id: rid, repo }) => {
+                let msg = match c.new_issue_form(&repo) {
+                    Ok(schema) => EngineMsg::IssueForm {
+                        id: rid,
+                        app: id.clone(),
+                        item: format!("issue:new|{repo}"),
+                        schema,
+                    },
+                    Err(e) => EngineMsg::Result { id: rid, ok: false, error: Some(e) },
+                };
+                let _ = tx.send(Ev::Emit(msg));
+                report_status(&mut c, &id, &tx, &mut last_status);
+            }
+            Ok(Cmd::IssueEdit { id: rid, item, edit }) => {
+                let _ = tx.send(Ev::Emit(action_result(rid, c.issue_edit(&item, &edit))));
+                report_status(&mut c, &id, &tx, &mut last_status);
+            }
+            Ok(Cmd::IssueCreate { id: rid, repo, issue }) => {
+                let _ = tx.send(Ev::Emit(action_result(rid, c.issue_create(&repo, &issue))));
+                report_status(&mut c, &id, &tx, &mut last_status);
+            }
+            Ok(Cmd::IssueBranch { id: rid, item }) => {
+                let _ = tx.send(Ev::Emit(action_result(rid, c.issue_branch(&item))));
+                report_status(&mut c, &id, &tx, &mut last_status);
+            }
+            Ok(Cmd::IssueCommit { id: rid, item, message }) => {
+                let _ = tx.send(Ev::Emit(action_result(rid, c.issue_commit(&item, &message))));
+                report_status(&mut c, &id, &tx, &mut last_status);
+            }
             Err(RecvTimeoutError::Timeout) => {
                 poll_once(&mut c, &id, &tx, &mut last_items);
                 report_status(&mut c, &id, &tx, &mut last_status);
@@ -286,6 +365,14 @@ fn report_status(
         *last = now;
     }
     let _ = tx.send(Ev::Status { id: id.to_string(), status: now, detail });
+}
+
+/// Maps a mutating action outcome to an `ActionResult` (S30).
+fn action_result(id: u64, result: crate::connector::Result<String>) -> EngineMsg {
+    match result {
+        Ok(message) => EngineMsg::ActionResult { id, ok: true, message: Some(message), error: None },
+        Err(e) => EngineMsg::ActionResult { id, ok: false, message: None, error: Some(e) },
+    }
 }
 
 fn result_msg(id: u64, result: crate::connector::Result<()>) -> EngineMsg {

@@ -140,3 +140,17 @@ pub fn github_post_json(agent: &ureq::Agent, url: &str, body: &str, token: &str)
         .map_err(|e| e.to_string())?;
     finish_github(resp)
 }
+
+/// PATCHes a JSON body to a GitHub REST URL (issue field edits, S30).
+pub fn github_patch_json(agent: &ureq::Agent, url: &str, body: &str, token: &str) -> Result<GithubResponse, String> {
+    let resp = agent
+        .patch(url)
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .header("User-Agent", "gentle-apps")
+        .header("Content-Type", "application/json; charset=utf-8")
+        .send(body)
+        .map_err(|e| e.to_string())?;
+    finish_github(resp)
+}

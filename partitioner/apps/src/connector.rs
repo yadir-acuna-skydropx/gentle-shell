@@ -3,7 +3,7 @@
 //! app never blocks the others or the stdin loop.
 use std::time::Duration;
 
-use crate::protocol::{Item, Status};
+use crate::protocol::{IssueFieldEdit, IssueSchema, Item, NewIssue, Status};
 
 /// Connector errors are plain strings: the engine has no error dependency and
 /// only forwards the message to the partitioner in a `result`.
@@ -47,6 +47,35 @@ pub trait Connector: Send {
     /// when the `view` action runs. The default refuses, so a connector that
     /// offers no `view` action needs no change.
     fn view(&mut self, _item_id: &str) -> Result<(String, String)> {
+        Err("not supported".to_string())
+    }
+    /// Returns the editable schema of an existing issue (S30), fetched off the
+    /// UI thread. The default refuses.
+    fn issue_form(&mut self, _item_id: &str) -> Result<IssueSchema> {
+        Err("not supported".to_string())
+    }
+    /// Returns the blank editable schema (options) for a new issue in `repo`
+    /// (`owner/name`), S30. The default refuses.
+    fn new_issue_form(&mut self, _repo: &str) -> Result<IssueSchema> {
+        Err("not supported".to_string())
+    }
+    /// Applies a form diff to an existing issue (S30), returning a summary. The
+    /// default refuses.
+    fn issue_edit(&mut self, _item_id: &str, _edit: &IssueFieldEdit) -> Result<String> {
+        Err("not supported".to_string())
+    }
+    /// Creates a new issue in `repo` (`owner/name`), returning a summary (S30).
+    fn issue_create(&mut self, _repo: &str, _issue: &NewIssue) -> Result<String> {
+        Err("not supported".to_string())
+    }
+    /// Creates or switches to the issue's local branch (S30). The default
+    /// refuses.
+    fn issue_branch(&mut self, _item_id: &str) -> Result<String> {
+        Err("not supported".to_string())
+    }
+    /// Commits the already-staged changes with `message` (S30). The default
+    /// refuses.
+    fn issue_commit(&mut self, _item_id: &str, _message: &str) -> Result<String> {
         Err("not supported".to_string())
     }
 }

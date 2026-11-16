@@ -12,7 +12,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use gentle_apps::protocol::{ClientMsg, EngineMsg, Status as AppState};
+use gentle_apps::protocol::{
+    ClientMsg, EngineMsg, IssueFieldEdit, IssueSchema, NewIssue, ProjectFieldEdit, Status as AppState,
+};
 use gentle_engines::arch_protocol::{ArchClientMsg as ArchReq, ArchEngineMsg as ArchMsg, KeyState as ArchKey};
 use gentle_engines::protocol::{ClientMsg as ExplainReq, EngineMsg as ExplainMsg, KeyState as ExplainKey};
 
@@ -74,6 +76,9 @@ pub enum Overlay {
     /// The in-terminal GitHub issue/PR reader (S27): wrapped, scrollable
     /// detail with a copy (`y`) and open-in-browser (`o`) action.
     Reader,
+    /// The issue editor (S30): edit an issue's fields + Project (v2) fields, or
+    /// fill a blank new issue.
+    IssueEditor,
 }
 
 /// The three stages of the architecture overlay (S18).
@@ -135,6 +140,89 @@ pub struct ReaderUi {
     pub error: Option<String>,
     /// Lines scrolled up from the top of the wrapped body.
     pub scroll: usize,
+}
+
+/// One editable field row in the issue editor (S30).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EditorField {
+    Title,
+    Body,
+    State,
+    Assignees,
+    Labels,
+    Milestone,
+    Comment,
+    /// A Project (v2) field: `projects[pi].fields[fi]`.
+    Project { pi: usize, fi: usize },
+}
+
+/// An open single-select pick-list in the issue editor (milestone / project
+/// single-select / iteration), S30.
+#[derive(Debug, Clone, Default)]
+pub struct PickState {
+    /// `(value, display)` options; the first is always `("", "(none)")`.
+    pub options: Vec<(String, String)>,
+    pub sel: usize,
+}
+
+/// State of the issue editor overlay (S30). Holds the working values (edited)
+/// plus the original [`IssueSchema`] for diffing and for the option pick-lists.
+#[derive(Debug, Clone, Default)]
+pub struct IssueEditorUi {
+    /// Id of the in-flight schema fetch (IssueForm / NewIssueForm).
+    pub id: u64,
+    pub app: String,
+    pub item: String,
+    pub repo: String,
+    /// `None` for a new issue.
+    pub number: Option<u64>,
+    pub loading: bool,
+    pub error: Option<String>,
+    pub status: Option<String>,
+    /// A non-fatal note (e.g. the Projects missing-scope hint).
+    pub note: Option<String>,
+    /// Originals + options, straight from the engine.
+    pub schema: IssueSchema,
+    // Working values.
+    pub title: String,
+    pub body: String,
+    pub state: String,
+    pub assignees: Vec<String>,
+    pub labels: Vec<String>,
+    pub milestone: Option<u64>,
+    pub comment: String,
+    /// Working project-field value ids/numbers/text: `[pi][fi]`.
+    pub project_values: Vec<Vec<String>>,
+    /// Selected field row.
+    pub sel: usize,
+    /// True while editing the selected text field.
+    pub editing: bool,
+    pub edit_buf: String,
+    /// Open pick-list for the selected field, if any.
+    pub pick: Option<PickState>,
+    pub scroll: usize,
+}
+
+/// Which mutating issue operation a confirmation prompt will run (S30).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IssueOp {
+    Branch,
+    Commit,
+    Edit(IssueFieldEdit),
+    Create(NewIssue),
+}
+
+/// A confirmation prompt for a mutating issue action (S30). Every mutation
+/// (edit/create/branch/commit) is confirmed here before a request is sent.
+#[derive(Debug, Clone)]
+pub struct IssueConfirm {
+    pub app: String,
+    pub item: String,
+    pub op: IssueOp,
+    /// The commit message being edited (Commit only).
+    pub message: String,
+    /// A one-line summary of what will happen.
+    pub summary: String,
 }
 
 /// State of the explainer popup (S17). Lives beside [`Overlay::Explain`]; the
@@ -430,6 +518,13 @@ pub struct App {
     pub helper: ExplainUi,
     /// In-terminal GitHub issue/PR reader state (S27).
     pub reader: ReaderUi,
+    /// Issue editor overlay state (S30).
+    pub issue_editor: IssueEditorUi,
+    /// A pending mutating issue action awaiting confirmation (S30).
+    pub issue_confirm: Option<IssueConfirm>,
+    /// Id of the in-flight mutating issue request (edit/create/branch/commit),
+    /// correlated against the engine's ActionResult (S30). `0` = none.
+    pub issue_action_id: u64,
     /// Open conversations (S22); always at least one. Index 0 is the first
     /// gentle-shell spawned at startup.
     pub conversations: Vec<Conversation>,
@@ -507,6 +602,9 @@ impl App {
             arch: ArchUi::default(),
             helper: ExplainUi::default(),
             reader: ReaderUi::default(),
+            issue_editor: IssueEditorUi::default(),
+            issue_confirm: None,
+            issue_action_id: 0,
             conversations: vec![Conversation { title: "1".into() }],
             active_conversation: 0,
             conv_sel: 0,
@@ -950,6 +1048,12 @@ impl App {
         // The transient status message lives only until the next key.
         self.status_msg = None;
 
+        // A mutating-issue confirmation prompt is modal (S30): it captures keys
+        // before the prefix chord and overlays.
+        if self.issue_confirm.is_some() {
+            return self.issue_confirm_key(key);
+        }
+
         // A pending prefix consumes exactly one key, then clears.
         if self.prefix {
             self.prefix = false;
@@ -1010,9 +1114,70 @@ impl App {
                 self.reader.error = Some(error.clone().unwrap_or_else(|| "view failed".to_string()));
                 return;
             }
+            // S30: the issue editor's schema fetch fills the editor overlay.
+            EngineMsg::IssueForm { id, schema, .. } if self.issue_editor.id == *id => {
+                self.apply_issue_form(schema.clone());
+                return;
+            }
+            EngineMsg::IssueForm { .. } => return, // stale editor id
+            EngineMsg::Result { id, ok: false, error } if self.issue_editor.id == *id => {
+                self.issue_editor.loading = false;
+                self.issue_editor.error = Some(error.clone().unwrap_or_else(|| "load failed".to_string()));
+                return;
+            }
+            // S30: the outcome of a mutating issue action (edit/create/branch/commit).
+            EngineMsg::ActionResult { id, ok, message, error } if self.issue_action_id != 0 && self.issue_action_id == *id => {
+                self.issue_action_id = 0;
+                if *ok {
+                    let m = message.clone().unwrap_or_else(|| "done".to_string());
+                    self.status_msg = Some(m.clone());
+                    // A successful edit/create closes the editor overlay.
+                    if self.overlay == Some(Overlay::IssueEditor) {
+                        self.issue_editor = IssueEditorUi::default();
+                        self.overlay = None;
+                    }
+                } else {
+                    let e = error.clone().unwrap_or_else(|| "action failed".to_string());
+                    if self.overlay == Some(Overlay::IssueEditor) {
+                        self.issue_editor.error = Some(e);
+                    } else {
+                        self.status_msg = Some(e);
+                    }
+                }
+                return;
+            }
             _ => {}
         }
         self.apps.apply(msg);
+    }
+
+    /// Fills the issue editor overlay from a fetched schema (S30).
+    fn apply_issue_form(&mut self, schema: IssueSchema) {
+        let project_values = schema
+            .projects
+            .iter()
+            .map(|p| p.fields.iter().map(current_field_value).collect())
+            .collect();
+        let e = &mut self.issue_editor;
+        e.loading = false;
+        e.error = None;
+        e.status = None;
+        e.repo = schema.repo.clone();
+        e.number = schema.number;
+        e.title = schema.title.clone();
+        e.body = schema.body.clone();
+        e.state = if schema.state.is_empty() { "open".into() } else { schema.state.clone() };
+        e.assignees = schema.assignees.clone();
+        e.labels = schema.labels.clone();
+        e.milestone = schema.milestone;
+        e.comment.clear();
+        e.note = schema.note.clone();
+        e.project_values = project_values;
+        e.schema = schema;
+        e.sel = 0;
+        e.editing = false;
+        e.pick = None;
+        e.scroll = 0;
     }
 
     /// Opens the in-terminal reader for an issue/PR and sends the `view`
@@ -1031,6 +1196,387 @@ impl App {
         };
         self.overlay = Some(Overlay::Reader);
         Action::Apps(ClientMsg::Action { id: rid, app, item, action: "view".to_string() })
+    }
+
+    /// Opens the issue editor for an existing issue and fetches its schema (S30).
+    pub fn open_issue_editor(&mut self, app: String, item: String) -> Action {
+        let rid = self.next_apps_id();
+        self.issue_editor = IssueEditorUi {
+            id: rid,
+            app: app.clone(),
+            item: item.clone(),
+            loading: true,
+            ..Default::default()
+        };
+        self.overlay = Some(Overlay::IssueEditor);
+        Action::Apps(ClientMsg::IssueForm { id: rid, app, item })
+    }
+
+    /// Opens the editor empty for a new issue in the row's repo (S30).
+    pub fn open_new_issue(&mut self, app: String, item_id: &str) -> Action {
+        let repo = item_id.strip_prefix("issue:new|").unwrap_or("").to_string();
+        let rid = self.next_apps_id();
+        self.issue_editor = IssueEditorUi {
+            id: rid,
+            app: app.clone(),
+            item: item_id.to_string(),
+            repo: repo.clone(),
+            number: None,
+            loading: true,
+            ..Default::default()
+        };
+        self.overlay = Some(Overlay::IssueEditor);
+        Action::Apps(ClientMsg::NewIssueForm { id: rid, app, repo })
+    }
+
+    /// Starts the confirm prompt to create/switch to the issue's branch (S30).
+    pub fn start_issue_branch(&mut self, app: String, item: String) -> Action {
+        self.issue_confirm = Some(IssueConfirm {
+            app,
+            item,
+            op: IssueOp::Branch,
+            message: String::new(),
+            summary: "Create or switch to the issue branch in the local repo?".to_string(),
+        });
+        Action::None
+    }
+
+    /// Starts the commit prompt with a prefilled, editable message (S30).
+    pub fn start_issue_commit(&mut self, app: String, item: String, issue_title: &str) -> Action {
+        let number = item.rsplit('#').next().and_then(|n| n.parse::<u64>().ok());
+        let title = issue_title.trim();
+        let message = match number {
+            Some(n) if !title.is_empty() => format!("{title} (refs #{n})"),
+            Some(n) => format!("refs #{n}"),
+            None => title.to_string(),
+        };
+        self.issue_confirm = Some(IssueConfirm {
+            app,
+            item,
+            op: IssueOp::Commit,
+            message,
+            summary: "Commit staged changes (edit refs\u{2192}closes; Enter commits, Esc cancels)".to_string(),
+        });
+        Action::None
+    }
+
+    /// The flat list of editable field rows for the current editor state (S30).
+    pub fn editor_fields(&self) -> Vec<EditorField> {
+        let mut v = vec![EditorField::Title, EditorField::Body, EditorField::State];
+        v.push(EditorField::Assignees);
+        v.push(EditorField::Labels);
+        v.push(EditorField::Milestone);
+        v.push(EditorField::Comment);
+        for (pi, p) in self.issue_editor.schema.projects.iter().enumerate() {
+            for fi in 0..p.fields.len() {
+                v.push(EditorField::Project { pi, fi });
+            }
+        }
+        v
+    }
+
+    /// Issue editor reducer (S30): field navigation, per-field editing /
+    /// pick-lists, `s`/Ctrl+S to save (confirmation first), Esc to close.
+    pub fn issue_editor_key(&mut self, key: KeyEvent) -> Action {
+        // A pick-list captures keys first.
+        if self.issue_editor.pick.is_some() {
+            return self.issue_pick_key(key);
+        }
+        // Text editing of the selected field.
+        if self.issue_editor.editing {
+            return self.issue_edit_field_key(key);
+        }
+        let fields = self.editor_fields();
+        let len = fields.len();
+        match key.code {
+            KeyCode::Esc => {
+                self.issue_editor = IssueEditorUi::default();
+                self.overlay = None;
+            }
+            KeyCode::Up | KeyCode::BackTab => {
+                self.issue_editor.sel = clamp_index(self.issue_editor.sel, -1, len);
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.issue_editor.sel = clamp_index(self.issue_editor.sel, 1, len);
+            }
+            KeyCode::Char('s') if !key.modifiers.contains(KeyModifiers::CONTROL) => return self.issue_editor_save(),
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => return self.issue_editor_save(),
+            KeyCode::Enter => return self.issue_editor_activate(),
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Enter on the selected field: toggle State, open a pick-list, or begin a
+    /// text edit (S30).
+    fn issue_editor_activate(&mut self) -> Action {
+        let fields = self.editor_fields();
+        let Some(field) = fields.get(self.issue_editor.sel).cloned() else { return Action::None };
+        match field {
+            EditorField::State => {
+                self.issue_editor.state =
+                    if self.issue_editor.state == "open" { "closed".into() } else { "open".into() };
+            }
+            EditorField::Milestone => {
+                let mut options = vec![(String::new(), "(none)".to_string())];
+                for m in &self.issue_editor.schema.milestones {
+                    options.push((m.number.to_string(), format!("{} (#{})", m.title, m.number)));
+                }
+                let sel = self
+                    .issue_editor
+                    .milestone
+                    .and_then(|n| options.iter().position(|(v, _)| v == &n.to_string()))
+                    .unwrap_or(0);
+                self.issue_editor.pick = Some(PickState { options, sel });
+            }
+            EditorField::Project { pi, fi } => {
+                let f = &self.issue_editor.schema.projects[pi].fields[fi];
+                if f.kind == "single_select" || f.kind == "iteration" {
+                    let mut options = vec![(String::new(), "(none)".to_string())];
+                    for o in &f.options {
+                        options.push((o.id.clone(), o.name.clone()));
+                    }
+                    let cur = self.issue_editor.project_values[pi][fi].clone();
+                    let sel = options.iter().position(|(v, _)| v == &cur).unwrap_or(0);
+                    self.issue_editor.pick = Some(PickState { options, sel });
+                } else {
+                    self.begin_text_edit(self.issue_editor.project_values[pi][fi].clone());
+                }
+            }
+            EditorField::Title => self.begin_text_edit(self.issue_editor.title.clone()),
+            EditorField::Body => self.begin_text_edit(self.issue_editor.body.clone()),
+            EditorField::Comment => self.begin_text_edit(self.issue_editor.comment.clone()),
+            EditorField::Assignees => self.begin_text_edit(self.issue_editor.assignees.join(", ")),
+            EditorField::Labels => self.begin_text_edit(self.issue_editor.labels.join(", ")),
+        }
+        Action::None
+    }
+
+    fn begin_text_edit(&mut self, initial: String) {
+        self.issue_editor.editing = true;
+        self.issue_editor.edit_buf = initial;
+    }
+
+    /// Text-edit reducer for a field (S30): type to edit; Shift+Enter inserts a
+    /// newline in multi-line fields (body/comment, S28); Enter commits; Esc
+    /// cancels.
+    fn issue_edit_field_key(&mut self, key: KeyEvent) -> Action {
+        let fields = self.editor_fields();
+        let field = fields.get(self.issue_editor.sel).cloned();
+        let multiline = matches!(field, Some(EditorField::Body) | Some(EditorField::Comment));
+        match key.code {
+            KeyCode::Esc => {
+                self.issue_editor.editing = false;
+                self.issue_editor.edit_buf.clear();
+            }
+            KeyCode::Enter if multiline && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.issue_editor.edit_buf.push('\n');
+            }
+            KeyCode::Enter => {
+                let buf = std::mem::take(&mut self.issue_editor.edit_buf);
+                self.commit_text_edit(field, buf);
+                self.issue_editor.editing = false;
+            }
+            KeyCode::Backspace => {
+                self.issue_editor.edit_buf.pop();
+            }
+            KeyCode::Char(c) => self.issue_editor.edit_buf.push(c),
+            _ => {}
+        }
+        Action::None
+    }
+
+    fn commit_text_edit(&mut self, field: Option<EditorField>, buf: String) {
+        match field {
+            Some(EditorField::Title) => self.issue_editor.title = buf,
+            Some(EditorField::Body) => self.issue_editor.body = buf,
+            Some(EditorField::Comment) => self.issue_editor.comment = buf,
+            Some(EditorField::Assignees) => {
+                self.issue_editor.assignees = split_csv(&buf);
+            }
+            Some(EditorField::Labels) => {
+                self.issue_editor.labels = split_csv(&buf);
+            }
+            Some(EditorField::Project { pi, fi }) => {
+                if let Some(row) = self.issue_editor.project_values.get_mut(pi) {
+                    if let Some(slot) = row.get_mut(fi) {
+                        *slot = buf;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pick-list reducer (S30): Up/Down move, Enter applies, Esc closes.
+    fn issue_pick_key(&mut self, key: KeyEvent) -> Action {
+        let Some(pick) = self.issue_editor.pick.as_mut() else { return Action::None };
+        let len = pick.options.len();
+        match key.code {
+            KeyCode::Esc => self.issue_editor.pick = None,
+            KeyCode::Up | KeyCode::Char('k') => pick.sel = clamp_index(pick.sel, -1, len),
+            KeyCode::Down | KeyCode::Char('j') => pick.sel = clamp_index(pick.sel, 1, len),
+            KeyCode::Enter => {
+                let value = pick.options.get(pick.sel).map(|(v, _)| v.clone()).unwrap_or_default();
+                let fields = self.editor_fields();
+                let field = fields.get(self.issue_editor.sel).cloned();
+                match field {
+                    Some(EditorField::Milestone) => {
+                        self.issue_editor.milestone = value.parse::<u64>().ok();
+                    }
+                    Some(EditorField::Project { pi, fi }) => {
+                        if let Some(slot) = self.issue_editor.project_values.get_mut(pi).and_then(|r| r.get_mut(fi)) {
+                            *slot = value;
+                        }
+                    }
+                    _ => {}
+                }
+                self.issue_editor.pick = None;
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Builds the form diff (or a new issue), then opens the confirmation
+    /// prompt that actually sends it (S30).
+    fn issue_editor_save(&mut self) -> Action {
+        let e = &self.issue_editor;
+        if e.number.is_none() {
+            if e.title.trim().is_empty() {
+                self.issue_editor.error = Some("a new issue needs a title".into());
+                return Action::None;
+            }
+            let issue = NewIssue {
+                title: e.title.clone(),
+                body: e.body.clone(),
+                assignees: e.assignees.clone(),
+                labels: e.labels.clone(),
+                milestone: e.milestone,
+            };
+            let summary = format!("Create issue in {}: {}", e.repo, e.title);
+            self.issue_confirm = Some(IssueConfirm {
+                app: e.app.clone(),
+                item: e.item.clone(),
+                op: IssueOp::Create(issue),
+                message: String::new(),
+                summary,
+            });
+            return Action::None;
+        }
+        let s = &e.schema;
+        let mut edit = IssueFieldEdit::default();
+        let mut changed: Vec<String> = Vec::new();
+        if e.title != s.title {
+            edit.title = Some(e.title.clone());
+            changed.push("title".into());
+        }
+        if e.body != s.body {
+            edit.body = Some(e.body.clone());
+            changed.push("body".into());
+        }
+        if e.state != s.state {
+            edit.state = Some(e.state.clone());
+            changed.push("state".into());
+        }
+        if e.assignees != s.assignees {
+            edit.assignees = Some(e.assignees.clone());
+            changed.push("assignees".into());
+        }
+        if e.labels != s.labels {
+            edit.labels = Some(e.labels.clone());
+            changed.push("labels".into());
+        }
+        if e.milestone != s.milestone {
+            edit.milestone = Some(e.milestone.unwrap_or(0));
+            changed.push("milestone".into());
+        }
+        if !e.comment.trim().is_empty() {
+            edit.comment = Some(e.comment.clone());
+            changed.push("comment".into());
+        }
+        for (pi, p) in s.projects.iter().enumerate() {
+            for (fi, f) in p.fields.iter().enumerate() {
+                let cur = e.project_values.get(pi).and_then(|r| r.get(fi)).cloned().unwrap_or_default();
+                let orig = current_field_value(f);
+                if cur != orig {
+                    edit.project_fields.push(ProjectFieldEdit {
+                        project_id: p.project_id.clone(),
+                        item_id: p.item_id.clone(),
+                        field_id: f.field_id.clone(),
+                        kind: f.kind.clone(),
+                        value: cur,
+                    });
+                    changed.push(format!("project:{}", f.name));
+                }
+            }
+        }
+        if changed.is_empty() {
+            self.issue_editor.status = Some("no changes".into());
+            return Action::None;
+        }
+        let summary = format!("Save {}#{}: {}", e.repo, e.number.unwrap_or(0), changed.join(", "));
+        self.issue_confirm = Some(IssueConfirm {
+            app: e.app.clone(),
+            item: e.item.clone(),
+            op: IssueOp::Edit(edit),
+            message: String::new(),
+            summary,
+        });
+        Action::None
+    }
+
+    /// Confirmation prompt reducer for a mutating issue action (S30). For a
+    /// commit the message is editable (Enter sends); others are y/n.
+    pub fn issue_confirm_key(&mut self, key: KeyEvent) -> Action {
+        let is_commit = matches!(self.issue_confirm.as_ref().map(|c| &c.op), Some(IssueOp::Commit));
+        if is_commit {
+            match key.code {
+                KeyCode::Esc => {
+                    self.issue_confirm = None;
+                }
+                KeyCode::Enter => return self.send_issue_confirm(),
+                KeyCode::Backspace => {
+                    if let Some(c) = self.issue_confirm.as_mut() {
+                        c.message.pop();
+                    }
+                }
+                KeyCode::Char(ch) => {
+                    if let Some(c) = self.issue_confirm.as_mut() {
+                        c.message.push(ch);
+                    }
+                }
+                _ => {}
+            }
+            return Action::None;
+        }
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => self.send_issue_confirm(),
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.issue_confirm = None;
+                self.status_msg = Some("cancelled".into());
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    fn send_issue_confirm(&mut self) -> Action {
+        let Some(c) = self.issue_confirm.take() else { return Action::None };
+        let rid = self.next_apps_id();
+        self.issue_action_id = rid;
+        self.status_msg = Some("running\u{2026}".into());
+        match c.op {
+            IssueOp::Branch => Action::Apps(ClientMsg::IssueBranch { id: rid, app: c.app, item: c.item }),
+            IssueOp::Commit => {
+                Action::Apps(ClientMsg::IssueCommit { id: rid, app: c.app, item: c.item, message: c.message })
+            }
+            IssueOp::Edit(edit) => Action::Apps(ClientMsg::IssueEdit { id: rid, app: c.app, item: c.item, edit }),
+            IssueOp::Create(issue) => {
+                let repo = c.item.strip_prefix("issue:new|").unwrap_or(&self.issue_editor.repo).to_string();
+                Action::Apps(ClientMsg::IssueCreate { id: rid, app: c.app, repo, issue })
+            }
+        }
     }
 
     /// Marks the apps engine offline (missing or exited).
@@ -1397,6 +1943,32 @@ impl App {
                     self.apps.open_menu(&it);
                 }
             }
+            // S30: e edits an issue (or opens the new-issue form on the + row),
+            // b creates/switches the issue branch, c commits staged changes.
+            KeyCode::Char('e') => {
+                if let Some(it) = self.apps.selected_visible_item() {
+                    match it.kind.as_deref() {
+                        Some("issue") => return self.open_issue_editor(app, it.id),
+                        Some("newissue") => return self.open_new_issue(app, &it.id),
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::Char('b') => {
+                if let Some(it) = self.apps.selected_visible_item() {
+                    if it.kind.as_deref() == Some("issue") {
+                        return self.start_issue_branch(app, it.id);
+                    }
+                }
+            }
+            KeyCode::Char('c') => {
+                if let Some(it) = self.apps.selected_visible_item() {
+                    if it.kind.as_deref() == Some("issue") {
+                        let title = it.title.rsplit(" \u{b7} ").next().unwrap_or("").to_string();
+                        return self.start_issue_commit(app, it.id, &title);
+                    }
+                }
+            }
             KeyCode::Char('r') => {
                 let rid = self.next_apps_id();
                 if let Some(frame) = self.apps.nav.last() {
@@ -1417,6 +1989,9 @@ impl App {
                         // A GitHub issue/PR leaf: Enter opens the in-terminal
                         // reader directly (S27); `a` still opens the action menu.
                         return self.open_reader(app, it.id);
+                    } else if it.kind.as_deref() == Some("newissue") {
+                        // The "+ New issue" row opens the empty editor (S30).
+                        return self.open_new_issue(app, &it.id);
                     } else if it.kind.is_none() && self.apps.nav.is_empty() {
                         // A flat item (Slack): Enter opens the reply editor as
                         // before; its actions (e.g. open) are reached with `a`.
@@ -1466,6 +2041,14 @@ impl App {
                         if action.id == "view" {
                             // The reader action opens the overlay (S27).
                             return self.open_reader(app, m.item_id);
+                        }
+                        if action.id == "edit" {
+                            // The edit action opens the issue editor (S30).
+                            return self.open_issue_editor(app, m.item_id);
+                        }
+                        if action.id == "new" {
+                            // The + New issue action opens the empty editor (S30).
+                            return self.open_new_issue(app, &m.item_id);
                         }
                         if action.confirm {
                             self.apps.confirm = Some(crate::apps_panel::Confirm {
@@ -1715,6 +2298,10 @@ impl App {
         if overlay == Overlay::Reader {
             return self.reader_key(key);
         }
+        // The issue editor has its own reducer (S30).
+        if overlay == Overlay::IssueEditor {
+            return self.issue_editor_key(key);
+        }
         match key.code {
             KeyCode::Esc => self.overlay = None,
             KeyCode::Up | KeyCode::Char('k') => self.overlay_move(overlay, -1),
@@ -1723,7 +2310,7 @@ impl App {
                 Overlay::Files => self.toggle_or_open_selected(),
                 Overlay::Changes => self.open_selected_change(),
                 Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch | Overlay::GitGraph
-                | Overlay::Conversations | Overlay::Reader => {}
+                | Overlay::Conversations | Overlay::Reader | Overlay::IssueEditor => {}
             },
             _ => {}
         }
@@ -1784,6 +2371,20 @@ impl App {
                     action: "open".to_string(),
                 })
             }
+            // S30: from an issue reader, e edits, b branches, c commits.
+            KeyCode::Char('e') if self.reader.item.starts_with("issue:") => {
+                let (app, item) = (self.reader.app.clone(), self.reader.item.clone());
+                self.open_issue_editor(app, item)
+            }
+            KeyCode::Char('b') if self.reader.item.starts_with("issue:") => {
+                let (app, item) = (self.reader.app.clone(), self.reader.item.clone());
+                self.start_issue_branch(app, item)
+            }
+            KeyCode::Char('c') if self.reader.item.starts_with("issue:") => {
+                let title = self.reader.title.rsplit(" \u{b7} ").next().unwrap_or("").to_string();
+                let (app, item) = (self.reader.app.clone(), self.reader.item.clone());
+                self.start_issue_commit(app, item, &title)
+            }
             _ => Action::None,
         }
     }
@@ -1793,7 +2394,7 @@ impl App {
             Overlay::Files => self.selected = clamp_index(self.selected, delta, self.entries.len()),
             Overlay::Changes => self.change_selected = clamp_index(self.change_selected, delta, self.changes().len()),
             Overlay::Help | Overlay::Apps | Overlay::Explain | Overlay::Arch | Overlay::GitGraph
-            | Overlay::Conversations | Overlay::Reader => {}
+            | Overlay::Conversations | Overlay::Reader | Overlay::IssueEditor => {}
         }
     }
 
@@ -2557,7 +3158,8 @@ impl App {
                     }
                 }
             }
-            Overlay::Help | Overlay::Explain | Overlay::Arch | Overlay::GitGraph | Overlay::Reader => {}
+            Overlay::Help | Overlay::Explain | Overlay::Arch | Overlay::GitGraph | Overlay::Reader
+            | Overlay::IssueEditor => {}
         }
         Action::None
     }
@@ -3771,10 +4373,18 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
                 app.reader.scroll = max_down;
             }
             frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
+        } else if overlay == Overlay::IssueEditor {
+            // Issue editor (S30): field list + per-field edit / pick-list.
+            let kind = if app.issue_editor.number.is_some() { "edit" } else { "new" };
+            let title = format!(" Issue {} · ↑↓/Tab move · Enter edit · s save · Esc ", kind);
+            let w = area.width.saturating_sub(2) as usize;
+            let h = area.height.saturating_sub(2).max(1) as usize;
+            let lines = issue_editor_lines(app, w, h);
+            frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
         } else {
         let (title, lines) = match overlay {
             Overlay::Explain | Overlay::Arch | Overlay::GitGraph | Overlay::Conversations
-            | Overlay::Reader => {
+            | Overlay::Reader | Overlay::IssueEditor => {
                 unreachable!("handled above")
             }
             Overlay::Files => {
@@ -3810,6 +4420,32 @@ pub fn draw(frame: &mut Frame, app: &mut App, pty: Option<&PtyPane>, shell: Opti
         };
         frame.render_widget(Paragraph::new(lines).block(block.title(title)), area);
         }
+    }
+
+    // A mutating-issue confirmation prompt renders on top of everything (S30).
+    if let Some(c) = &app.issue_confirm {
+        let area = centered(l.chat, 70, 30);
+        frame.render_widget(Clear, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Confirm · S30 ");
+        let mut lines = vec![Line::styled(sanitize_line(&c.summary), Style::default().fg(Color::White))];
+        lines.push(Line::raw(""));
+        match &c.op {
+            IssueOp::Commit => {
+                lines.push(Line::styled(
+                    format!("message: {}\u{2588}", sanitize_line(&c.message)),
+                    Style::default().fg(Color::Cyan),
+                ));
+                lines.push(Line::raw(""));
+                lines.push(Line::styled("Enter commit · Esc cancel", Style::default().fg(Color::DarkGray)));
+            }
+            _ => {
+                lines.push(Line::styled("y confirm · n/Esc cancel", Style::default().fg(Color::DarkGray)));
+            }
+        }
+        frame.render_widget(Paragraph::new(lines).block(block), area);
     }
 
     let status = if app.prefix {
@@ -3878,6 +4514,9 @@ pub fn help_lines() -> Vec<Line<'static>> {
         "        minimized box to restore it (S26).".into(),
         "Apps: ↑↓ select · Enter app→items→reply · a actions (open) · Esc back".into(),
         "      GitHub issue/PR: Enter opens the in-terminal reader (S27)".into(),
+        "      GitHub issue: e edit fields+Project · b issue branch · c commit staged".into(),
+        "      editor: ↑↓/Tab move · Enter edit/toggle/pick · s save (confirm) · Esc".into(),
+        "      ＋ New issue row: e / Enter opens the empty editor (S30)".into(),
         "      reader: ↑↓/j k/PgUp/PgDn + wheel scroll · y copy · o open · Esc close".into(),
         "      +/- resize the expanded panel (40-70%) · click an app to open it".into(),
         "      header: [_] collapse · [□] expand · click “Apps” to toggle".into(),
@@ -3892,6 +4531,126 @@ pub fn help_lines() -> Vec<Line<'static>> {
     .into_iter()
     .map(Line::raw)
     .collect()
+}
+
+/// Splits a comma-separated field into trimmed, non-empty values (S30).
+fn split_csv(s: &str) -> Vec<String> {
+    s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect()
+}
+
+/// The current working value id/number/text of a Project field (S30): for a
+/// single-select / iteration this maps the current display name back to its
+/// option id so a diff compares ids, not labels.
+fn current_field_value(f: &gentle_apps::protocol::ProjectFieldSchema) -> String {
+    match f.current.as_deref() {
+        None => String::new(),
+        Some(cur) => {
+            if f.kind == "single_select" || f.kind == "iteration" {
+                f.options.iter().find(|o| o.name == cur).map(|o| o.id.clone()).unwrap_or_default()
+            } else {
+                cur.to_string()
+            }
+        }
+    }
+}
+
+/// Renders the issue editor overlay body (S30): a loading/error line, then each
+/// field with its working value, the open text-edit buffer or pick-list, plus
+/// the note/status lines.
+fn issue_editor_lines(app: &App, w: usize, _h: usize) -> Vec<Line<'static>> {
+    let e = &app.issue_editor;
+    if e.loading {
+        return vec![Line::styled("loading\u{2026}", Style::default().fg(Color::DarkGray))];
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if let Some(err) = &e.error {
+        out.push(Line::styled(format!("\u{26a0} {}", sanitize_line(err)), Style::default().fg(Color::Red)));
+    }
+    if let Some(note) = &e.note {
+        out.push(Line::styled(sanitize_line(note), Style::default().fg(Color::Yellow)));
+    }
+    let repo_line = match e.number {
+        Some(n) => format!("{}#{}", e.repo, n),
+        None => format!("{} (new issue)", e.repo),
+    };
+    out.push(Line::styled(sanitize_line(&repo_line), Style::default().fg(Color::Cyan)));
+    out.push(Line::raw(""));
+
+    let fields = app.editor_fields();
+    for (i, field) in fields.iter().enumerate() {
+        let (label, value) = editor_field_display(app, field);
+        let selected = i == e.sel;
+        let editing = selected && e.editing;
+        let shown = if editing { format!("{}\u{2588}", e.edit_buf) } else { value };
+        // Keep each row to one visible line (multi-line body shows its first).
+        let first = shown.lines().next().unwrap_or("").to_string();
+        let suffix = if shown.contains('\n') { " \u{21b5}…" } else { "" };
+        let text = format!("{:>10}: {}{}", label, fit(&sanitize_line(&first), w.saturating_sub(14)), suffix);
+        let mut style = Style::default();
+        if selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        out.push(Line::styled(text, style));
+        // Render the open pick-list right under its field.
+        if selected {
+            if let Some(pick) = &e.pick {
+                for (j, (_, disp)) in pick.options.iter().enumerate() {
+                    let marker = if j == pick.sel { "\u{25b8} " } else { "  " };
+                    let mut st = Style::default().fg(Color::Green);
+                    if j == pick.sel {
+                        st = st.add_modifier(Modifier::BOLD);
+                    }
+                    out.push(Line::styled(format!("      {marker}{}", sanitize_line(disp)), st));
+                }
+            }
+        }
+    }
+    if let Some(status) = &e.status {
+        out.push(Line::raw(""));
+        out.push(Line::styled(sanitize_line(status), Style::default().fg(Color::Yellow)));
+    }
+    out.push(Line::raw(""));
+    out.push(Line::styled(
+        "Enter edit/toggle/pick · Shift+Enter newline (body/comment) · s save · Esc close",
+        Style::default().fg(Color::DarkGray),
+    ));
+    out
+}
+
+/// `(label, display value)` for one editor field row (S30).
+fn editor_field_display(app: &App, field: &EditorField) -> (String, String) {
+    let e = &app.issue_editor;
+    match field {
+        EditorField::Title => ("Title".into(), e.title.clone()),
+        EditorField::Body => ("Body".into(), e.body.clone()),
+        EditorField::State => ("State".into(), e.state.clone()),
+        EditorField::Assignees => ("Assignees".into(), e.assignees.join(", ")),
+        EditorField::Labels => ("Labels".into(), e.labels.join(", ")),
+        EditorField::Milestone => (
+            "Milestone".into(),
+            e.milestone
+                .and_then(|n| e.schema.milestones.iter().find(|m| m.number == n).map(|m| m.title.clone()))
+                .or_else(|| e.milestone.map(|n| format!("#{n}")))
+                .unwrap_or_else(|| "(none)".into()),
+        ),
+        EditorField::Comment => ("Comment".into(), e.comment.clone()),
+        EditorField::Project { pi, fi } => {
+            let f = &e.schema.projects[*pi].fields[*fi];
+            let val = e.project_values.get(*pi).and_then(|r| r.get(*fi)).cloned().unwrap_or_default();
+            let disp = if f.kind == "single_select" || f.kind == "iteration" {
+                if val.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    f.options.iter().find(|o| o.id == val).map(|o| o.name.clone()).unwrap_or(val)
+                }
+            } else if val.is_empty() {
+                "(none)".to_string()
+            } else {
+                val
+            };
+            (f.name.clone(), disp)
+        }
+    }
 }
 
 /// Renders the in-terminal GitHub reader body (S27): a loading/error line, or
@@ -6353,6 +7112,183 @@ mod tests {
         assert_eq!(app.handle_mouse(up), Action::ScrollShell(1));
         let down = MouseEvent { kind: MouseEventKind::ScrollDown, column: term.x + 1, row: term.y + 1, modifiers: KeyModifiers::NONE };
         assert_eq!(app.handle_mouse(down), Action::ScrollShell(-1));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    // ---------- S30: issue editor + branch/commit ----------
+
+    fn gh_issue_item(id: &str, title: &str) -> AppItem {
+        AppItem {
+            id: id.into(),
+            title: title.into(),
+            kind: Some("issue".into()),
+            actions: vec![
+                gentle_apps::protocol::ItemAction { id: "view".into(), label: "View".into(), confirm: false },
+                gentle_apps::protocol::ItemAction { id: "edit".into(), label: "Edit issue".into(), confirm: false },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn new_issue_row(repo: &str) -> AppItem {
+        AppItem {
+            id: format!("issue:new|{repo}"),
+            title: "\u{ff0b} New issue".into(),
+            kind: Some("newissue".into()),
+            actions: vec![gentle_apps::protocol::ItemAction { id: "new".into(), label: "New issue".into(), confirm: false }],
+            ..Default::default()
+        }
+    }
+
+    /// Drives the github app into View::Items with the given items.
+    fn github_items(app: &mut App, items: Vec<AppItem>) {
+        app.mode = Mode::Workspace;
+        app.focus = Focus::Apps;
+        app.apply_apps_msg(EngineMsg::Apps { apps: vec![app_status("github", "GitHub", AppStatusKind::Connected)] });
+        app.apply_apps_msg(EngineMsg::Items { app: "github".into(), items });
+        render(app, 120, 40);
+        app.handle_key(key(KeyCode::Enter)); // enter the app → View::Items
+    }
+
+    #[test]
+    fn issue_editor_opens_edits_title_and_saves_only_the_changed_field() {
+        let root = fixture("issue-edit");
+        let mut app = App::new(root.clone());
+        github_items(&mut app, vec![gh_issue_item("issue:o/r#7", "r#7 \u{b7} Old title")]);
+
+        // `e` opens the editor and requests the schema.
+        let act = app.handle_key(ch('e'));
+        let rid = match act {
+            Action::Apps(ClientMsg::IssueForm { id, app: a, item }) => {
+                assert_eq!((a.as_str(), item.as_str()), ("github", "issue:o/r#7"));
+                id
+            }
+            other => panic!("expected IssueForm, got {other:?}"),
+        };
+        assert_eq!(app.overlay, Some(Overlay::IssueEditor));
+
+        // The schema arrives and fills the editor.
+        app.apply_apps_msg(EngineMsg::IssueForm {
+            id: rid,
+            app: "github".into(),
+            item: "issue:o/r#7".into(),
+            schema: IssueSchema {
+                repo: "o/r".into(),
+                number: Some(7),
+                title: "Old title".into(),
+                state: "open".into(),
+                ..Default::default()
+            },
+        });
+        assert!(!app.issue_editor.loading);
+        assert_eq!(app.issue_editor.title, "Old title");
+
+        // Edit the title (field 0): Enter → type → Enter commits.
+        app.handle_key(key(KeyCode::Enter));
+        assert!(app.issue_editor.editing);
+        for _ in 0..9 {
+            app.handle_key(key(KeyCode::Backspace));
+        }
+        for c in "New".chars() {
+            app.handle_key(ch(c));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.issue_editor.title, "New");
+
+        // Save shows a confirmation naming only the changed field.
+        app.handle_key(ch('s'));
+        let confirm = app.issue_confirm.as_ref().expect("confirmation shown");
+        assert!(confirm.summary.contains("title"), "{}", confirm.summary);
+        assert!(!confirm.summary.contains("body"));
+
+        // Confirming sends the edit with only the changed field in the diff.
+        let act = app.handle_key(ch('y'));
+        match act {
+            Action::Apps(ClientMsg::IssueEdit { app: a, item, edit, .. }) => {
+                assert_eq!((a.as_str(), item.as_str()), ("github", "issue:o/r#7"));
+                assert_eq!(edit.title.as_deref(), Some("New"));
+                assert_eq!(edit.body, None);
+                assert!(edit.project_fields.is_empty());
+            }
+            other => panic!("expected IssueEdit, got {other:?}"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn new_issue_row_opens_the_empty_editor_and_creates() {
+        let root = fixture("issue-new");
+        let mut app = App::new(root.clone());
+        github_items(&mut app, vec![new_issue_row("o/r"), gh_issue_item("issue:o/r#7", "r#7 \u{b7} x")]);
+
+        // The + row (index 0) opens the new-issue form.
+        let act = app.handle_key(ch('e'));
+        let rid = match act {
+            Action::Apps(ClientMsg::NewIssueForm { id, repo, .. }) => {
+                assert_eq!(repo, "o/r");
+                id
+            }
+            other => panic!("expected NewIssueForm, got {other:?}"),
+        };
+        app.apply_apps_msg(EngineMsg::IssueForm {
+            id: rid,
+            app: "github".into(),
+            item: "issue:new|o/r".into(),
+            schema: IssueSchema { repo: "o/r".into(), number: None, state: "open".into(), ..Default::default() },
+        });
+        assert_eq!(app.issue_editor.number, None);
+
+        // Title is empty → save refuses until a title is entered.
+        app.handle_key(ch('s'));
+        assert!(app.issue_confirm.is_none());
+        app.handle_key(key(KeyCode::Enter)); // edit title
+        for c in "Bug".chars() {
+            app.handle_key(ch(c));
+        }
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(ch('s'));
+        assert!(app.issue_confirm.as_ref().unwrap().summary.contains("Create"));
+        let act = app.handle_key(ch('y'));
+        match act {
+            Action::Apps(ClientMsg::IssueCreate { repo, issue, .. }) => {
+                assert_eq!(repo, "o/r");
+                assert_eq!(issue.title, "Bug");
+            }
+            other => panic!("expected IssueCreate, got {other:?}"),
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn issue_branch_and_commit_send_after_confirm_and_esc_cancels() {
+        let root = fixture("issue-bc");
+        let mut app = App::new(root.clone());
+        github_items(&mut app, vec![gh_issue_item("issue:o/r#7", "r#7 \u{b7} Fix it")]);
+
+        // `b` asks to confirm, then y sends the branch action.
+        assert_eq!(app.handle_key(ch('b')), Action::None);
+        assert!(app.issue_confirm.is_some());
+        let act = app.handle_key(ch('y'));
+        assert!(matches!(act, Action::Apps(ClientMsg::IssueBranch { item, .. }) if item == "issue:o/r#7"));
+
+        // `c` opens an editable, prefilled commit message; Enter sends it.
+        assert_eq!(app.handle_key(ch('c')), Action::None);
+        let msg = app.issue_confirm.as_ref().unwrap().message.clone();
+        assert_eq!(msg, "Fix it (refs #7)");
+        let act = app.handle_key(key(KeyCode::Enter));
+        match act {
+            Action::Apps(ClientMsg::IssueCommit { item, message, .. }) => {
+                assert_eq!(item, "issue:o/r#7");
+                assert_eq!(message, "Fix it (refs #7)");
+            }
+            other => panic!("expected IssueCommit, got {other:?}"),
+        }
+
+        // Esc on the confirmation cancels with no action.
+        app.handle_key(ch('b'));
+        assert!(app.issue_confirm.is_some());
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        assert!(app.issue_confirm.is_none());
         fs::remove_dir_all(root).unwrap();
     }
 }

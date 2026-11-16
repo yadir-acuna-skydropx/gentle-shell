@@ -933,3 +933,188 @@ fn build_detail_strips_terminal_control_and_escape_sequences() {
     assert!(body.chars().all(|c| c == '\n' || !gentle_apps::sanitize::is_unsafe(c)), "body: {body:?}");
     assert!(!body.contains('\x1b'));
 }
+
+// ---------- T31 / S30: issue editing, Projects, create, branch, commit ----------
+
+/// The current staged/HEAD branch name of a repo.
+fn current_branch(dir: &Path) -> String {
+    let out = Command::new("git").arg("-C").arg(dir).args(["rev-parse", "--abbrev-ref", "HEAD"]).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[test]
+fn issue_form_fetches_current_values_and_options_off_the_ui_thread() {
+    let server = FakeServer::start(|rec| {
+        if rec.path == "/repos/octo/repo/issues/7" {
+            FakeResp::json(
+                r#"{"number":7,"title":"A bug","body":"desc","state":"open","assignees":[{"login":"ann"}],"labels":[{"name":"bug"}],"milestone":{"number":3}}"#,
+            )
+        } else if rec.path == "/repos/octo/repo/labels" {
+            FakeResp::json(r#"[{"name":"bug"},{"name":"p1"}]"#)
+        } else if rec.path == "/repos/octo/repo/assignees" {
+            FakeResp::json(r#"[{"login":"ann"},{"login":"bob"}]"#)
+        } else if rec.path == "/repos/octo/repo/milestones" {
+            FakeResp::json(r#"[{"number":3,"title":"v1"}]"#)
+        } else if rec.path == "/graphql" {
+            FakeResp::json(
+                r#"{"data":{"repository":{"issue":{"projectItems":{"nodes":[{"id":"PVTI_1","project":{"id":"PVT_1","title":"Roadmap","fields":{"nodes":[{"id":"F_status","name":"Status","dataType":"SINGLE_SELECT","options":[{"id":"o1","name":"Todo"}]}]}},"fieldValues":{"nodes":[{"name":"Todo","field":{"id":"F_status"}}]}}]}}}}}"#,
+            )
+        } else {
+            FakeResp::json("{}")
+        }
+    });
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, tempdir("iform"));
+    let schema = c.issue_form("issue:octo/repo#7").unwrap();
+    assert_eq!(schema.number, Some(7));
+    assert_eq!(schema.title, "A bug");
+    assert_eq!(schema.state, "open");
+    assert_eq!(schema.assignees, vec!["ann".to_string()]);
+    assert_eq!(schema.labels, vec!["bug".to_string()]);
+    assert_eq!(schema.milestone, Some(3));
+    assert_eq!(schema.assignable_users, vec!["ann".to_string(), "bob".to_string()]);
+    assert_eq!(schema.repo_labels, vec!["bug".to_string(), "p1".to_string()]);
+    assert_eq!(schema.milestones.len(), 1);
+    assert_eq!(schema.projects.len(), 1);
+    assert_eq!(schema.projects[0].fields[0].name, "Status");
+    assert!(schema.note.is_none());
+}
+
+#[test]
+fn issue_form_reports_the_scope_hint_when_projects_are_forbidden() {
+    let server = FakeServer::start(|rec| {
+        if rec.path == "/graphql" {
+            FakeResp::json(r#"{"errors":[{"type":"FORBIDDEN","message":"Resource not accessible by personal access token"}]}"#)
+        } else if rec.path == "/repos/octo/repo/issues/7" {
+            FakeResp::json(r#"{"number":7,"title":"A bug","state":"open"}"#)
+        } else {
+            FakeResp::json("[]")
+        }
+    });
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, tempdir("iscope"));
+    let schema = c.issue_form("issue:octo/repo#7").unwrap();
+    assert!(schema.projects.is_empty());
+    assert_eq!(schema.note.as_deref(), Some("Project fields need: gh auth refresh -s project"));
+}
+
+#[test]
+fn issue_edit_patches_only_changed_fields_then_posts_comment_and_project_field() {
+    let server = FakeServer::start(|rec| {
+        if rec.path == "/graphql" {
+            FakeResp::json(r#"{"data":{"updateProjectV2ItemFieldValue":{"projectV2Item":{"id":"PVTI_1"}}}}"#)
+        } else {
+            FakeResp { status: 200, headers: vec![], body: "{}".into() }
+        }
+    });
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, tempdir("iedit"));
+    let edit = gentle_apps::protocol::IssueFieldEdit {
+        title: Some("New title".into()),
+        comment: Some("a note".into()),
+        project_fields: vec![gentle_apps::protocol::ProjectFieldEdit {
+            project_id: "PVT_1".into(),
+            item_id: "PVTI_1".into(),
+            field_id: "F_status".into(),
+            kind: "single_select".into(),
+            value: "o1".into(),
+        }],
+        ..Default::default()
+    };
+    let msg = c.issue_edit("issue:octo/repo#7", &edit).unwrap();
+    assert!(msg.contains("fields") && msg.contains("comment") && msg.contains("project field"), "{msg}");
+    let reqs = server.requests();
+    let patch = reqs.iter().find(|r| r.method == "PATCH").expect("one PATCH");
+    assert_eq!(patch.path, "/repos/octo/repo/issues/7");
+    let body: serde_json::Value = serde_json::from_str(&patch.body).unwrap();
+    // Only the changed field is in the PATCH (no comment, no state, no labels).
+    assert_eq!(body, serde_json::json!({"title": "New title"}));
+    assert!(reqs.iter().any(|r| r.method == "POST" && r.path == "/repos/octo/repo/issues/7/comments"));
+    assert!(reqs.iter().any(|r| r.method == "POST" && r.path == "/graphql"));
+}
+
+#[test]
+fn issue_create_posts_a_new_issue() {
+    let server = FakeServer::start(|rec| {
+        if rec.method == "POST" && rec.path == "/repos/octo/repo/issues" {
+            FakeResp { status: 201, headers: vec![], body: r#"{"number":99,"title":"T"}"#.into() }
+        } else {
+            FakeResp::json("{}")
+        }
+    });
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, tempdir("icreate"));
+    let issue = gentle_apps::protocol::NewIssue {
+        title: "T".into(),
+        body: "B".into(),
+        labels: vec!["bug".into()],
+        ..Default::default()
+    };
+    let msg = c.issue_create("octo/repo", &issue).unwrap();
+    assert!(msg.contains("created repo#99"), "{msg}");
+    let reqs = server.requests();
+    let post = reqs.iter().find(|r| r.method == "POST").unwrap();
+    let body: serde_json::Value = serde_json::from_str(&post.body).unwrap();
+    assert_eq!(body, serde_json::json!({"title": "T", "body": "B", "labels": ["bug"]}));
+    // An empty title never hits the network.
+    assert!(c.issue_create("octo/repo", &gentle_apps::protocol::NewIssue::default()).is_err());
+}
+
+#[test]
+fn issue_branch_creates_then_switches_and_refuses_a_dirty_switch() {
+    let server = FakeServer::start(|rec| {
+        if rec.path == "/repos/octo/repo/issues/7" {
+            FakeResp::json(r#"{"number":7,"title":"Fix the Login Bug!"}"#)
+        } else {
+            FakeResp::json("{}")
+        }
+    });
+    let repo = tempdir("ibranch");
+    init_repo(&repo, "https://github.com/octo/repo.git");
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, repo.clone());
+
+    // First call creates and switches to the derived branch.
+    let msg = c.issue_branch("issue:octo/repo#7").unwrap();
+    assert!(msg.contains("created 7-fix-the-login-bug"), "{msg}");
+    assert_eq!(current_branch(&repo), "7-fix-the-login-bug");
+
+    // Back on main, a clean second call switches to the existing branch.
+    git(&repo, &["checkout", "-q", "main"]);
+    let msg = c.issue_branch("issue:octo/repo#7").unwrap();
+    assert!(msg.contains("switched to 7-fix-the-login-bug"), "{msg}");
+
+    // On main with a dirty tree, switching refuses (never --force).
+    git(&repo, &["checkout", "-q", "main"]);
+    std::fs::write(repo.join("a.txt"), "uncommitted\n").unwrap();
+    let err = c.issue_branch("issue:octo/repo#7").unwrap_err();
+    assert!(err.contains("working tree has changes"), "{err}");
+    assert_eq!(current_branch(&repo), "main");
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn issue_commit_refuses_with_nothing_staged_and_commits_only_staged_with_the_exact_message() {
+    let server = FakeServer::start(poll_handler);
+    let repo = tempdir("icommit");
+    init_repo(&repo, "https://github.com/octo/repo.git");
+    let (token, _) = FixedToken::single("tok");
+    let (mut c, _) = connector_with(&server, token, repo.clone());
+
+    // Nothing staged: refuse with a clear hint; never stages automatically.
+    std::fs::write(repo.join("b.txt"), "unstaged\n").unwrap();
+    let err = c.issue_commit("issue:octo/repo#7", "Fix (refs #7)").unwrap_err();
+    assert!(err.contains("nothing staged"), "{err}");
+
+    // Stage only b.txt, leave another file unstaged, then commit.
+    git(&repo, &["add", "b.txt"]);
+    std::fs::write(repo.join("c.txt"), "still unstaged\n").unwrap();
+    let msg = c.issue_commit("issue:octo/repo#7", "Fix login (refs #7)").unwrap();
+    assert!(msg.contains("committed"), "{msg}");
+    // The commit used the exact message and did NOT add c.txt (no git add -A).
+    let last = Command::new("git").arg("-C").arg(&repo).args(["log", "-1", "--pretty=%s"]).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&last.stdout).trim(), "Fix login (refs #7)");
+    let status = Command::new("git").arg("-C").arg(&repo).args(["status", "--porcelain"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&status.stdout).contains("c.txt"), "c.txt stays unstaged/untracked");
+    std::fs::remove_dir_all(&repo).ok();
+}
