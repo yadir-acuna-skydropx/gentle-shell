@@ -12,6 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 INSTALL="$SCRIPT_DIR/install.sh"
 UPDATE="$SCRIPT_DIR/update.sh"
 LIB="$SCRIPT_DIR/lib/tools.sh"
+LIBE="$SCRIPT_DIR/lib/engram.sh"
 
 TESTTMP="$(mktemp -d "${TMPDIR:-/tmp}/gp-test.XXXXXX")"
 trap 'rm -rf "$TESTTMP"' EXIT
@@ -21,14 +22,14 @@ bad()  { fail=$((fail + 1)); printf 'FAIL - %s\n' "$1"; }
 check() { if "$@"; then ok "$DESC"; else bad "$DESC"; fi; }
 
 # ---- 1. syntax -------------------------------------------------------------
-for f in "$INSTALL" "$UPDATE" "$LIB"; do
+for f in "$INSTALL" "$UPDATE" "$LIB" "$LIBE"; do
   DESC="bash -n $(basename "$f")"
   if bash -n "$f" 2>"$TESTTMP/bn.err"; then ok "$DESC"; else bad "$DESC"; cat "$TESTTMP/bn.err"; fi
 done
 
 # ---- 2. shellcheck (optional) ---------------------------------------------
 if command -v shellcheck >/dev/null 2>&1; then
-  for f in "$INSTALL" "$UPDATE" "$LIB"; do
+  for f in "$INSTALL" "$UPDATE" "$LIB" "$LIBE"; do
     DESC="shellcheck $(basename "$f")"
     if shellcheck -S warning "$f"; then ok "$DESC"; else bad "$DESC"; fi
   done
@@ -60,6 +61,15 @@ assert_contains "[2/6] Rust toolchain"
 assert_contains "[3/6] Partitioner engines"
 assert_contains "[4/6] gentle-shell launcher"
 assert_contains "[5/6] Security tools"
+assert_contains "[6/6] Engram memory server health"
+assert_contains "engram: health check (planned)"
+
+# --help lists the new Engram flags
+HELP="$(bash "$INSTALL" --help 2>&1)"
+DESC="--help lists --fix-engram"
+if printf '%s' "$HELP" | grep -qF -- "--fix-engram"; then ok "$DESC"; else bad "$DESC"; fi
+DESC="--help lists --no-engram"
+if printf '%s' "$HELP" | grep -qF -- "--no-engram"; then ok "$DESC"; else bad "$DESC"; fi
 assert_contains "cargo install --locked --force --path"
 assert_contains "/partitioner/apps"
 assert_contains "/partitioner/engines"
@@ -109,6 +119,41 @@ if printf '%s' "$UPLAN" | grep -qF "merge --ff-only" \
 else
   bad "$DESC"
 fi
+
+# ---- 6. engram helpers (pure) ----------------------------------------------
+# shellcheck source=lib/engram.sh
+. "$LIBE"
+
+DESC="engram_parse_health_version extracts the version"
+if [ "$(engram_parse_health_version '{"service":"engram","status":"ok","version":"3.7.2"}')" = "3.7.2" ]; then ok "$DESC"; else bad "$DESC"; fi
+
+DESC="engram_parse_health_version is empty without a version"
+if [ -z "$(engram_parse_health_version '{"status":"ok"}')" ]; then ok "$DESC"; else bad "$DESC"; fi
+
+DESC="semver_lt: 3.5.2 < 3.7.2"
+if semver_lt 3.5.2 3.7.2; then ok "$DESC"; else bad "$DESC"; fi
+
+DESC="semver_lt: equal is not less"
+if semver_lt 3.7.2 3.7.2; then bad "$DESC"; else ok "$DESC"; fi
+
+DESC="semver_lt: numeric, 3.10.0 is not < 3.9.9"
+if semver_lt 3.10.0 3.9.9; then bad "$DESC"; else ok "$DESC"; fi
+
+DESC="semver_lt: numeric, 3.9.9 < 3.10.0"
+if semver_lt 3.9.9 3.10.0; then ok "$DESC"; else bad "$DESC"; fi
+
+FAKERT="$TESTTMP/runtime"
+mkdir -p "$FAKERT/engram-3.5.2" "$FAKERT/engram-3.7.2" "$FAKERT/engram-3.10.1" "$FAKERT/not-engram"
+DESC="engram_newest_runtime_version picks the highest X.Y.Z"
+if [ "$(GENTLE_SHELL_RUNTIME_DIR="$FAKERT" engram_newest_runtime_version)" = "3.10.1" ]; then ok "$DESC"; else bad "$DESC"; fi
+
+FAKESTORE="$TESTTMP/store"
+mkdir -p "$FAKESTORE"
+printf 'db\n'  > "$FAKESTORE/engram.db"
+printf 'wal\n' > "$FAKESTORE/engram.db-wal"
+BK="$(engram_backup_store "$FAKESTORE")"
+DESC="engram_backup_store copies the db files and keeps the source"
+if [ -f "$BK/engram.db" ] && [ -f "$BK/engram.db-wal" ] && [ -f "$FAKESTORE/engram.db" ]; then ok "$DESC"; else bad "$DESC"; fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

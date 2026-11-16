@@ -7,6 +7,8 @@
 #   install.sh --dry-run       print every command without executing anything
 #   install.sh --force         rebuild/reinstall even when nothing changed
 #   install.sh --no-security-tools   skip gitleaks/osv/trivy/cargo-audit/semgrep
+#   install.sh --fix-engram    stop a stale Engram server on 127.0.0.1:7437 and start the bundled one (backup first)
+#   install.sh --no-engram     skip the Engram server health check (step 6)
 #
 # What it installs, all under $HOME (never sudo):
 #   1. gentle-shell (which itself pins gentle-ai and Engram)
@@ -25,6 +27,8 @@ PART_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"          # .../partitioner
 REPO_ROOT="$(cd "$PART_DIR/.." && pwd)"           # repo checkout root
 # shellcheck source=lib/tools.sh
 . "$SCRIPT_DIR/lib/tools.sh"
+# shellcheck source=lib/engram.sh
+. "$SCRIPT_DIR/lib/engram.sh"
 
 # ---- user-space locations --------------------------------------------------
 BIN_DIR="$HOME/.local/bin"
@@ -39,9 +43,11 @@ UPDATE=0
 DRY_RUN=0
 FORCE=0
 SECURITY_TOOLS=1
+FIX_ENGRAM=0
+ENGRAM_CHECK=1
 
 usage() {
-  sed -n '2,20p' "$SCRIPT_DIR/install.sh" | sed 's/^# \{0,1\}//'
+  sed -n '2,21p' "$SCRIPT_DIR/install.sh" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -50,6 +56,8 @@ while [ $# -gt 0 ]; do
     --dry-run) DRY_RUN=1 ;;
     --force) FORCE=1 ;;
     --no-security-tools) SECURITY_TOOLS=0 ;;
+    --fix-engram) FIX_ENGRAM=1 ;;
+    --no-engram) ENGRAM_CHECK=0 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -390,6 +398,86 @@ update_repo() {
 }
 
 # ===========================================================================
+# 6. Engram memory server health (S36, T39)
+# ===========================================================================
+# Detect a stale, strictly-older Engram server squatting the shared port and,
+# backup-first, reconcile it so memory stops being disabled every launch. This
+# never patches gentle-shell (S1): the launcher's deliberate refusal to stop a
+# listening server stays as upstream; this installer step is our own owned code
+# that runs exactly when the stale server was most likely created (an upgrade).
+# Detection + warning (C) run on every invocation; the stop+restart (B) runs
+# only on --update/--force/--fix-engram, and only against a version strictly
+# older than the newest bundled runtime.
+reconcile_engram() {
+  step "Engram memory server health"
+  if [ "$ENGRAM_CHECK" != 1 ]; then
+    note "--no-engram: skipping the Engram server health check"
+    ok "engram: skipped"
+    return 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    note "would probe http://127.0.0.1:$(engram_port)/health and compare with the newest bundled runtime"
+    note "if the running server is strictly older and --update/--force/--fix-engram: back up $(engram_store_dir), stop it, start the bundled daemon"
+    ok "engram: health check (planned)"
+    return 0
+  fi
+  local running expected
+  running="$(engram_running_version)"
+  expected="$(engram_newest_runtime_version)"
+  if [ -z "$running" ]; then
+    note "no Engram server answering on 127.0.0.1:$(engram_port) — Shell starts it on next launch"
+    ok "engram: no running server"
+    return 0
+  fi
+  if [ -z "$expected" ]; then
+    note "running Engram $running; no bundled runtime found to compare against — left untouched"
+    ok "engram: $running (no baseline)"
+    return 0
+  fi
+  if ! semver_lt "$running" "$expected"; then
+    note "running Engram $running >= bundled $expected — healthy"
+    ok "engram: $running (healthy)"
+    return 0
+  fi
+  # Stale: the listener is strictly older than the bundled runtime (S36).
+  local store; store="$(engram_store_dir)"
+  warn "stale Engram $running on 127.0.0.1:$(engram_port) (bundled is $expected) — memory likely disabled"
+  if [ "$UPDATE" != 1 ] && [ "$FORCE" != 1 ] && [ "$FIX_ENGRAM" != 1 ]; then
+    warn "    fix: re-run with --fix-engram (backs up $store, stops the old server, starts the bundled one)"
+    fail "engram: stale server $running (not changed; use --fix-engram)"
+    return 0
+  fi
+  local backup
+  if ! backup="$(engram_backup_store "$store")"; then
+    fail "engram: backup failed — server left untouched"
+    return 0
+  fi
+  note "backup: $backup"
+  local bin
+  bin="$(engram_newest_runtime_bin)"
+  [ -n "$bin" ] || bin="$(command -v engram || true)"
+  if [ -z "$bin" ]; then
+    fail "engram: no engram binary found to start the bundled server"
+    return 0
+  fi
+  "$bin" stop >/dev/null 2>&1 || true
+  if [ -n "$(engram_running_version)" ]; then
+    local pid; pid="$(engram_listener_pid)"
+    if [ -n "$pid" ]; then kill -TERM "$pid" 2>/dev/null || true; fi
+  fi
+  local i
+  for i in 1 2 3 4 5 6 7 8; do [ -z "$(engram_running_version)" ] && break; sleep 1; done
+  "$bin" run -d >/dev/null 2>&1 || true
+  for i in 1 2 3 4 5 6; do [ -n "$(engram_running_version)" ] && break; sleep 1; done
+  local now; now="$(engram_running_version)"
+  if [ -n "$now" ] && ! semver_lt "$now" "$expected"; then
+    ok "engram: reconciled $running -> $now (backup $backup)"
+  else
+    fail "engram: reconcile incomplete (now=${now:-none}; backup kept at $backup)"
+  fi
+}
+
+# ===========================================================================
 # Final summary + user checklist
 # ===========================================================================
 final_summary() {
@@ -437,6 +525,7 @@ main() {
   build_engines
   install_launcher
   install_security_tools
+  reconcile_engram
   final_summary
   # Non-zero exit when a hard requirement failed is intentionally avoided:
   # the installer is cron-safe and reports issues without failing the run.
