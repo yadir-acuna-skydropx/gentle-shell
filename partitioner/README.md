@@ -53,6 +53,9 @@ Useful flags:
 | `--force` | rebuild/reinstall even when nothing changed |
 | `--update` | refresh everything (what `update.sh` passes) |
 | `--no-security-tools` | skip gitleaks/osv-scanner/trivy/cargo-audit/semgrep |
+| `--fix-engram` | stop a stale Engram server on `127.0.0.1:7437` and start the bundled one (backup first) |
+| `--no-engram` | skip the Engram server health check (step 6) |
+| `--no-review-models` | skip seeding the RDD review-lens model routing (step 7) |
 
 Everything lands under `$HOME`: engines in `~/.cargo/bin`, release tools in
 `~/.local/bin`, a dedicated semgrep venv in
@@ -63,6 +66,17 @@ and any single tool failure is reported in the final summary without aborting
 the install. Test the scripts (syntax, shellcheck, dry-run plan, and the
 checksum-refuse path — no real downloads) with
 `partitioner/scripts/test-install.sh`.
+
+**One prerequisite on a bare machine:** Node (`pi` / `npm` / `pnpm`) for step 1,
+which installs gentle-shell (and through it gentle-ai + Engram). The Rust
+toolchain and everything else are installed by the script; without Node, step 1
+stops with guidance. Steps 6–7 also keep the native-review stack healthy: a
+stale Engram server on port 7437 is reconciled (backup-first) and the four RDD
+review lenses are seeded into `models.json` so `gentle-ai review` can launch.
+
+See [`docs/architecture.md`](docs/architecture.md) for how every engine is
+spawned, the protocols between them, and how they plug into gentle-shell / Pi /
+gentle-ai / Engram.
 
 ### gentle-sec engine (S35)
 
