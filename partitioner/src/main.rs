@@ -262,6 +262,34 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
+/// Writes the terminal mode-set sequences that `setup_terminal` emits (alternate
+/// screen, mouse capture, bracketed paste, and the keyboard-enhancement push
+/// when enabled). All of these are idempotent mode sets, so re-emitting them is
+/// safe. For the kitty keyboard stack we pop-then-push so the stack depth stays
+/// at exactly one; `KBD_ENHANCED` is left unchanged, so `restore_terminal` still
+/// pops exactly once on exit (never double-popping). Factored out so it can be
+/// unit-tested against a byte buffer (S34).
+fn write_setup_modes<W: io::Write>(w: &mut W, kbd_enhanced: bool) -> io::Result<()> {
+    execute!(w, EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)?;
+    if kbd_enhanced {
+        execute!(
+            w,
+            PopKeyboardEnhancementFlags,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    Ok(())
+}
+
+/// Re-emits the terminal setup sequences after a resize. A reattached session
+/// (S34) hands the partitioner a fresh terminal whose modes were never set, so
+/// on every Resize we re-assert them and force a full repaint. Best-effort: a
+/// terminal that drops a sequence simply keeps its previous state.
+fn reemit_terminal_modes() {
+    let mut stdout = io::stdout();
+    let _ = write_setup_modes(&mut stdout, KBD_ENHANCED.load(Ordering::SeqCst));
+}
+
 fn install_panic_hook() {
     let default = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -541,7 +569,13 @@ fn event_loop(
                     }
                 }
             }
-            Event::Input(CtEvent::Resize(_, _)) => {}
+            Event::Input(CtEvent::Resize(_, _)) => {
+                // A reattached session may give us a fresh terminal (S34): re-assert
+                // the alternate screen, mouse, bracketed-paste and keyboard-enhance
+                // modes, then clear so the next draw repaints every cell.
+                reemit_terminal_modes();
+                let _ = terminal.clear();
+            }
             Event::Input(_) => needs_redraw = false,
             Event::PtyOutput => {
                 pty_pending.store(false, Ordering::Release);
@@ -782,7 +816,33 @@ fn spawn_shell(root: &Path, tx: Sender<Event>, pending: Arc<AtomicBool>) -> Resu
 
 #[cfg(test)]
 mod tests {
-    use super::base64_encode;
+    use super::{base64_encode, write_setup_modes};
+
+    #[test]
+    fn setup_modes_reemit_alt_screen_mouse_and_bracketed_paste() {
+        // S34: a reattached fresh terminal must get the alternate screen (?1049h),
+        // mouse capture (?1006h) and bracketed paste (?2004h) modes re-asserted.
+        let mut buf = Vec::new();
+        write_setup_modes(&mut buf, false).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("[?1049h"), "alternate screen: {s:?}");
+        assert!(s.contains("[?1006h"), "mouse capture: {s:?}");
+        assert!(s.contains("[?2004h"), "bracketed paste: {s:?}");
+        // Without keyboard enhancement no kitty stack sequence is written.
+        assert!(!s.contains("[>1u"), "no keyboard push when disabled: {s:?}");
+    }
+
+    #[test]
+    fn setup_modes_reemit_keyboard_enhancement_as_pop_then_push() {
+        // S34: with enhancement on we pop then push so the kitty stack depth stays
+        // at one; `restore_terminal` still pops exactly once (never double-pops).
+        let mut buf = Vec::new();
+        write_setup_modes(&mut buf, true).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        let pop = s.find("[<1u").expect("pop sequence present");
+        let push = s.find("[>1u").expect("push sequence present");
+        assert!(pop < push, "pop must precede push: {s:?}");
+    }
 
     #[test]
     fn base64_matches_the_rfc4648_test_vectors() {

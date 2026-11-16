@@ -1,0 +1,17 @@
+[package]
+name = "gentle-session"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "gentle_session"
+path = "src/lib.rs"
+
+[[bin]]
+name = "gentle-session"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.104"
+libc = "0.2.191"
+portable-pty = "0.9.0"

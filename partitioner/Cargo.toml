@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "apps", "engines"]
+members = [".", "apps", "engines", "session"]
 resolver = "2"
 
 [package]
