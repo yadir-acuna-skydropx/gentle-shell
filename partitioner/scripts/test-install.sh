@@ -56,13 +56,15 @@ assert_absent() {
 }
 
 assert_contains "DRY RUN: no command will be executed"
-assert_contains "[1/6] gentle-shell"
-assert_contains "[2/6] Rust toolchain"
-assert_contains "[3/6] Partitioner engines"
-assert_contains "[4/6] gentle-shell launcher"
-assert_contains "[5/6] Security tools"
-assert_contains "[6/6] Engram memory server health"
+assert_contains "[1/7] gentle-shell"
+assert_contains "[2/7] Rust toolchain"
+assert_contains "[3/7] Partitioner engines"
+assert_contains "[4/7] gentle-shell launcher"
+assert_contains "[5/7] Security tools"
+assert_contains "[6/7] Engram memory server health"
 assert_contains "engram: health check (planned)"
+assert_contains "[7/7] Review model routing"
+assert_contains "review models: (planned)"
 
 # --help lists the new Engram flags
 HELP="$(bash "$INSTALL" --help 2>&1)"
@@ -70,6 +72,8 @@ DESC="--help lists --fix-engram"
 if printf '%s' "$HELP" | grep -qF -- "--fix-engram"; then ok "$DESC"; else bad "$DESC"; fi
 DESC="--help lists --no-engram"
 if printf '%s' "$HELP" | grep -qF -- "--no-engram"; then ok "$DESC"; else bad "$DESC"; fi
+DESC="--help lists --no-review-models"
+if printf '%s' "$HELP" | grep -qF -- "--no-review-models"; then ok "$DESC"; else bad "$DESC"; fi
 assert_contains "cargo install --locked --force --path"
 assert_contains "/partitioner/apps"
 assert_contains "/partitioner/engines"
@@ -154,6 +158,16 @@ printf 'wal\n' > "$FAKESTORE/engram.db-wal"
 BK="$(engram_backup_store "$FAKESTORE")"
 DESC="engram_backup_store copies the db files and keeps the source"
 if [ -f "$BK/engram.db" ] && [ -f "$BK/engram.db-wal" ] && [ -f "$FAKESTORE/engram.db" ]; then ok "$DESC"; else bad "$DESC"; fi
+
+# ---- 7. review-model seeder (node syntax + unit tests) ---------------------
+if command -v node >/dev/null 2>&1; then
+  DESC="node --check seed-review-models.mjs"
+  if node --check "$SCRIPT_DIR/seed-review-models.mjs" 2>"$TESTTMP/nc.err"; then ok "$DESC"; else bad "$DESC"; cat "$TESTTMP/nc.err"; fi
+  DESC="node --test seed-review-models.test.mjs"
+  if node --test "$SCRIPT_DIR/seed-review-models.test.mjs" >"$TESTTMP/nt.out" 2>&1; then ok "$DESC"; else bad "$DESC"; tail -20 "$TESTTMP/nt.out"; fi
+else
+  printf 'skip - node not installed (seed-review-models tests)\n'
+fi
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

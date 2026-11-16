@@ -9,6 +9,7 @@
 #   install.sh --no-security-tools   skip gitleaks/osv/trivy/cargo-audit/semgrep
 #   install.sh --fix-engram    stop a stale Engram server on 127.0.0.1:7437 and start the bundled one (backup first)
 #   install.sh --no-engram     skip the Engram server health check (step 6)
+#   install.sh --no-review-models  skip seeding the RDD review-lens model routing (step 7)
 #
 # What it installs, all under $HOME (never sudo):
 #   1. gentle-shell (which itself pins gentle-ai and Engram)
@@ -45,9 +46,10 @@ FORCE=0
 SECURITY_TOOLS=1
 FIX_ENGRAM=0
 ENGRAM_CHECK=1
+REVIEW_MODELS=1
 
 usage() {
-  sed -n '2,21p' "$SCRIPT_DIR/install.sh" | sed 's/^# \{0,1\}//'
+  sed -n '2,22p' "$SCRIPT_DIR/install.sh" | sed 's/^# \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -58,6 +60,7 @@ while [ $# -gt 0 ]; do
     --no-security-tools) SECURITY_TOOLS=0 ;;
     --fix-engram) FIX_ENGRAM=1 ;;
     --no-engram) ENGRAM_CHECK=0 ;;
+    --no-review-models) REVIEW_MODELS=0 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -66,7 +69,7 @@ done
 
 # ---- output helpers --------------------------------------------------------
 STEP_N=0
-STEP_TOTAL=6
+STEP_TOTAL=7
 step() { STEP_N=$((STEP_N + 1)); printf '\n==> [%d/%d] %s\n' "$STEP_N" "$STEP_TOTAL" "$*"; }
 note() { printf '    - %s\n' "$*"; }
 warn() { printf '    ! %s\n' "$*" >&2; }
@@ -478,6 +481,44 @@ reconcile_engram() {
 }
 
 # ===========================================================================
+# 7. RDD review-lens model routing (S37, T40)
+# ===========================================================================
+# The four native-review lenses (review-risk/resilience/readability/reliability)
+# are fail-closed in the Pi host-relay routing: absent from the global gentle-ai
+# models.json, the review refuses to launch, and that file is otherwise written
+# only by an interactive apply. Seed the four keys idempotently so RDD review
+# works out of the box; the helper never overwrites a user entry or an
+# unparseable file. Delegated to Node because models.json is JSON.
+seed_review_models() {
+  step "Review model routing (RDD lenses)"
+  if [ "$REVIEW_MODELS" != 1 ]; then
+    note "--no-review-models: skipping review-lens routing"
+    ok "review models: skipped"
+    return 0
+  fi
+  local helper="$SCRIPT_DIR/seed-review-models.mjs"
+  if [ ! -f "$helper" ]; then
+    fail "review models: helper not found ($helper)"
+    return 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    note "would run: node seed-review-models.mjs --model sonnet --thinking medium"
+    note "seeds review-risk/resilience/readability/reliability into the gentle-ai models.json only when absent (idempotent)"
+    ok "review models: (planned)"
+    return 0
+  fi
+  if ! have node; then
+    fail "review models: node unavailable — cannot seed review-lens routing"
+    return 0
+  fi
+  if node "$helper" --model sonnet --thinking medium; then
+    ok "review models: review-* lenses routed"
+  else
+    fail "review models: seeding failed (RDD native review may stay disabled)"
+  fi
+}
+
+# ===========================================================================
 # Final summary + user checklist
 # ===========================================================================
 final_summary() {
@@ -526,6 +567,7 @@ main() {
   install_launcher
   install_security_tools
   reconcile_engram
+  seed_review_models
   final_summary
   # Non-zero exit when a hard requirement failed is intentionally avoided:
   # the installer is cron-safe and reports issues without failing the run.
