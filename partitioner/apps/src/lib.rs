@@ -13,6 +13,7 @@ pub mod oauth;
 pub mod pkce;
 pub mod protocol;
 pub mod sanitize;
+pub mod sec;
 pub mod slack;
 pub mod store;
 
@@ -47,6 +48,7 @@ pub fn default_connectors() -> Vec<Box<dyn connector::Connector>> {
     let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     vec![
         Box::new(slack::SlackConnector::new(cfg, meta.client_id, store, home)),
-        Box::new(github::GithubConnector::new(github::GithubConfig::from_env(), repo_root)),
+        Box::new(github::GithubConnector::new(github::GithubConfig::from_env(), repo_root.clone())),
+        Box::new(sec::SecConnector::new(repo_root)),
     ]
 }

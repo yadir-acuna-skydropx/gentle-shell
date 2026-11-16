@@ -15,6 +15,10 @@ path = "src/bin/gentle-explain.rs"
 name = "gentle-arch"
 path = "src/bin/gentle-arch.rs"
 
+[[bin]]
+name = "gentle-sec"
+path = "src/bin/gentle-sec.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -23,6 +23,7 @@ pub mod engine;
 pub mod kb;
 pub mod keystore;
 pub mod scan;
+pub mod sec;
 pub mod tools;
 pub mod protocol;
 
