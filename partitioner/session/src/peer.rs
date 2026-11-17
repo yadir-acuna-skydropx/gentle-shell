@@ -12,7 +12,11 @@ pub fn self_uid() -> u32 {
     unsafe { libc::getuid() }
 }
 
-/// Reads the connected peer's uid from the socket via SO_PEERCRED (Linux).
+/// Reads the connected peer's uid from the socket. Linux and Android expose it
+/// via `SO_PEERCRED` + `ucred`; macOS and the BSDs expose it via `getpeereid`.
+/// Both return the peer's effective uid, so the same-user check is identical on
+/// every platform.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     let fd = stream.as_raw_fd();
     let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
@@ -31,6 +35,22 @@ pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
         return Err(io::Error::last_os_error());
     }
     Ok(cred.uid)
+}
+
+/// macOS / BSD variant: `getpeereid` writes the connected peer's effective uid
+/// and gid; we authorize on the uid exactly like the Linux path above.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    let fd = stream.as_raw_fd();
+    let mut uid: libc::uid_t = 0;
+    let mut gid: libc::gid_t = 0;
+    // SAFETY: getpeereid writes the peer's effective uid/gid into the out-params.
+    let rc = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let _ = gid;
+    Ok(uid)
 }
 
 /// Decides whether a peer with `peer` uid may attach given our `own` uid.
